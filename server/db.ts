@@ -24,6 +24,21 @@ export function getCairoDateString(date: Date = new Date()): string {
 }
 
 /**
+ * Returns interval [startCairo, endCairo) for a YYYY-MM-DD date in Africa/Cairo
+ */
+export function getCairoDateInterval(dateStr: string): { startCairo: string; endCairo: string; nextDateStr: string } {
+  const cleanDate = (dateStr || getCairoDateString()).slice(0, 10);
+  const [year, month, day] = cleanDate.split('-').map(Number);
+  const nextDate = new Date(Date.UTC(year, month - 1, day + 1));
+  const nextDateStr = nextDate.toISOString().slice(0, 10);
+  return {
+    startCairo: `${cleanDate} 00:00:00`,
+    endCairo: `${nextDateStr} 00:00:00`,
+    nextDateStr,
+  };
+}
+
+/**
  * Returns the threshold date (YYYY-MM-DD) for HOT vs COLD tier.
  * HOT = Today + 29 preceding calendar days (30 calendar days total window) in Africa/Cairo.
  */
@@ -311,6 +326,12 @@ export function initDatabase() {
   tryRunMigration("ALTER TABLE orders ADD COLUMN validation_status TEXT DEFAULT 'PENDING_VALIDATION'");
   tryRunMigration("ALTER TABLE orders ADD COLUMN storage_tier TEXT DEFAULT 'HOT'");
   tryRunMigration("ALTER TABLE orders ADD COLUMN canceling_date TEXT");
+  tryRunMigration("ALTER TABLE orders ADD COLUMN extra_phone_status TEXT DEFAULT 'NOT_RETRIEVED'");
+  tryRunMigration("ALTER TABLE orders ADD COLUMN address_word_count INTEGER");
+  tryRunMigration("ALTER TABLE orders ADD COLUMN address_is_latin INTEGER DEFAULT 0");
+  tryRunMigration("ALTER TABLE orders ADD COLUMN address_quality_status TEXT DEFAULT 'NOT_RETRIEVED'");
+  tryRunMigration("ALTER TABLE orders ADD COLUMN last_enrichment_at TEXT");
+  tryRunMigration("ALTER TABLE orders ADD COLUMN last_enrichment_status TEXT");
   tryRunMigration("ALTER TABLE order_items ADD COLUMN merchant_name TEXT");
   tryRunMigration("ALTER TABLE order_items ADD COLUMN warehouse_name TEXT");
   tryRunMigration("ALTER TABLE order_status_events ADD COLUMN storage_tier TEXT DEFAULT 'HOT'");
@@ -576,9 +597,9 @@ export function populateInitialCoverageFromExistingData() {
       pagesRead: 1,
       recordsExtracted: logRows,
       recordsSaved: logRows,
-      completionStatus: 'COMPLETE',
+      completionStatus: 'PARTIAL',
       lastAttemptedAt: nowIso,
-      completedAt: nowIso,
+      completedAt: null,
     });
   }
 
@@ -601,9 +622,9 @@ export function populateInitialCoverageFromExistingData() {
       pagesRead: 1,
       recordsExtracted: od.c,
       recordsSaved: od.c,
-      completionStatus: 'COMPLETE',
+      completionStatus: 'PARTIAL',
       lastAttemptedAt: nowIso,
-      completedAt: nowIso,
+      completedAt: null,
     });
   }
 }

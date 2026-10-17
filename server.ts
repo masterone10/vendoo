@@ -6,7 +6,7 @@ import { initDatabase } from './server/db.js';
 import { apiRouter } from './server/routes.js';
 import { syncEngine } from './server/syncEngine.js';
 
-dotenv.config();
+dotenv.config({ override: true });
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);

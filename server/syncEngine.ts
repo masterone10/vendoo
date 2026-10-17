@@ -5,6 +5,8 @@ import {
   getCoverageRecord,
   saveCoverageRecord,
   HistoricalCoverageRecord,
+  getCairoDateString,
+  getCairoDateInterval,
 } from './db.js';
 import {
   vendoorClient,
@@ -26,12 +28,182 @@ export interface SyncEngineStatus {
   consecutiveFailures: number;
 }
 
+export interface AgeCalculationResult {
+  ageInDays: number | null;
+  ageBucket: 'less_than_2_days' | '2_to_4_days' | '4_to_5_days' | 'over_5_days' | 'unknown';
+}
+
+/**
+ * Shared, mutually exclusive age calculation.
+ * 1. less_than_2_days (< 2 days)
+ * 2. 2_to_4_days (>= 2 and < 4 days)
+ * 3. 4_to_5_days (>= 4 and <= 5 days)
+ * 4. over_5_days (> 5 days)
+ * 5. unknown (missing, invalid, or unverified timestamp)
+ */
+export function calculateAgeBucket(timestampStr: string | null | undefined, nowMs: number = Date.now()): AgeCalculationResult {
+  if (!timestampStr) {
+    return { ageInDays: null, ageBucket: 'unknown' };
+  }
+  const cleanStr = String(timestampStr).trim();
+  if (!cleanStr) {
+    return { ageInDays: null, ageBucket: 'unknown' };
+  }
+  const t = new Date(cleanStr).getTime();
+  if (isNaN(t) || t <= 0) {
+    return { ageInDays: null, ageBucket: 'unknown' };
+  }
+  const diffDays = Math.max(0, (nowMs - t) / (1000 * 60 * 60 * 24));
+  const rounded = Math.round(diffDays * 10) / 10;
+  if (diffDays < 2) {
+    return { ageInDays: rounded, ageBucket: 'less_than_2_days' };
+  } else if (diffDays >= 2 && diffDays < 4) {
+    return { ageInDays: rounded, ageBucket: '2_to_4_days' };
+  } else if (diffDays >= 4 && diffDays <= 5) {
+    return { ageInDays: rounded, ageBucket: '4_to_5_days' };
+  } else {
+    return { ageInDays: rounded, ageBucket: 'over_5_days' };
+  }
+}
+
+/**
+ * Retrieves the genuine qualifying Processing transition timestamp for an order.
+ * Strictly from Vendoor logs or recorded status events; never falls back to created_at or local sync time.
+ */
+export function getProcessingTransitionTime(orderId: number, orderCode?: string): string | null {
+  const evt: any = db.prepare(`
+    SELECT event_time_source
+    FROM order_status_events
+    WHERE order_id = ? AND to_status = 'Processing' AND event_time_source IS NOT NULL
+    ORDER BY id DESC
+    LIMIT 1
+  `).get(orderId);
+
+  if (evt && evt.event_time_source) {
+    return evt.event_time_source;
+  }
+
+  if (orderCode) {
+    const canon: any = db.prepare(`
+      SELECT event_timestamp
+      FROM canonical_activity_events
+      WHERE order_code = ? AND to_status = 'Processing'
+      ORDER BY id DESC
+      LIMIT 1
+    `).get(orderCode);
+
+    if (canon && canon.event_timestamp) {
+      return canon.event_timestamp;
+    }
+  }
+
+  return null;
+}
+
+/**
+ * Decode common HTML entities from Vendoor text
+ */
+export function decodeHtmlEntities(str: string): string {
+  if (!str) return '';
+  return str
+    .replace(/&quot;/g, '"')
+    .replace(/&#039;|&apos;/g, "'")
+    .replace(/&lt;/g, '<')
+    .replace(/&gt;/g, '>')
+    .replace(/&amp;/g, '&')
+    .replace(/&nbsp;/g, ' ')
+    .replace(/&#(\d+);/g, (_, code) => String.fromCharCode(parseInt(code, 10)));
+}
+
+/**
+ * Extracts verified warehouse name from a Vendoor product object or product name.
+ * e.g. "Oncloud slipper code Tex12 ( مخزن Te1 )" -> "مخزن Te1"
+ * Returns null if no warehouse identifier is present. Never guesses.
+ */
+export function extractWarehouseFromProduct(p: VendoorRawProduct): string | null {
+  const name = p.name || '';
+  const warehouseMatch = name.match(/\(\s*مخزن\s*([^)]+)\s*\)/i);
+  if (warehouseMatch && warehouseMatch[1]?.trim()) {
+    return `مخزن ${warehouseMatch[1].trim()}`;
+  }
+  const codeMatch = name.match(/\(\s*كود\s*([^)]+)\s*\)/i);
+  if (codeMatch && codeMatch[1]?.trim()) {
+    return `كود ${codeMatch[1].trim()}`;
+  }
+  if (p.warehouse_name && String(p.warehouse_name).trim()) {
+    return String(p.warehouse_name).trim();
+  }
+  return null;
+}
+
+/**
+ * Evaluates distinct warehouses across an order's product list.
+ */
+export function extractDistinctWarehouses(products: VendoorRawProduct[]): {
+  warehouses: string[];
+  isMultiWarehouse: boolean;
+  isUnresolved: boolean;
+} {
+  const set = new Set<string>();
+  let hasUnknown = false;
+  for (const p of products) {
+    const w = extractWarehouseFromProduct(p);
+    if (w) {
+      set.add(w);
+    } else {
+      hasUnknown = true;
+    }
+  }
+  const warehouses = Array.from(set);
+  return {
+    warehouses,
+    isMultiWarehouse: warehouses.length > 1,
+    isUnresolved: warehouses.length === 0 && products.length > 0,
+  };
+}
+
+/**
+ * Unicode-aware address quality check
+ */
+export function evaluateAddressQuality(address: string | null | undefined): {
+  isConfirmedShort: boolean;
+  isConfirmedLatin: boolean;
+  wordCount: number;
+  latinRatio: number;
+  status: 'VALID' | 'SHORT_ADDRESS' | 'LATIN_SCRIPT' | 'MISSING' | 'NOT_RETRIEVED';
+} {
+  if (address === null || address === undefined) {
+    return { isConfirmedShort: false, isConfirmedLatin: false, wordCount: 0, latinRatio: 0, status: 'NOT_RETRIEVED' };
+  }
+  const clean = address.trim();
+  if (!clean) {
+    return { isConfirmedShort: false, isConfirmedLatin: false, wordCount: 0, latinRatio: 0, status: 'MISSING' };
+  }
+  const words = clean.match(/[\p{L}\p{N}]+/gu) || [];
+  const wordCount = words.length;
+  const isConfirmedShort = wordCount <= 3;
+
+  const lettersOnly = clean.replace(/[^\p{L}]/gu, '');
+  let latinRatio = 0;
+  if (lettersOnly.length > 0) {
+    const latinLetters = lettersOnly.match(/[A-Za-z]/g) || [];
+    latinRatio = latinLetters.length / lettersOnly.length;
+  }
+  const isConfirmedLatin = latinRatio > 0.6; // >60% Latin
+
+  let status: 'VALID' | 'SHORT_ADDRESS' | 'LATIN_SCRIPT' | 'MISSING' | 'NOT_RETRIEVED' = 'VALID';
+  if (isConfirmedShort) status = 'SHORT_ADDRESS';
+  else if (isConfirmedLatin) status = 'LATIN_SCRIPT';
+
+  return { isConfirmedShort, isConfirmedLatin, wordCount, latinRatio, status };
+}
+
 type SSEListener = (data: { event: string; payload: any }) => void;
 
-class SyncEngine {
+export class SyncEngine {
   private isSyncing = false;
   private intervalTimer: NodeJS.Timeout | null = null;
-  private sseClients: Set<(data: { event: string; payload: any }) => void> = new Set();
+  private sseClients: Set<SSEListener> = new Set();
   private status: SyncEngineStatus = {
     isRunning: false,
     lastSyncStartedAt: null,
@@ -56,7 +228,6 @@ class SyncEngine {
 
   public registerSSEClient(listener: SSEListener): () => void {
     this.sseClients.add(listener);
-    // Send immediate status
     listener({ event: 'status', payload: this.getStatus() });
     return () => {
       this.sseClients.delete(listener);
@@ -73,12 +244,12 @@ class SyncEngine {
     }
   }
 
-  public start(intervalSeconds = 25) {
+  public start(intervalSeconds = 30) {
     if (this.intervalTimer) return;
     this.status.isRunning = true;
     console.log(`[SyncEngine] Starting background sync worker (interval: ${intervalSeconds}s)...`);
 
-    // Immediate initial run
+    // Run initial sync cycle
     this.runFullSyncCycle('INITIAL').catch(err => {
       console.error('[SyncEngine] Initial sync error:', err.message);
     });
@@ -124,43 +295,423 @@ class SyncEngine {
   }
 
   /**
-   * Extract distinct merchant codes from an order's products.
-   * Uses actual merchant identifiers (vendor ID / merchant code),
-   * NOT warehouse names or product names!
+   * Reconciles order items in place without destructive churn.
+   * Updates existing lines by vendoor_item_id, inserts new lines,
+   * and preserves existing lines on partial/failed responses.
    */
-  public extractMerchantCodes(products: VendoorRawProduct[]): string[] {
-    const codes = new Set<string>();
+  public reconcileOrderProducts(orderDbId: number, products: VendoorRawProduct[], nowIso: string): { distinctWarehouses: string[]; isMultiWarehouse: boolean } {
+    if (!products || products.length === 0) {
+      return { distinctWarehouses: [], isMultiWarehouse: false };
+    }
+
+    const existingItems: any[] = db.prepare('SELECT id, vendoor_item_id, product_id, sku, quantity, unit_price, merchant_code, product_name FROM order_items WHERE order_id = ?').all(orderDbId);
+    const existingMap = new Map<number, any>();
+    for (const it of existingItems) {
+      if (it.vendoor_item_id) existingMap.set(it.vendoor_item_id, it);
+    }
+
+    const seenIds = new Set<number>();
+    const warehouseSet = new Set<string>();
+
+    const insertItemStmt = db.prepare(`
+      INSERT INTO order_items (
+        order_id, vendoor_item_id, product_id, product_name, merchant_code,
+        sku, size, color, quantity, unit_price, pay_vendor, image_path, raw_json, created_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `);
+
+    const updateItemStmt = db.prepare(`
+      UPDATE order_items SET
+        product_name = ?,
+        merchant_code = ?,
+        warehouse_name = ?,
+        sku = ?,
+        size = ?,
+        color = ?,
+        quantity = ?,
+        unit_price = ?,
+        pay_vendor = ?,
+        image_path = COALESCE(?, image_path)
+      WHERE id = ?
+    `);
+
     for (const p of products) {
-      // 1. Direct merchant code or vendor ID in product object
-      const directCode = p.merchant_code || p.vendor_id || (p.pivot as any)?.vendor_id || (p.pivot as any)?.merchant_code;
-      if (directCode && String(directCode).trim()) {
-        codes.add(String(directCode).trim());
-        continue;
+      const warehouse = extractWarehouseFromProduct(p);
+      if (warehouse) warehouseSet.add(warehouse);
+
+      const itemId = p.pivot?.id || null;
+      const unitPrice = parseFloat(p.pivot?.price || '0') || 0;
+      const payVendor = parseFloat(p.pivot?.pay_vendor || '0') || 0;
+      const qty = p.pivot?.quantity || 1;
+      const productName = p.name || 'منتج';
+      const sku = p.pivot?.code || null;
+      const size = p.pivot?.size || null;
+      const color = p.pivot?.color || null;
+      const warehouseDisplay = warehouse || 'غير محدد';
+
+      if (itemId && existingMap.has(itemId)) {
+        seenIds.add(itemId);
+        const curr = existingMap.get(itemId);
+        if (curr.quantity !== qty || curr.unit_price !== unitPrice || curr.product_name !== productName || curr.merchant_code !== warehouseDisplay) {
+          updateItemStmt.run(productName, warehouseDisplay, warehouse, sku, size, color, qty, unitPrice, payVendor, p.image_path || null, curr.id);
+        }
+      } else {
+        insertItemStmt.run(
+          orderDbId,
+          itemId,
+          p.id || null,
+          productName,
+          warehouseDisplay,
+          sku,
+          size,
+          color,
+          qty,
+          unitPrice,
+          payVendor,
+          p.image_path || null,
+          JSON.stringify(p),
+          nowIso
+        );
+        if (itemId) seenIds.add(itemId);
       }
-      // 2. Explicit vendor prefix in SKU / pivot code if structured
-      if (p.pivot?.code) {
-        const parts = p.pivot.code.split('-');
-        if (parts.length > 1 && parts[0] && parts[0].trim().length >= 2) {
-          codes.add(parts[0].trim());
-          continue;
+    }
+
+    return {
+      distinctWarehouses: Array.from(warehouseSet),
+      isMultiWarehouse: warehouseSet.size > 1,
+    };
+  }
+
+  /**
+   * Evaluates business risk alerts for an order
+   */
+  public evaluateOrderAlerts(orderDbId: number, randomNum: string, currentStatus: string, isMultiWarehouse: number, warehouses: string[], nowIso: string): number {
+    let triggered = 0;
+    const insertAlertStmt = db.prepare(`
+      INSERT INTO alerts (
+        alert_key, order_id, random_number, alert_type, severity,
+        status, title, description, details_json, is_pre_existing,
+        created_at, updated_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT(alert_key) DO UPDATE SET
+        status = CASE WHEN alerts.status = 'RESOLVED' THEN 'OPEN' ELSE alerts.status END,
+        updated_at = excluded.updated_at
+    `);
+
+    // 1. Multi-Warehouse on Printed Orders
+    if (currentStatus === 'Printed' && isMultiWarehouse === 1) {
+      const alertKey = `MULTI_WAREHOUSE_${randomNum}`;
+      insertAlertStmt.run(
+        alertKey,
+        orderDbId,
+        randomNum,
+        'MULTIPLE_MERCHANT_CODES',
+        'CRITICAL',
+        'OPEN',
+        `طلب مؤكد يحتوي منتجات من ${warehouses.length} مخازن مختلفة (${randomNum})`,
+        `الطلب في حالة Printed ويحتوي على أصناف من مخازن مستقلة: ${warehouses.join('، ')}`,
+        JSON.stringify({ orderId: orderDbId, randomNum, warehouses }),
+        0,
+        nowIso,
+        nowIso
+      );
+      triggered++;
+    }
+
+    // 2. Low delivery rate (< 70% strictly, unknown is NOT low)
+    const orderRow: any = db.prepare('SELECT delivery_rate, customer_phone_extra, extra_phone_status, address_quality_status, created_at_source FROM orders WHERE id = ?').get(orderDbId);
+    if (orderRow) {
+      if (orderRow.delivery_rate !== null && orderRow.delivery_rate !== undefined && orderRow.delivery_rate < 70) {
+        const alertKey = `LOW_DELIVERY_${randomNum}`;
+        insertAlertStmt.run(
+          alertKey,
+          orderDbId,
+          randomNum,
+          'LOW_DELIVERY_RATE',
+          'WARNING',
+          'OPEN',
+          `نسبة تسليم منخفضة للعميل (${orderRow.delivery_rate}%) - (${randomNum})`,
+          `العميل لديه نسبة تسليم مؤكدة أقل من 70% (${orderRow.delivery_rate}%)، يرجى مراجعة الجدية قبل الشحن.`,
+          JSON.stringify({ deliveryRate: orderRow.delivery_rate }),
+          0,
+          nowIso,
+          nowIso
+        );
+        triggered++;
+      }
+
+      // 3. Confirmed absent extra phone in Printed state
+      if (currentStatus === 'Printed' && orderRow.extra_phone_status === 'CONFIRMED_ABSENT') {
+        const alertKey = `NO_EXTRA_PHONE_${randomNum}`;
+        insertAlertStmt.run(
+          alertKey,
+          orderDbId,
+          randomNum,
+          'MISSING_EXTRA_PHONE',
+          'WARNING',
+          'OPEN',
+          `طلب مؤكد دون هاتف إضافي (${randomNum})`,
+          `تم التأكد من غياب رقم الهاتف الإضافي في بيانات الطلب المطبوع.`,
+          JSON.stringify({ extraPhoneStatus: orderRow.extra_phone_status }),
+          0,
+          nowIso,
+          nowIso
+        );
+        triggered++;
+      }
+
+      // 4. Low address quality
+      if (currentStatus === 'Printed' && (orderRow.address_quality_status === 'SHORT_ADDRESS' || orderRow.address_quality_status === 'LATIN_SCRIPT')) {
+        const alertKey = `POOR_ADDRESS_${randomNum}`;
+        const reason = orderRow.address_quality_status === 'SHORT_ADDRESS' ? 'العنوان يحتوي 3 كلمات أو أقل' : 'العنوان مكتوب بحروف لاتينية / إنجليزية';
+        insertAlertStmt.run(
+          alertKey,
+          orderDbId,
+          randomNum,
+          'INCOMPLETE_DATA',
+          'INFO',
+          'OPEN',
+          `ملاحظة جودة عنوان الطلب (${randomNum})`,
+          `طلب في حالة Printed مع ملاحظة عنوان: ${reason}`,
+          JSON.stringify({ addressQualityStatus: orderRow.address_quality_status }),
+          0,
+          nowIso,
+          nowIso
+        );
+        triggered++;
+      }
+
+      // 5. Long-running Pending (> 5 days)
+      if (currentStatus === 'Pending' && orderRow.created_at_source) {
+        const ageRes = calculateAgeBucket(orderRow.created_at_source);
+        if (ageRes.ageBucket === 'over_5_days') {
+          const alertKey = `LONG_PENDING_${randomNum}`;
+          insertAlertStmt.run(
+            alertKey,
+            orderDbId,
+            randomNum,
+            'INCOMPLETE_DATA',
+            'WARNING',
+            'OPEN',
+            `طلب معلق متجاوز 5 أيام (${randomNum})`,
+            `الطلب في حالة Pending منذ ${ageRes.ageInDays} يوم، متجاوزاً الحد التشغيلي الموصى به.`,
+            JSON.stringify({ ageInDays: ageRes.ageInDays }),
+            0,
+            nowIso,
+            nowIso
+          );
+          triggered++;
         }
       }
     }
-    // If no distinct codes could be determined but products exist:
-    // Mark as single default merchant or UNKNOWN rather than guessing warehouse names
-    if (codes.size === 0 && products.length > 0) {
-      return ['25919']; // Default canonical single merchant baseline from fixtures
+
+    return triggered;
+  }
+
+  /**
+   * Field-aware canonical order upsert using vendoor_id as primary source key
+   */
+  public upsertCanonicalOrder(rawOrder: VendoorRawOrder, nowIso: string): {
+    orderDbId: number;
+    isNew: boolean;
+    statusChanged: boolean;
+    previousStatus: string | null;
+    currentStatus: string;
+  } {
+    const vendoorId = rawOrder.id;
+    if (!vendoorId) {
+      throw new Error('Order missing required vendoor_id');
     }
-    return Array.from(codes);
+
+    const currentStatus = this.parseStatusString(rawOrder.status);
+    const rawProducts = rawOrder.products || [];
+    const { warehouses, isMultiWarehouse } = extractDistinctWarehouses(rawProducts);
+    const distinctCount = warehouses.length > 0 ? warehouses.length : 1;
+    const multiWarehouseFlag = isMultiWarehouse ? 1 : 0;
+    const orderCreatedAt = rawOrder.created_at || nowIso;
+    const orderTier = isDateInHot(orderCreatedAt) ? 'HOT' : 'COLD';
+    const addressEval = evaluateAddressQuality(rawOrder.address);
+
+    let existing: any = db.prepare('SELECT * FROM orders WHERE vendoor_id = ?').get(vendoorId);
+    if (!existing && rawOrder.random_number) {
+      existing = db.prepare('SELECT * FROM orders WHERE random_number = ?').get(rawOrder.random_number);
+    }
+
+    let orderDbId: number;
+    let isNew = false;
+    let statusChanged = false;
+    let previousStatus: string | null = null;
+
+    if (!existing) {
+      isNew = true;
+      const res = db.prepare(`
+        INSERT INTO orders (
+          vendoor_id, random_number, order_no, order_type, current_status, status_raw,
+          affiliate_code, affiliate_name, affiliate_id, customer_name, customer_phone,
+          governorate, address, total_price, shipping_cost, total_order,
+          created_at_source, shipping_date, printed_date, distinct_merchant_count,
+          multi_merchant_flag, state_entry_at, storage_tier,
+          address_word_count, address_is_latin, address_quality_status,
+          last_observed_at, created_at, updated_at
+        ) VALUES (
+          ?, ?, ?, ?, ?, ?,
+          ?, ?, ?, ?, ?,
+          ?, ?, ?, ?, ?,
+          ?, ?, ?, ?,
+          ?, ?, ?,
+          ?, ?, ?,
+          ?, ?, ?
+        )
+      `).run(
+        vendoorId,
+        rawOrder.random_number || `VND_${vendoorId}`,
+        rawOrder.order_no || null,
+        rawOrder.order_type || 'اوردر جديد',
+        currentStatus,
+        rawOrder.status || '',
+        rawOrder.affiliate_code || '',
+        rawOrder.affiliate_name || '',
+        rawOrder.affiliate_id || null,
+        rawOrder.full_name || '',
+        rawOrder.phone || '',
+        rawOrder.governrate_name || '',
+        rawOrder.address || '',
+        rawOrder.total_price || 0,
+        parseFloat(rawOrder.shipping_cost || '0') || 0,
+        parseFloat(rawOrder.total_order || '0') || 0,
+        orderCreatedAt,
+        rawOrder.shipping_date || null,
+        rawOrder.printed_date || null,
+        distinctCount,
+        multiWarehouseFlag,
+        nowIso,
+        orderTier,
+        addressEval.wordCount,
+        addressEval.isConfirmedLatin ? 1 : 0,
+        addressEval.status,
+        nowIso,
+        nowIso,
+        nowIso
+      );
+
+      orderDbId = Number(res.lastInsertRowid);
+
+      db.prepare(`
+        INSERT INTO order_status_events (
+          order_id, random_number, from_status, to_status, actor_name,
+          event_time_source, storage_tier, observed_at, source_channel
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `).run(
+        orderDbId,
+        rawOrder.random_number || `VND_${vendoorId}`,
+        null,
+        currentStatus,
+        'استيراد أولي',
+        orderCreatedAt,
+        orderTier,
+        nowIso,
+        'initial_import'
+      );
+    } else {
+      orderDbId = existing.id;
+      previousStatus = existing.current_status;
+      statusChanged = existing.current_status !== currentStatus;
+
+      db.prepare(`
+        UPDATE orders SET
+          vendoor_id = ?,
+          random_number = COALESCE(?, random_number),
+          order_no = COALESCE(?, order_no),
+          order_type = COALESCE(?, order_type),
+          current_status = ?,
+          status_raw = COALESCE(?, status_raw),
+          affiliate_code = COALESCE(?, affiliate_code),
+          affiliate_name = COALESCE(?, affiliate_name),
+          customer_name = COALESCE(?, customer_name),
+          customer_phone = COALESCE(?, customer_phone),
+          governorate = COALESCE(?, governorate),
+          address = COALESCE(?, address),
+          total_price = CASE WHEN ? > 0 THEN ? ELSE total_price END,
+          shipping_cost = CASE WHEN ? > 0 THEN ? ELSE shipping_cost END,
+          total_order = CASE WHEN ? > 0 THEN ? ELSE total_order END,
+          shipping_date = COALESCE(?, shipping_date),
+          printed_date = COALESCE(?, printed_date),
+          distinct_merchant_count = ?,
+          multi_merchant_flag = ?,
+          address_word_count = COALESCE(?, address_word_count),
+          address_is_latin = ?,
+          address_quality_status = ?,
+          state_entry_at = CASE WHEN current_status != ? THEN ? ELSE state_entry_at END,
+          last_observed_at = ?,
+          updated_at = ?
+        WHERE id = ?
+      `).run(
+        vendoorId,
+        rawOrder.random_number || null,
+        rawOrder.order_no || null,
+        rawOrder.order_type || null,
+        currentStatus,
+        rawOrder.status || null,
+        rawOrder.affiliate_code || null,
+        rawOrder.affiliate_name || null,
+        rawOrder.full_name || null,
+        rawOrder.phone || null,
+        rawOrder.governrate_name || null,
+        rawOrder.address || null,
+        rawOrder.total_price || 0,
+        rawOrder.total_price || 0,
+        parseFloat(rawOrder.shipping_cost || '0') || 0,
+        parseFloat(rawOrder.shipping_cost || '0') || 0,
+        parseFloat(rawOrder.total_order || '0') || 0,
+        parseFloat(rawOrder.total_order || '0') || 0,
+        rawOrder.shipping_date || null,
+        rawOrder.printed_date || null,
+        distinctCount,
+        multiWarehouseFlag,
+        addressEval.wordCount,
+        addressEval.isConfirmedLatin ? 1 : 0,
+        addressEval.status,
+        currentStatus,
+        nowIso,
+        nowIso,
+        nowIso,
+        orderDbId
+      );
+
+      if (statusChanged) {
+        db.prepare(`
+          INSERT INTO order_status_events (
+            order_id, random_number, from_status, to_status, actor_name,
+            event_time_source, storage_tier, observed_at, source_channel
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        `).run(
+          orderDbId,
+          rawOrder.random_number || existing.random_number,
+          previousStatus,
+          currentStatus,
+          'النظام',
+          nowIso,
+          orderTier,
+          nowIso,
+          'poll_detection'
+        );
+      }
+    }
+
+    if (rawProducts.length > 0) {
+      this.reconcileOrderProducts(orderDbId, rawProducts, nowIso);
+    }
+
+    this.evaluateOrderAlerts(orderDbId, rawOrder.random_number || existing?.random_number || `VND_${vendoorId}`, currentStatus, multiWarehouseFlag, warehouses, nowIso);
+
+    return { orderDbId, isNew, statusChanged, previousStatus, currentStatus };
   }
 
   /**
    * Full synchronization cycle:
-   * 1. Orders batch scanning
-   * 2. Critical Alert evaluation (Multi-merchant in Printed state)
-   * 3. Confirmation Age pages sync
-   * 4. System Logs sync (employee canonical events)
-   * 5. Customer Intelligence queue
+   * Covers all orders with full pagination across batches,
+   * updates canonical orders, synchronizes confirmation age pages,
+   * fetches full system logs, and enriches customer intelligence.
    */
   public async runFullSyncCycle(runType: 'INITIAL' | 'PERIODIC' | 'RECONCILIATION' | 'MANUAL') {
     if (this.isSyncing) return;
@@ -175,301 +726,54 @@ class SyncEngine {
     let eventsDetected = 0;
     let alertsTriggered = 0;
     let errorsCount = 0;
+    let hasFailedPage = false;
     let errorMessage: string | null = null;
 
     try {
       console.log(`[SyncEngine] Starting ${runType} sync cycle...`);
 
-      // 1. Scan Orders: First page to get total, then paginate through
+      // 1. Scan Orders: First page to get total and records
       const firstBatch = await vendoorClient.fetchOrdersBatch(0, 100);
       const totalOrdersInSource = firstBatch.recordsTotal;
       let allOrders: VendoorRawOrder[] = [...firstBatch.data];
 
-      // If initial or manual, fetch all remaining pages to guarantee 100% full coverage
-      if (runType === 'INITIAL' || runType === 'MANUAL' || runType === 'RECONCILIATION') {
-        const batchSize = 100;
-        for (let start = 100; start < totalOrdersInSource; start += batchSize) {
-          try {
-            const nextBatch = await vendoorClient.fetchOrdersBatch(start, batchSize);
-            allOrders = allOrders.concat(nextBatch.data);
-          } catch (err: any) {
-            console.error(`[SyncEngine] Error fetching orders batch at start ${start}:`, err.message);
-            errorsCount++;
-          }
+      // In EVERY cycle (including PERIODIC), paginate through all pages to guarantee complete coverage
+      const batchSize = 100;
+      for (let start = 100; start < totalOrdersInSource; start += batchSize) {
+        try {
+          const nextBatch = await vendoorClient.fetchOrdersBatch(start, batchSize);
+          allOrders = allOrders.concat(nextBatch.data);
+        } catch (pageErr: any) {
+          console.error(`[SyncEngine] Error fetching orders batch at start ${start}:`, pageErr.message);
+          errorsCount++;
+          hasFailedPage = true;
+          errorMessage = `Failed to fetch page at offset ${start}: ${pageErr.message}`;
+          break;
         }
       }
 
       ordersScanned = allOrders.length;
       this.status.currentPhase = 'PROCESSING_ORDERS';
 
-      // Prepare statements for bulk upsert
-      const selectOrderStmt = db.prepare('SELECT id, current_status, distinct_merchant_count, delivery_rate FROM orders WHERE random_number = ?');
-      const insertOrderStmt = db.prepare(`
-        INSERT INTO orders (
-          vendoor_id, random_number, order_no, order_type, current_status, status_raw,
-          affiliate_code, affiliate_name, affiliate_id, customer_name, customer_phone,
-          governorate, address, total_price, shipping_cost, total_order,
-          created_at_source, shipping_date, printed_date, distinct_merchant_count,
-          multi_merchant_flag, state_entry_at, storage_tier, last_observed_at, created_at, updated_at
-        ) VALUES (
-          ?, ?, ?, ?, ?, ?,
-          ?, ?, ?, ?, ?,
-          ?, ?, ?, ?, ?,
-          ?, ?, ?, ?,
-          ?, ?, ?, ?, ?, ?
-        )
-      `);
+      const enrichmentQueue: { id: number; phone: string; vendoorId: number; random_number: string; status: string }[] = [];
 
-      const updateOrderStmt = db.prepare(`
-        UPDATE orders SET
-          order_no = COALESCE(?, order_no),
-          order_type = ?,
-          current_status = ?,
-          status_raw = ?,
-          affiliate_code = ?,
-          affiliate_name = ?,
-          customer_name = ?,
-          customer_phone = ?,
-          governorate = ?,
-          address = ?,
-          total_price = ?,
-          shipping_cost = ?,
-          total_order = ?,
-          shipping_date = COALESCE(?, shipping_date),
-          printed_date = COALESCE(?, printed_date),
-          distinct_merchant_count = ?,
-          multi_merchant_flag = ?,
-          state_entry_at = CASE WHEN current_status != ? THEN ? ELSE state_entry_at END,
-          last_observed_at = ?,
-          updated_at = ?
-        WHERE random_number = ?
-      `);
-
-      const insertItemStmt = db.prepare(`
-        INSERT INTO order_items (
-          order_id, vendoor_item_id, product_id, product_name, merchant_code,
-          sku, size, color, quantity, unit_price, pay_vendor, image_path, raw_json, created_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-      `);
-
-      const deleteItemsStmt = db.prepare('DELETE FROM order_items WHERE order_id = ?');
-
-      const insertStatusEventStmt = db.prepare(`
-        INSERT INTO order_status_events (
-          order_id, random_number, from_status, to_status, actor_name,
-          event_time_source, storage_tier, observed_at, source_channel
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-      `);
-
-      const insertAlertStmt = db.prepare(`
-        INSERT INTO alerts (
-          alert_key, order_id, random_number, alert_type, severity,
-          status, title, description, details_json, is_pre_existing,
-          created_at, updated_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-      `);
-
-      // Transactional processing
       db.exec('BEGIN TRANSACTION;');
 
-      const ordersNeedingCustomerEnrichment: { id: number; phone: string; random_number: string }[] = [];
-
       for (const rawOrder of allOrders) {
-        const randomNum = rawOrder.random_number;
-        if (!randomNum) continue;
+        if (!rawOrder.id) continue;
+        const upsertRes = this.upsertCanonicalOrder(rawOrder, nowIso);
+        if (upsertRes.isNew) ordersCreated++;
+        else ordersUpdated++;
+        if (upsertRes.statusChanged) eventsDetected++;
 
-        const currentStatus = this.parseStatusString(rawOrder.status);
-        const products = rawOrder.products || [];
-        const merchantCodes = this.extractMerchantCodes(products);
-        const distinctMerchantCount = merchantCodes.length;
-        const isMultiMerchant = distinctMerchantCount > 1 ? 1 : 0;
-
-        const existing: any = selectOrderStmt.get(randomNum);
-        const orderCreatedAt = rawOrder.created_at || nowIso;
-        const orderTier = isDateInHot(orderCreatedAt) ? 'HOT' : 'COLD';
-
-        let orderDbId: number;
-
-        if (!existing) {
-          // New Order insertion
-          const result = insertOrderStmt.run(
-            rawOrder.id,
-            randomNum,
-            rawOrder.order_no || null,
-            rawOrder.order_type || 'اوردر جديد',
-            currentStatus,
-            rawOrder.status || '',
-            rawOrder.affiliate_code || '',
-            rawOrder.affiliate_name || '',
-            rawOrder.affiliate_id || null,
-            rawOrder.full_name || '',
-            rawOrder.phone || '',
-            rawOrder.governrate_name || '',
-            rawOrder.address || '',
-            rawOrder.total_price || 0,
-            parseFloat(rawOrder.shipping_cost) || 0,
-            parseFloat(rawOrder.total_order) || 0,
-            orderCreatedAt,
-            rawOrder.shipping_date || null,
-            rawOrder.printed_date || null,
-            distinctMerchantCount,
-            isMultiMerchant,
-            nowIso, // initial state_entry_at
-            orderTier,
-            nowIso,
-            nowIso,
-            nowIso
-          );
-
-          orderDbId = Number(result.lastInsertRowid);
-          ordersCreated++;
-
-          // Record initial status creation event
-          insertStatusEventStmt.run(
-            orderDbId,
-            randomNum,
-            null,
-            currentStatus,
-            'استيراد أولي',
-            orderCreatedAt,
-            orderTier,
-            nowIso,
-            'orders_sync'
-          );
-
-          // Queue for customer delivery rate enrichment
-          if (rawOrder.phone) {
-            ordersNeedingCustomerEnrichment.push({
-              id: orderDbId,
-              phone: rawOrder.phone,
-              random_number: randomNum,
-            });
-          }
-        } else {
-          orderDbId = existing.id;
-          const statusChanged = existing.current_status !== currentStatus;
-
-          updateOrderStmt.run(
-            rawOrder.order_no || null,
-            rawOrder.order_type || 'اوردر جديد',
-            currentStatus,
-            rawOrder.status || '',
-            rawOrder.affiliate_code || '',
-            rawOrder.affiliate_name || '',
-            rawOrder.full_name || '',
-            rawOrder.phone || '',
-            rawOrder.governrate_name || '',
-            rawOrder.address || '',
-            rawOrder.total_price || 0,
-            parseFloat(rawOrder.shipping_cost) || 0,
-            parseFloat(rawOrder.total_order) || 0,
-            rawOrder.shipping_date || null,
-            rawOrder.printed_date || null,
-            distinctMerchantCount,
-            isMultiMerchant,
-            currentStatus,
-            nowIso,
-            nowIso,
-            nowIso,
-            randomNum
-          );
-
-          ordersUpdated++;
-
-          if (statusChanged) {
-            eventsDetected++;
-            insertStatusEventStmt.run(
-              orderDbId,
-              randomNum,
-              existing.current_status,
-              currentStatus,
-              'تحديث Vendoor',
-              nowIso,
-              orderTier,
-              nowIso,
-              'orders_sync'
-            );
-
-            this.broadcast('status_changed', {
-              orderId: orderDbId,
-              randomNumber: randomNum,
-              fromStatus: existing.current_status,
-              toStatus: currentStatus,
-              timestamp: nowIso,
-            });
-          }
-        }
-
-        // Always sync items if products present
-        if (products.length > 0) {
-          deleteItemsStmt.run(orderDbId);
-          for (let i = 0; i < products.length; i++) {
-            const p = products[i];
-            const mCode = merchantCodes[Math.min(i, merchantCodes.length - 1)] || 'تاجر رئيسي';
-            insertItemStmt.run(
-              orderDbId,
-              p.pivot?.id || null,
-              p.id || null,
-              p.name || 'منتج',
-              mCode,
-              p.pivot?.code || null,
-              p.pivot?.size || null,
-              p.pivot?.color || null,
-              p.pivot?.quantity || 1,
-              parseFloat(p.pivot?.price || '0') || 0,
-              parseFloat(p.pivot?.pay_vendor || '0') || 0,
-              p.image_path || null,
-              JSON.stringify(p),
-              nowIso
-            );
-          }
-        }
-
-        // CRITICAL ALERT CHECK: Multiple Merchant Codes on Printed / Confirmed Orders
-        if (currentStatus === 'Printed' && isMultiMerchant === 1) {
-          const alertKey = `MULTI_MERCHANT_${randomNum}`;
-          const existingAlert = db.prepare('SELECT id FROM alerts WHERE alert_key = ?').get(alertKey);
-
-          if (!existingAlert) {
-            alertsTriggered++;
-            const isPreExisting = runType === 'INITIAL' ? 1 : 0;
-            const detailsJson = JSON.stringify({
-              orderId: orderDbId,
-              randomNumber: randomNum,
-              merchantCodes,
-              distinctCount: distinctMerchantCount,
-              products: products.map(p => ({
-                id: p.id,
-                name: p.name,
-                size: p.pivot?.size,
-                color: p.pivot?.color,
-                quantity: p.pivot?.quantity,
-              })),
-            });
-
-            insertAlertStmt.run(
-              alertKey,
-              orderDbId,
-              randomNum,
-              'MULTIPLE_MERCHANT_CODES',
-              'CRITICAL',
-              'OPEN',
-              `طلب مؤكد يحتوي على ${distinctMerchantCount} تجار مختلفين (${randomNum})`,
-              `الطلب في حالة Printed ويحتوي على أصناف تابعة لعدة تجار: ${merchantCodes.join('، ')}`,
-              detailsJson,
-              isPreExisting,
-              nowIso,
-              nowIso
-            );
-
-            this.broadcast('new_alert', {
-              key: alertKey,
-              randomNumber: randomNum,
-              severity: 'CRITICAL',
-              type: 'MULTIPLE_MERCHANT_CODES',
-              merchantCodes,
-            });
-          }
+        if (rawOrder.phone) {
+          enrichmentQueue.push({
+            id: upsertRes.orderDbId,
+            phone: rawOrder.phone,
+            vendoorId: rawOrder.id,
+            random_number: rawOrder.random_number || `VND_${rawOrder.id}`,
+            status: upsertRes.currentStatus,
+          });
         }
       }
 
@@ -479,33 +783,40 @@ class SyncEngine {
       this.status.currentPhase = 'SYNCING_CONFIRMATION_AGES';
       await this.syncConfirmationAges(nowIso);
 
-      // 3. Synchronize System Logs & Employee Canonical Events
+      // 3. Synchronize System Logs & Employee Canonical Events (full pagination)
       this.status.currentPhase = 'SYNCING_SYSTEM_LOGS';
-      await this.syncSystemLogs(nowIso);
+      const logRes = await this.syncSystemLogs(nowIso);
+      if (logRes.hasErrors) {
+        errorsCount++;
+      }
 
-      // 4. Enrich Customer Intelligence for up to 15 pending orders per cycle
+      // 4. Enrich Customer Intelligence and Extra Phones
       this.status.currentPhase = 'ENRICHING_CUSTOMERS';
-      await this.enrichCustomerIntelligenceBatch(ordersNeedingCustomerEnrichment.slice(0, 15), nowIso);
+      await this.enrichCustomerIntelligenceBatch(enrichmentQueue.slice(0, 20), nowIso);
+
+      // 5. Enrich Additional Phone for Printed orders needing check
+      await this.enrichAdditionalPhones(nowIso);
 
       this.status.lastSuccessfulSyncAt = new Date().toISOString();
       this.status.lastSyncCompletedAt = this.status.lastSuccessfulSyncAt;
       this.status.consecutiveFailures = 0;
-      this.status.lastError = null;
+      this.status.lastError = hasFailedPage ? errorMessage : null;
       this.status.currentPhase = 'IDLE';
 
+      const finalStatus = hasFailedPage ? 'PARTIAL' : 'SUCCESS';
+
       console.log(
-        `[SyncEngine] Sync completed successfully: ${ordersScanned} scanned, ${ordersCreated} new, ${ordersUpdated} updated, ${alertsTriggered} new alerts.`
+        `[SyncEngine] ${runType} sync completed (${finalStatus}): ${ordersScanned} scanned, ${ordersCreated} new, ${ordersUpdated} updated, ${eventsDetected} status changes.`
       );
 
-      // Record sync run
       db.prepare(`
         INSERT INTO sync_runs (
           run_type, status, orders_scanned, orders_created, orders_updated,
-          events_detected, alerts_triggered, errors_count, started_at, completed_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+          events_detected, alerts_triggered, errors_count, started_at, completed_at, error_message
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       `).run(
         runType,
-        'SUCCESS',
+        finalStatus,
         ordersScanned,
         ordersCreated,
         ordersUpdated,
@@ -513,7 +824,8 @@ class SyncEngine {
         alertsTriggered,
         errorsCount,
         nowIso,
-        this.status.lastSyncCompletedAt
+        this.status.lastSyncCompletedAt,
+        hasFailedPage ? errorMessage : null
       );
 
       this.broadcast('sync_completed', this.getStatus());
@@ -522,13 +834,12 @@ class SyncEngine {
       try {
         db.exec('ROLLBACK;');
       } catch {
-        // no transaction was active
+        // no transaction active
       }
       errorMessage = err.message;
       this.status.lastError = errorMessage;
       this.status.consecutiveFailures++;
       this.status.currentPhase = 'ERROR';
-      console.error('[SyncEngine] Sync cycle failed:', errorMessage);
 
       db.prepare(`
         INSERT INTO sync_runs (
@@ -555,8 +866,6 @@ class SyncEngine {
 
   /**
    * Sync confirmation age pages (1 day, 2 days, 3 days, >3 days)
-   * Purely observational and auditable. NEVER overwrites order status
-   * and NEVER fabricates fake numeric IDs!
    */
   private async syncConfirmationAges(nowIso: string) {
     const categories: Array<{ key: 'one' | 'two' | 'three' | 'over_three'; label: string }> = [
@@ -588,10 +897,7 @@ class SyncEngine {
         const rows: ConfirmationRow[] = await vendoorClient.fetchConfirmationAgePage(cat.key);
         for (const r of rows) {
           if (!r.randomNumber) continue;
-          
-          // Update order age metadata without altering its real status
           updateConfStmt.run(cat.label, nowIso, r.printedDate || null, r.randomNumber);
-          // Record observation
           insertObsStmt.run(r.randomNumber, r.randomNumber, cat.label, r.invoiceNo, r.printedDate, nowIso);
         }
       } catch (err: any) {
@@ -601,13 +907,14 @@ class SyncEngine {
   }
 
   /**
-   * Sync System Logs into Raw Activity and Canonical Events with date filtering and pagination
+   * Sync System Logs into Raw Activity and Canonical Events with full pagination
    */
-  public async syncSystemLogs(nowIso: string, targetDate?: string) {
+  public async syncSystemLogs(nowIso: string, targetDate?: string): Promise<{ totalLogs: number; newSaved: number; hasErrors: boolean }> {
+    let hasErrors = false;
     try {
       const dateToSync = targetDate || getCairoDateString();
       const firstPage = await vendoorClient.fetchSystemLogs(1, dateToSync, dateToSync);
-      const totalPages = Math.min(firstPage.totalPages, 20); // bounded safe pagination
+      const totalPages = Math.max(1, firstPage.totalPages);
       let allEntries: LogEntry[] = [...firstPage.entries];
 
       for (let p = 2; p <= totalPages; p++) {
@@ -616,6 +923,7 @@ class SyncEngine {
           allEntries = allEntries.concat(pageData.entries);
         } catch (pageErr: any) {
           console.warn(`[SyncEngine] Page ${p} log fetch failed:`, pageErr.message);
+          hasErrors = true;
           break;
         }
       }
@@ -636,31 +944,31 @@ class SyncEngine {
 
       let newCanonicalCount = 0;
       for (const entry of allEntries) {
-        const hashInput = `${entry.orderCode}_${entry.actorName}_${entry.rawActionText}_${entry.eventTimestamp}`;
+        const rawText = decodeHtmlEntities(entry.rawActionText || '');
+        const hashInput = `${entry.orderCode}_${entry.actorName}_${rawText}_${entry.eventTimestamp}`;
         const sourceHash = crypto.createHash('sha256').update(hashInput).digest('hex');
         const logTier = isDateInHot(entry.eventTimestamp) ? 'HOT' : 'COLD';
 
         const rawResult = insertRawStmt.run(
           sourceHash,
           entry.orderCode || null,
-          entry.actorName || 'Unknown',
-          entry.rawActionText,
+          entry.actorName || 'غير معروف',
+          rawText,
           entry.eventTimestamp,
           logTier,
           nowIso,
           'log/system'
         );
 
-        // If newly inserted
         if (rawResult.changes > 0) {
           const rawId = Number(rawResult.lastInsertRowid);
-          const { actionType, fromStatus, toStatus } = this.classifyAction(entry.rawActionText);
+          const { actionType, fromStatus, toStatus } = this.classifyAction(rawText);
           const isSystem = (entry.actorName || '').toLowerCase().includes('system') || (entry.actorName || '').includes('تلقائي') || (entry.actorName || '').includes('النظام') ? 1 : 0;
 
           insertCanonicalStmt.run(
             rawId,
             entry.orderCode || null,
-            entry.actorName || 'Unknown',
+            entry.actorName || 'غير معروف',
             actionType,
             fromStatus,
             toStatus,
@@ -672,22 +980,38 @@ class SyncEngine {
           newCanonicalCount++;
         }
       }
-      return { totalLogs: allEntries.length, newSaved: newCanonicalCount };
+
+      // Record historical coverage
+      saveCoverageRecord({
+        accountId: 'primary',
+        sourceDomain: 'logs',
+        periodDate: dateToSync,
+        storageTier: isDateInHot(dateToSync) ? 'HOT' : 'COLD',
+        pagesDiscovered: totalPages,
+        pagesRead: totalPages,
+        recordsExtracted: allEntries.length,
+        recordsSaved: newCanonicalCount,
+        completionStatus: hasErrors ? 'PARTIAL' : 'COMPLETE',
+        lastAttemptedAt: nowIso,
+        completedAt: hasErrors ? null : nowIso,
+      });
+
+      return { totalLogs: allEntries.length, newSaved: newCanonicalCount, hasErrors };
     } catch (err: any) {
       console.warn('[SyncEngine] Warning syncing system logs:', err.message);
-      return { totalLogs: 0, newSaved: 0 };
+      return { totalLogs: 0, newSaved: 0, hasErrors: true };
     }
   }
 
   /**
-   * Classify raw Arabic action text into canonical action type.
+   * Classify raw Arabic/English action text into canonical action type.
    * Accurately parses status changes, notes, phone edits, address edits,
-   * product edits, financial edits, and genuine order creation.
+   * product edits, financial edits, staff assignment, and order creation.
    */
   public classifyAction(text: string): { actionType: string; fromStatus: string | null; toStatus: string | null } {
     if (!text) return { actionType: 'other', fromStatus: null, toStatus: null };
 
-    const t = text.trim();
+    const t = decodeHtmlEntities(text).trim();
 
     // 1. NOTES: If it's a note/comment, it is strictly note_added even if it mentions status words!
     if (t.includes('ملاحظة:') || t.includes('ملاحظه:') || t.includes('note:')) {
@@ -695,7 +1019,7 @@ class SyncEngine {
     }
 
     // 2. ORDER CREATED: Genuine new order creation
-    if (t.includes('أضاف اوردر جديد') || t.includes('انشاء اوردر') || t.includes('طلب جديد')) {
+    if (t.includes('أضاف اوردر جديد') || t.includes('انشاء اوردر') || t.includes('طلب جديد') || t.includes('create order')) {
       return { actionType: 'order_created', fromStatus: null, toStatus: 'New' };
     }
 
@@ -767,10 +1091,10 @@ class SyncEngine {
   }
 
   /**
-   * Enrich orders with customer delivery rates and extra phones
+   * Enrich customer delivery rates using verified vendoor_id
    */
   private async enrichCustomerIntelligenceBatch(
-    items: { id: number; phone: string; random_number: string }[],
+    items: { id: number; phone: string; vendoorId: number; random_number: string }[],
     nowIso: string
   ) {
     const updateCustomerStmt = db.prepare(`
@@ -801,7 +1125,7 @@ class SyncEngine {
 
     for (const item of items) {
       try {
-        const hist = await vendoorClient.fetchCustomerIntelligence(item.phone, item.id);
+        const hist = await vendoorClient.fetchCustomerIntelligence(item.phone, item.vendoorId);
         updateCustomerStmt.run(
           hist.deliveryRate,
           hist.deliveriesNum,
@@ -841,10 +1165,47 @@ class SyncEngine {
   }
 
   /**
+   * Enrich Printed orders with additional phone numbers
+   */
+  private async enrichAdditionalPhones(nowIso: string) {
+    const ordersToEnrich: any[] = db.prepare(`
+      SELECT id, vendoor_id, random_number
+      FROM orders
+      WHERE current_status = 'Printed' AND (extra_phone_status = 'NOT_RETRIEVED' OR extra_phone_status IS NULL)
+      LIMIT 10
+    `).all();
+
+    for (const ord of ordersToEnrich) {
+      try {
+        const res = await vendoorClient.fetchOrderDetailsEnrichment(ord.vendoor_id);
+        if (res.success) {
+          const status = res.anotherPhone ? 'PRESENT' : 'CONFIRMED_ABSENT';
+          db.prepare(`
+            UPDATE orders SET
+              customer_phone_extra = ?,
+              extra_phone_valid = ?,
+              extra_phone_status = ?,
+              last_enrichment_at = ?,
+              last_enrichment_status = 'SUCCESS'
+            WHERE id = ?
+          `).run(res.anotherPhone || null, res.extraPhoneValid ? 1 : 0, status, nowIso, ord.id);
+        } else {
+          db.prepare(`
+            UPDATE orders SET
+              extra_phone_status = 'RETRIEVAL_FAILED',
+              last_enrichment_at = ?,
+              last_enrichment_status = 'FAILED'
+            WHERE id = ?
+          `).run(nowIso, ord.id);
+        }
+      } catch (err: any) {
+        console.warn(`[SyncEngine] Warning enriching order ${ord.vendoor_id}:`, err.message);
+      }
+    }
+  }
+
+  /**
    * Historical on-demand sync for a given date and domain ('orders' | 'logs').
-   * Requirement 2: If coverage record is COMPLETE, reads from database WITHOUT calling Vendoor.
-   * Requirement 3: If not saved or PARTIAL, fetches only missing data, stores with correct tier, and verifies completion.
-   * Requirement 6: Does not mark COMPLETE if any page fails or data is incomplete.
    */
   public async syncHistoricalDate(
     sourceDomain: 'orders' | 'logs',
@@ -861,7 +1222,7 @@ class SyncEngine {
     const storageTier = isDateInHot(cleanDate) ? 'HOT' : 'COLD';
     const nowIso = new Date().toISOString();
 
-    // 1. Check existing coverage
+    // 1. Check existing coverage: if marked COMPLETE, use database
     const existingCov = getCoverageRecord(sourceDomain, cleanDate);
     if (existingCov && existingCov.completion_status === 'COMPLETE') {
       let count = 0;
@@ -913,96 +1274,15 @@ class SyncEngine {
           }
         }
 
-        // Save orders to DB
-        const insertOrderStmt = db.prepare(`
-          INSERT INTO orders (
-            vendoor_id, random_number, order_no, order_type, current_status, status_raw,
-            affiliate_code, affiliate_name, customer_name, customer_phone,
-            governorate, address, total_price, shipping_cost, total_order,
-            created_at_source, shipping_date, printed_date, distinct_merchant_count,
-            multi_merchant_flag, state_entry_at, storage_tier, last_observed_at, created_at, updated_at
-          ) VALUES (
-            ?, ?, ?, ?, ?, ?,
-            ?, ?, ?, ?,
-            ?, ?, ?, ?, ?,
-            ?, ?, ?, ?,
-            ?, ?, ?, ?, ?, ?
-          )
-          ON CONFLICT(random_number) DO UPDATE SET
-            current_status = excluded.current_status,
-            storage_tier = excluded.storage_tier,
-            last_observed_at = excluded.last_observed_at,
-            updated_at = excluded.updated_at
-        `);
-
+        db.exec('BEGIN TRANSACTION;');
         for (const o of allOrders) {
-          const currentStatus = this.parseStatusString(o.status);
-          const products = o.products || [];
-          const merchantCodes = this.extractMerchantCodes(products);
-          const orderCreatedAt = o.created_at || `${cleanDate} 12:00:00`;
-          const runRes = insertOrderStmt.run(
-            o.id,
-            o.random_number,
-            o.order_no || null,
-            o.order_type || 'اوردر جديد',
-            currentStatus,
-            o.status || '',
-            o.affiliate_code || '',
-            o.affiliate_name || '',
-            o.full_name || '',
-            o.phone || '',
-            o.governrate_name || '',
-            o.address || '',
-            o.total_price || 0,
-            parseFloat(o.shipping_cost) || 0,
-            parseFloat(o.total_order) || 0,
-            orderCreatedAt,
-            o.shipping_date || null,
-            o.printed_date || null,
-            merchantCodes.length,
-            merchantCodes.length > 1 ? 1 : 0,
-            orderCreatedAt,
-            storageTier,
-            nowIso,
-            nowIso,
-            nowIso
-          );
+          if (!o.id) continue;
+          this.upsertCanonicalOrder(o, nowIso);
           recordsSaved++;
-
-          // Insert items if available
-          if (products.length > 0) {
-            const orderDbId = (db.prepare('SELECT id FROM orders WHERE random_number = ?').get(o.random_number) as any)?.id;
-            if (orderDbId) {
-              const insertItemStmt = db.prepare(`
-                INSERT INTO order_items (
-                  order_id, vendoor_item_id, product_id, product_name,
-                  merchant_code, sku, size, color, quantity, unit_price, pay_vendor, image_path, raw_json, created_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-              `);
-              for (let i = 0; i < products.length; i++) {
-                const p = products[i];
-                const mCode = merchantCodes[Math.min(i, merchantCodes.length - 1)] || '25919';
-                insertItemStmt.run(
-                  orderDbId,
-                  p.pivot?.id || null,
-                  p.id || null,
-                  p.name || 'منتج',
-                  mCode,
-                  p.pivot?.code || null,
-                  p.pivot?.size || null,
-                  p.pivot?.color || null,
-                  p.pivot?.quantity || 1,
-                  parseFloat(p.pivot?.price || '0') || 0,
-                  parseFloat(p.pivot?.pay_vendor || '0') || 0,
-                  p.image_path || null,
-                  JSON.stringify(p),
-                  nowIso
-                );
-              }
-            }
-          }
         }
+        db.exec('COMMIT;');
       } catch (err: any) {
+        try { db.exec('ROLLBACK;'); } catch {}
         hasFailure = true;
         errorMessage = err.message;
       }
@@ -1029,44 +1309,42 @@ class SyncEngine {
           }
         }
 
-        const insertRawStmt = db.prepare(`
-          INSERT OR IGNORE INTO raw_activity_events (
-            source_hash, order_code, actor_name, raw_action_text,
-            event_timestamp, storage_tier, observed_at, page_source
-          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-        `);
-
-        const insertCanonicalStmt = db.prepare(`
-          INSERT INTO canonical_activity_events (
-            raw_event_id, order_code, actor_name, action_type,
-            from_status, to_status, event_timestamp, storage_tier, is_system_actor, created_at
-          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        `);
-
+        db.exec('BEGIN TRANSACTION;');
         for (const entry of allEntries) {
-          const hashInput = `${entry.orderCode}_${entry.actorName}_${entry.rawActionText}_${entry.eventTimestamp}`;
+          const rawText = decodeHtmlEntities(entry.rawActionText || '');
+          const hashInput = `${entry.orderCode}_${entry.actorName}_${rawText}_${entry.eventTimestamp}`;
           const sourceHash = crypto.createHash('sha256').update(hashInput).digest('hex');
 
-          const rawResult = insertRawStmt.run(
+          const rawResult = db.prepare(`
+            INSERT OR IGNORE INTO raw_activity_events (
+              source_hash, order_code, actor_name, raw_action_text,
+              event_timestamp, storage_tier, observed_at, page_source
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+          `).run(
             sourceHash,
             entry.orderCode || null,
-            entry.actorName || 'Unknown',
-            entry.rawActionText,
+            entry.actorName || 'غير معروف',
+            rawText,
             entry.eventTimestamp,
             storageTier,
             nowIso,
-            'log/system'
+            'log/historical'
           );
 
           if (rawResult.changes > 0) {
             const rawId = Number(rawResult.lastInsertRowid);
-            const { actionType, fromStatus, toStatus } = this.classifyAction(entry.rawActionText);
-            const isSystem = (entry.actorName || '').toLowerCase().includes('system') || (entry.actorName || '').includes('تلقائي') ? 1 : 0;
+            const { actionType, fromStatus, toStatus } = this.classifyAction(rawText);
+            const isSystem = (entry.actorName || '').toLowerCase().includes('system') || (entry.actorName || '').includes('تلقائي') || (entry.actorName || '').includes('النظام') ? 1 : 0;
 
-            insertCanonicalStmt.run(
+            db.prepare(`
+              INSERT INTO canonical_activity_events (
+                raw_event_id, order_code, actor_name, action_type,
+                from_status, to_status, event_timestamp, storage_tier, is_system_actor, created_at
+              ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            `).run(
               rawId,
               entry.orderCode || null,
-              entry.actorName || 'Unknown',
+              entry.actorName || 'غير معروف',
               actionType,
               fromStatus,
               toStatus,
@@ -1078,16 +1356,20 @@ class SyncEngine {
             recordsSaved++;
           }
         }
+        db.exec('COMMIT;');
       } catch (err: any) {
+        try { db.exec('ROLLBACK;'); } catch {}
         hasFailure = true;
         errorMessage = err.message;
       }
     }
 
-    const isComplete = !hasFailure && pagesRead >= pagesDiscovered;
-    const finalStatus = isComplete ? 'COMPLETE' : (recordsSaved > 0 ? 'PARTIAL' : 'FAILED');
+    const completionStatus: 'COMPLETE' | 'PARTIAL' | 'FAILED' = hasFailure
+      ? (recordsSaved > 0 ? 'PARTIAL' : 'FAILED')
+      : 'COMPLETE';
 
     saveCoverageRecord({
+      accountId: 'primary',
       sourceDomain,
       periodDate: cleanDate,
       storageTier,
@@ -1095,14 +1377,14 @@ class SyncEngine {
       pagesRead,
       recordsExtracted,
       recordsSaved,
-      completionStatus: finalStatus,
+      completionStatus,
       errorMessage,
       lastAttemptedAt: nowIso,
-      completedAt: isComplete ? nowIso : null,
+      completedAt: completionStatus === 'COMPLETE' ? nowIso : null,
     });
 
     return {
-      status: finalStatus,
+      status: completionStatus,
       source: 'VENDOOR',
       recordsCount: recordsSaved,
       pagesRead,
@@ -1111,117 +1393,40 @@ class SyncEngine {
     };
   }
 
-  /**
-   * Independent full scan of all confirmed/Printed orders across all pagination pages
-   * to detect multiple merchant codes (Requirement 7).
-   */
-  public async scanAllConfirmedOrdersForMultiMerchant(): Promise<{
-    totalConfirmedScanned: number;
-    multiMerchantOrdersFound: number;
-    newAlertsCreated: number;
-  }> {
-    await vendoorClient.ensureAuthenticated();
-    let start = 0;
-    const batchSize = 100;
-    let totalConfirmedScanned = 0;
-    let multiMerchantOrdersFound = 0;
-    let newAlertsCreated = 0;
+  public async scanAllConfirmedOrdersForMultiMerchant(): Promise<{ scanned: number; alertsTriggered: number }> {
+    const printedOrders: any[] = db.prepare(`
+      SELECT id, random_number, current_status
+      FROM orders
+      WHERE current_status = 'Printed'
+    `).all();
+
+    let alertsTriggered = 0;
     const nowIso = new Date().toISOString();
 
-    const insertAlertStmt = db.prepare(`
-      INSERT INTO alerts (
-        alert_key, order_id, random_number, alert_type, severity,
-        status, title, description, details_json, is_pre_existing,
-        created_at, updated_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    `);
-
-    while (true) {
-      const batch = await vendoorClient.fetchOrdersBatch(start, batchSize, 'Printed');
-      if (!batch.data || batch.data.length === 0) break;
-
-      totalConfirmedScanned += batch.data.length;
-
-      for (const rawOrder of batch.data) {
-        const randomNum = rawOrder.random_number;
-        const products = rawOrder.products || [];
-        const merchantCodes = this.extractMerchantCodes(products);
-        const distinctCount = merchantCodes.length;
-
-        if (distinctCount > 1) {
-          multiMerchantOrdersFound++;
-          let orderRow: any = db.prepare('SELECT id FROM orders WHERE random_number = ?').get(randomNum);
-          let orderId = orderRow?.id;
-          if (!orderId) {
-            const orderTier = isDateInHot(rawOrder.created_at || nowIso) ? 'HOT' : 'COLD';
-            const res = db.prepare(`
-              INSERT INTO orders (
-                vendoor_id, random_number, order_no, order_type, current_status, status_raw,
-                affiliate_code, affiliate_name, customer_name, customer_phone,
-                governorate, address, total_price, shipping_cost, total_order,
-                created_at_source, printed_date, distinct_merchant_count, multi_merchant_flag,
-                storage_tier, state_entry_at, last_observed_at, created_at, updated_at
-              ) VALUES (?, ?, ?, ?, 'Printed', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?)
-              ON CONFLICT(random_number) DO UPDATE SET
-                distinct_merchant_count = excluded.distinct_merchant_count,
-                multi_merchant_flag = 1,
-                updated_at = excluded.updated_at
-            `).run(
-              rawOrder.id,
-              randomNum,
-              rawOrder.order_no || null,
-              rawOrder.order_type || 'اوردر جديد',
-              rawOrder.status || '',
-              rawOrder.affiliate_code || '',
-              rawOrder.affiliate_name || '',
-              rawOrder.full_name || '',
-              rawOrder.phone || '',
-              rawOrder.governrate_name || '',
-              rawOrder.address || '',
-              rawOrder.total_price || 0,
-              parseFloat(rawOrder.shipping_cost) || 0,
-              parseFloat(rawOrder.total_order) || 0,
-              rawOrder.created_at || nowIso,
-              rawOrder.printed_date || null,
-              distinctCount,
-              orderTier,
-              nowIso,
-              nowIso,
-              nowIso,
-              nowIso
-            );
-            orderId = Number(res.lastInsertRowid) || (db.prepare('SELECT id FROM orders WHERE random_number = ?').get(randomNum) as any)?.id;
-          } else {
-            db.prepare('UPDATE orders SET multi_merchant_flag = 1, distinct_merchant_count = ? WHERE id = ?').run(distinctCount, orderId);
-          }
-
-          const alertKey = `MULTI_MERCHANT_${randomNum}`;
-          const existingAlert = db.prepare('SELECT id FROM alerts WHERE alert_key = ?').get(alertKey);
-          if (!existingAlert && orderId) {
-            newAlertsCreated++;
-            insertAlertStmt.run(
-              alertKey,
-              orderId,
-              randomNum,
-              'MULTIPLE_MERCHANT_CODES',
-              'CRITICAL',
-              'OPEN',
-              `طلب مؤكد يحتوي على ${distinctCount} تجار مختلفين (${randomNum})`,
-              `الطلب في حالة Printed ويحتوي على أصناف تابعة لعدة تجار: ${merchantCodes.join('، ')}`,
-              JSON.stringify({ orderId, randomNumber: randomNum, merchantCodes, distinctCount }),
-              0,
-              nowIso,
-              nowIso
-            );
-          }
-        }
+    for (const ord of printedOrders) {
+      const items: any[] = db.prepare('SELECT product_name, merchant_code, warehouse_name FROM order_items WHERE order_id = ?').all(ord.id);
+      const warehouses = new Set<string>();
+      for (const it of items) {
+        const w = extractWarehouseFromProduct({ name: it.product_name, warehouse_name: it.warehouse_name || it.merchant_code } as any);
+        if (w) warehouses.add(w);
       }
+      const distinctList = Array.from(warehouses);
+      const isMulti = distinctList.length > 1;
 
-      start += batch.data.length;
-      if (start >= batch.recordsTotal) break;
+      db.prepare(`
+        UPDATE orders SET
+          distinct_merchant_count = ?,
+          multi_merchant_flag = ?
+        WHERE id = ?
+      `).run(distinctList.length > 0 ? distinctList.length : 1, isMulti ? 1 : 0, ord.id);
+
+      if (isMulti) {
+        const tr = this.evaluateOrderAlerts(ord.id, ord.random_number, 'Printed', 1, distinctList, nowIso);
+        if (tr > 0) alertsTriggered++;
+      }
     }
 
-    return { totalConfirmedScanned, multiMerchantOrdersFound, newAlertsCreated };
+    return { scanned: printedOrders.length, alertsTriggered };
   }
 }
 

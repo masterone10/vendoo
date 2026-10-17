@@ -8,7 +8,8 @@
     "build": "vite build && esbuild server.ts --bundle --platform=node --target=node22 --outfile=dist-server/server.js --external:node:sqlite --external:express --external:vite",
     "start": "node dist-server/server.js",
     "clean": "rm -rf dist dist-server",
-    "lint": "tsc --noEmit"
+    "lint": "tsc --noEmit",
+    "test": "tsx server/tests/acceptance.test.ts && tsx server/tests/requirements_verification.test.ts"
   },
   "dependencies": {
     "@google/genai": "^2.4.0",

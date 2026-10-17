@@ -1,5 +1,5 @@
 import dotenv from 'dotenv';
-dotenv.config();
+dotenv.config({ override: true });
 
 export interface VendoorRawProduct {
   id: number;
@@ -157,7 +157,10 @@ class VendoorClient {
 
         this.updateCookies(getRes);
         const html = await getRes.text();
-        const tokenMatch = html.match(/name="_token"\s+value="([^"]+)"/);
+        const tokenMatch = html.match(/<input[^>]+name=["']_token["'][^>]+value=["']([^"']+)["']/i) ||
+                           html.match(/<input[^>]+value=["']([^"']+)["'][^>]+name=["']_token["']/i) ||
+                           html.match(/<meta[^>]+name=["']csrf-token["'][^>]+content=["']([^"']+)["']/i) ||
+                           html.match(/name="_token"\s+value="([^"]+)"/);
         if (!tokenMatch) {
           throw new Error('CSRF token not found on Vendoor login page');
         }
@@ -490,6 +493,7 @@ class VendoorClient {
   }
 
   public async fetchOrderDetailsEnrichment(vendoorOrderId: number): Promise<{
+    success: boolean;
     anotherPhone: string;
     extraPhoneValid: boolean;
     merchantCodes: string[];
@@ -511,13 +515,13 @@ class VendoorClient {
     this.updateCookies(res);
 
     if (!res.ok) {
-      return { anotherPhone: '', extraPhoneValid: false, merchantCodes: [], vendorIds: [], warehouseNames: [] };
+      return { success: false, anotherPhone: '', extraPhoneValid: false, merchantCodes: [], vendorIds: [], warehouseNames: [] };
     }
 
     const html = await res.text();
 
     // Extract another_phone
-    const phoneMatch = html.match(/name="another_phone"[^>]*value="([^"]*)"/i);
+    const phoneMatch = html.match(/name="another_phone"[^>]*value="([^"]*)"/i) || html.match(/value="([^"]*)"[^>]*name="another_phone"/i);
     const anotherPhone = phoneMatch ? phoneMatch[1].trim() : '';
 
     // Validate extra phone: Egyptian mobile numbers must match 01[0125][0-9]{8}
@@ -536,6 +540,7 @@ class VendoorClient {
     const distinctMerchantCodes = vendorIds.length > 0 ? [...new Set(vendorIds)] : [];
 
     return {
+      success: true,
       anotherPhone,
       extraPhoneValid,
       merchantCodes: distinctMerchantCodes,

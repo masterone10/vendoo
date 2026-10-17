@@ -13,7 +13,7 @@ export const PendingProcessingView: React.FC<PendingProcessingViewProps> = ({
 }) => {
   const [orders, setOrders] = useState<any[]>([]);
   const [loading, setLoading] = useState(false);
-  const [selectedAgeBucket, setSelectedAgeBucket] = useState<'all' | '2_to_4_days' | '4_to_5_days' | 'over_5_days'>('all');
+  const [selectedAgeBucket, setSelectedAgeBucket] = useState<'all' | 'less_than_2_days' | '2_to_4_days' | '4_to_5_days' | 'over_5_days' | 'unknown'>('all');
   const [search, setSearch] = useState('');
 
   useEffect(() => {
@@ -34,12 +34,14 @@ export const PendingProcessingView: React.FC<PendingProcessingViewProps> = ({
     }
   }
 
-  // Count by age bucket
+  // Count by age bucket (5 mutually exclusive buckets)
   const bucketCounts = {
     all: orders.length,
+    less_than_2_days: orders.filter(o => o.ageBucket === 'less_than_2_days').length,
     '2_to_4_days': orders.filter(o => o.ageBucket === '2_to_4_days').length,
     '4_to_5_days': orders.filter(o => o.ageBucket === '4_to_5_days').length,
     over_5_days: orders.filter(o => o.ageBucket === 'over_5_days').length,
+    unknown: orders.filter(o => o.ageBucket === 'unknown').length,
   };
 
   const filtered = orders.filter((o) => {
@@ -49,8 +51,8 @@ export const PendingProcessingView: React.FC<PendingProcessingViewProps> = ({
     if (!search) return true;
     const q = search.toLowerCase();
     return (
-      o.random_number.toLowerCase().includes(q) ||
-      o.customer_phone.includes(q) ||
+      (o.random_number && o.random_number.toLowerCase().includes(q)) ||
+      (o.customer_phone && o.customer_phone.includes(q)) ||
       (o.customer_name && o.customer_name.toLowerCase().includes(q))
     );
   });
@@ -85,12 +87,14 @@ export const PendingProcessingView: React.FC<PendingProcessingViewProps> = ({
             </span>
           </h2>
           <p className="text-xs text-slate-400 mt-1">
-            متابعة عمر الحالة الحالية ومنع تجاوز المهلات التشغيلية
+            {isPending
+              ? 'العمر محسوب حصريًا من تاريخ إنشاء الطلب الأصلي في Vendoor دون تأثر بالمزامنات أو التعديلات'
+              : 'العمر محسوب بدقة من واقع آخر حركة تحويل فعلية إلى Processing مسجلة في سجلات النظام (Logs)'}
           </p>
         </div>
 
         {/* Age Buckets Filter */}
-        <div className="flex items-center gap-1.5 p-1 bg-slate-900 border border-slate-800 rounded-lg text-xs font-medium">
+        <div className="flex items-center gap-1.5 p-1 bg-slate-900 border border-slate-800 rounded-lg text-xs font-medium flex-wrap">
           <button
             onClick={() => setSelectedAgeBucket('all')}
             className={`px-3 py-1.5 rounded-md transition-all cursor-pointer ${
@@ -100,6 +104,16 @@ export const PendingProcessingView: React.FC<PendingProcessingViewProps> = ({
             }`}
           >
             الكل ({bucketCounts.all})
+          </button>
+          <button
+            onClick={() => setSelectedAgeBucket('less_than_2_days')}
+            className={`px-3 py-1.5 rounded-md transition-all cursor-pointer ${
+              selectedAgeBucket === 'less_than_2_days'
+                ? 'bg-emerald-500/20 text-emerald-300 border border-emerald-500/30 shadow-sm'
+                : 'text-slate-400 hover:text-emerald-400'
+            }`}
+          >
+            أقل من يومين ({bucketCounts.less_than_2_days})
           </button>
           <button
             onClick={() => setSelectedAgeBucket('2_to_4_days')}
@@ -131,6 +145,18 @@ export const PendingProcessingView: React.FC<PendingProcessingViewProps> = ({
           >
             أكثر من 5 أيام ({bucketCounts.over_5_days})
           </button>
+          {bucketCounts.unknown > 0 && (
+            <button
+              onClick={() => setSelectedAgeBucket('unknown')}
+              className={`px-3 py-1.5 rounded-md transition-all cursor-pointer ${
+                selectedAgeBucket === 'unknown'
+                  ? 'bg-slate-700 text-slate-200 border border-slate-600 shadow-sm'
+                  : 'text-slate-400 hover:text-slate-300'
+              }`}
+            >
+              غير محدد ({bucketCounts.unknown})
+            </button>
+          )}
         </div>
       </div>
 

@@ -7,7 +7,11 @@ interface TeamViewProps {
   onSelectOrder: (orderCode: string) => void;
 }
 
+export type TeamPeriodType = 'today' | 'yesterday' | 'all' | 'custom';
+
 export const TeamView: React.FC<TeamViewProps> = ({ selectedDate, onSelectOrder }) => {
+  const [period, setPeriod] = useState<TeamPeriodType>(selectedDate ? 'custom' : 'today');
+  const [customDate, setCustomDate] = useState<string>(selectedDate || '');
   const [team, setTeam] = useState<TeamMember[]>([]);
   const [totalActions, setTotalActions] = useState(0);
   const [totalUniqueOrders, setTotalUniqueOrders] = useState(0);
@@ -18,19 +22,39 @@ export const TeamView: React.FC<TeamViewProps> = ({ selectedDate, onSelectOrder 
   const [eventsLoading, setEventsLoading] = useState(false);
 
   useEffect(() => {
-    fetchTeamData();
+    if (selectedDate) {
+      setCustomDate(selectedDate);
+      setPeriod('custom');
+    }
   }, [selectedDate]);
+
+  useEffect(() => {
+    fetchTeamData();
+  }, [period, customDate]);
 
   async function fetchTeamData() {
     setLoading(true);
     try {
-      const url = selectedDate ? `/api/team?date=${selectedDate}` : '/api/team?period=today';
+      let url = '/api/team';
+      if (period === 'today') {
+        url = '/api/team?period=today';
+      } else if (period === 'yesterday') {
+        url = '/api/team?period=yesterday';
+      } else if (period === 'all') {
+        url = '/api/team?period=all';
+      } else if (period === 'custom') {
+        if (customDate) {
+          url = `/api/team?date=${encodeURIComponent(customDate)}`;
+        } else {
+          url = '/api/team?period=today';
+        }
+      }
       const res = await fetch(url);
       const data = await res.json();
       setTeam(data.team || []);
       setTotalActions(data.totalActions || 0);
       setTotalUniqueOrders(data.totalUniqueOrders || 0);
-      setDateFilterLabel(data.dateFilter || selectedDate || '');
+      setDateFilterLabel(data.dateFilter || customDate || '');
     } catch (err) {
       console.error('Error fetching team stats:', err);
     } finally {
@@ -43,8 +67,14 @@ export const TeamView: React.FC<TeamViewProps> = ({ selectedDate, onSelectOrder 
     setEventsLoading(true);
     try {
       let url = `/api/team/${encodeURIComponent(name)}/events`;
-      if (selectedDate) {
-        url += `?date=${selectedDate}`;
+      if (period === 'today') {
+        url += '?period=today';
+      } else if (period === 'yesterday') {
+        url += '?period=yesterday';
+      } else if (period === 'all') {
+        url += '?period=all';
+      } else if (period === 'custom' && customDate) {
+        url += `?date=${encodeURIComponent(customDate)}`;
       }
       const res = await fetch(url);
       const data = await res.json();

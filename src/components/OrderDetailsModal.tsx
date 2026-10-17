@@ -25,6 +25,7 @@ export const OrderDetailsModal: React.FC<OrderDetailsModalProps> = ({ orderCode,
   const [timeline, setTimeline] = useState<any[]>([]);
   const [alerts, setAlerts] = useState<Alert[]>([]);
   const [customerObservations, setCustomerObservations] = useState<any[]>([]);
+  const [sourceLogs, setSourceLogs] = useState<any[]>([]);
   const [loading, setLoading] = useState(false);
 
   useEffect(() => {
@@ -43,6 +44,7 @@ export const OrderDetailsModal: React.FC<OrderDetailsModalProps> = ({ orderCode,
       setTimeline(data.timeline || []);
       setAlerts(data.alerts || []);
       setCustomerObservations(data.customerObservations || []);
+      setSourceLogs(data.sourceLogs || []);
     } catch (err) {
       console.error('Error fetching order details:', err);
     } finally {
@@ -324,9 +326,9 @@ export const OrderDetailsModal: React.FC<OrderDetailsModalProps> = ({ orderCode,
                       لا توجد سجلات انتقالات سابقة محفوظة
                     </div>
                   ) : (
-                    timeline.map((evt, idx) => (
+                    timeline.map((evt) => (
                       <div key={evt.id} className="flex items-start gap-3 border-b border-slate-800/60 last:border-0 pb-2.5 last:pb-0">
-                        <div className="w-2 h-2 rounded-full bg-amber-400 mt-1.5 shrink-0"></div>
+                        <div className={`w-2 h-2 rounded-full mt-1.5 shrink-0 ${evt.source_channel === 'poll_detection' ? 'bg-sky-400' : 'bg-amber-400'}`}></div>
                         <div className="flex-1 space-y-0.5">
                           <div className="flex items-center justify-between">
                             <span className="font-semibold text-slate-200">
@@ -336,8 +338,10 @@ export const OrderDetailsModal: React.FC<OrderDetailsModalProps> = ({ orderCode,
                               {evt.event_time_source || evt.observed_at}
                             </span>
                           </div>
-                          <div className="text-[11px] text-slate-400">
-                            المنفذ: {evt.actor_name || 'النظام'} · القناة: {evt.source_channel}
+                          <div className="text-[11px] text-slate-400 flex items-center gap-2">
+                            <span>المنفذ: {evt.actor_name || 'النظام'}</span>
+                            <span>·</span>
+                            <span>القناة: {evt.source_channel === 'poll_detection' ? 'كشف المزامنة الدورية (Poll)' : 'سجل أصلي (Source Log)'}</span>
                           </div>
                         </div>
                       </div>
@@ -345,6 +349,32 @@ export const OrderDetailsModal: React.FC<OrderDetailsModalProps> = ({ orderCode,
                   )}
                 </div>
               </div>
+
+              {/* Genuine Vendoor System Logs for this Order */}
+              {sourceLogs.length > 0 && (
+                <div className="space-y-3">
+                  <h4 className="font-bold text-slate-200 flex items-center gap-2">
+                    <Clock className="w-4 h-4 text-emerald-400" />
+                    <span>سجلات العمليات الرسمية من Vendoor ({sourceLogs.length} حركة مسجلة)</span>
+                  </h4>
+
+                  <div className="p-4 rounded-xl bg-slate-950/60 border border-slate-800 space-y-2.5 max-h-60 overflow-y-auto">
+                    {sourceLogs.map((log) => (
+                      <div key={log.id} className="flex items-start justify-between gap-3 text-xs border-b border-slate-800/50 pb-2 last:border-0">
+                        <div className="space-y-0.5">
+                          <div className="text-slate-200 font-medium">{log.raw_action_text || log.action_type}</div>
+                          <div className="text-[11px] text-slate-400 font-mono">
+                            الموظف: <strong className="text-amber-400">{log.actor_name}</strong> · النوع: {log.action_type}
+                          </div>
+                        </div>
+                        <span className="text-[11px] font-mono text-slate-500 whitespace-nowrap">
+                          {log.event_timestamp}
+                        </span>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              )}
             </>
           )}
         </div>

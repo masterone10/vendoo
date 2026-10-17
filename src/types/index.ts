@@ -29,8 +29,10 @@ export interface Order {
   customer_phone: string;
   customer_phone_extra: string | null;
   extra_phone_valid: number;
+  extra_phone_status?: 'NOT_RETRIEVED' | 'PRESENT' | 'CONFIRMED_ABSENT' | 'RETRIEVAL_FAILED' | string;
   governorate: string;
   address: string;
+  address_quality_status?: 'VALID' | 'SHORT_ADDRESS' | 'LATIN_SCRIPT' | 'MISSING' | 'NOT_RETRIEVED' | string;
   total_price: number;
   shipping_cost: number;
   total_order: number;
@@ -111,15 +113,19 @@ export interface DashboardStats {
     Canceled: number;
   };
   pendingAge: {
+    lessThanTwoDays: number;
     twoToFourDays: number;
     fourToFiveDays: number;
     overFiveDays: number;
+    unknown: number;
     total: number;
   };
   processingAge: {
+    lessThanTwoDays: number;
     twoToFourDays: number;
     fourToFiveDays: number;
     overFiveDays: number;
+    unknown: number;
     total: number;
   };
   syncStatus: SyncStatus;

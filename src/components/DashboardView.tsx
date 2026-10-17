@@ -391,26 +391,37 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
             <span className="text-xs text-slate-500">إجمالي {pendingAge.total} طلب</span>
           </div>
 
-          <div className="grid grid-cols-3 gap-2.5 pt-1 text-center">
+          <div className="grid grid-cols-2 sm:grid-cols-4 gap-2.5 pt-1 text-center">
+            <div className="p-2.5 rounded-lg bg-slate-950/60 border border-slate-800">
+              <div className="text-[11px] text-slate-400">&lt; يومين</div>
+              <div className="text-lg font-bold font-mono text-emerald-400 mt-0.5">
+                {pendingAge.lessThanTwoDays || 0}
+              </div>
+            </div>
             <div className="p-2.5 rounded-lg bg-slate-950/60 border border-slate-800">
               <div className="text-[11px] text-slate-400">2 إلى 4 أيام</div>
               <div className="text-lg font-bold font-mono text-amber-300 mt-0.5">
-                {pendingAge.twoToFourDays}
+                {pendingAge.twoToFourDays || 0}
               </div>
             </div>
             <div className="p-2.5 rounded-lg bg-slate-950/60 border border-slate-800">
               <div className="text-[11px] text-slate-400">4 إلى 5 أيام</div>
               <div className="text-lg font-bold font-mono text-amber-400 mt-0.5">
-                {pendingAge.fourToFiveDays}
+                {pendingAge.fourToFiveDays || 0}
               </div>
             </div>
             <div className="p-2.5 rounded-lg bg-slate-950/60 border border-slate-800">
               <div className="text-[11px] text-slate-400">&gt; 5 أيام (حرج)</div>
               <div className="text-lg font-bold font-mono text-rose-400 mt-0.5">
-                {pendingAge.overFiveDays}
+                {pendingAge.overFiveDays || 0}
               </div>
             </div>
           </div>
+          {Boolean(pendingAge.unknown) && (
+            <div className="text-[11px] text-slate-500 text-left pt-1">
+              غير محدد / غير مكتمل: {pendingAge.unknown}
+            </div>
+          )}
         </div>
 
         {/* Processing Age Breakdown */}
@@ -421,31 +432,42 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
           <div className="flex items-center justify-between border-b border-slate-800/60 pb-3">
             <h4 className="text-sm font-bold text-sky-400 flex items-center gap-2">
               <RotateCw className="w-4 h-4 text-sky-400" />
-              <span>أعمار طلبات Processing (قيد التجهيز)</span>
+              <span>أعمار طلبات Processing (من واقع السجلات)</span>
             </h4>
             <span className="text-xs text-slate-500">إجمالي {processingAge.total} طلب</span>
           </div>
 
-          <div className="grid grid-cols-3 gap-2.5 pt-1 text-center">
+          <div className="grid grid-cols-2 sm:grid-cols-4 gap-2.5 pt-1 text-center">
+            <div className="p-2.5 rounded-lg bg-slate-950/60 border border-slate-800">
+              <div className="text-[11px] text-slate-400">&lt; يومين</div>
+              <div className="text-lg font-bold font-mono text-emerald-400 mt-0.5">
+                {processingAge.lessThanTwoDays || 0}
+              </div>
+            </div>
             <div className="p-2.5 rounded-lg bg-slate-950/60 border border-slate-800">
               <div className="text-[11px] text-slate-400">2 إلى 4 أيام</div>
               <div className="text-lg font-bold font-mono text-sky-300 mt-0.5">
-                {processingAge.twoToFourDays}
+                {processingAge.twoToFourDays || 0}
               </div>
             </div>
             <div className="p-2.5 rounded-lg bg-slate-950/60 border border-slate-800">
               <div className="text-[11px] text-slate-400">4 إلى 5 أيام</div>
               <div className="text-lg font-bold font-mono text-amber-400 mt-0.5">
-                {processingAge.fourToFiveDays}
+                {processingAge.fourToFiveDays || 0}
               </div>
             </div>
             <div className="p-2.5 rounded-lg bg-slate-950/60 border border-slate-800">
               <div className="text-[11px] text-slate-400">&gt; 5 أيام (تأخير)</div>
               <div className="text-lg font-bold font-mono text-rose-400 mt-0.5">
-                {processingAge.overFiveDays}
+                {processingAge.overFiveDays || 0}
               </div>
             </div>
           </div>
+          {Boolean(processingAge.unknown) && (
+            <div className="text-[11px] text-slate-500 text-left pt-1">
+              غير محدد / غير مكتمل السجل: {processingAge.unknown}
+            </div>
+          )}
         </div>
       </section>
     </div>
