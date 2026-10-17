@@ -133,14 +133,17 @@ export interface DashboardStats {
 
 export interface SyncStatus {
   isRunning: boolean;
+  cycleState?: 'IDLE' | 'QUEUED' | 'RUNNING' | 'PARTIAL' | 'SUCCESS' | 'ERROR';
   lastSyncStartedAt: string | null;
   lastSyncCompletedAt: string | null;
   lastSuccessfulSyncAt: string | null;
+  nextScheduledRunAt?: string | null;
   currentPhase: string;
   totalOrdersInDb: number;
   totalAlertsOpen: number;
   lastError: string | null;
   consecutiveFailures: number;
+  lastDurationMs?: number | null;
 }
 
 export interface TeamMember {

@@ -1,6 +1,7 @@
 import { Router, Request, Response } from 'express';
 import {
   db,
+  DB_PATH,
   getCairoDateString,
   getCairoDateInterval,
   getDailySnapshot,
@@ -955,6 +956,15 @@ apiRouter.get('/sync/runs', (_req: Request, res: Response) => {
   }
 });
 
+apiRouter.get('/sync/reconcile', async (_req: Request, res: Response) => {
+  try {
+    const report = syncEngine.reconcileSourceVsLocal();
+    res.json(report);
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 apiRouter.post('/alerts/scan-multi-merchant', async (_req: Request, res: Response) => {
   try {
     const result = await syncEngine.scanAllConfirmedOrdersForMultiMerchant();
@@ -1001,7 +1011,7 @@ apiRouter.get('/settings', (_req: Request, res: Response) => {
       timezone: 'Africa/Cairo',
       syncInterval: parseInt(process.env.SYNC_INTERVAL_SECONDS || '30', 10),
       database: {
-        path: process.env.DATABASE_PATH || 'data/vendoor_intelligence.sqlite',
+        path: DB_PATH,
         sizeBytes: dbSize,
         journalMode: walMode,
       },

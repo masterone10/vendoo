@@ -16,16 +16,76 @@ import {
   LogEntry,
 } from './vendoorClient.js';
 
+export interface DetailedSyncMetrics {
+  rawRowsReceived: number;
+  validRecordsParsed: number;
+  uniqueSourceIds: number;
+  duplicateSourceIds: number;
+  newOrdersInserted: number;
+  existingOrdersExamined: number;
+  recordsWithFieldChanges: number;
+  statusChangesCount: number;
+  unresolvedStatusCount: number;
+  invalidRecordsCount: number;
+  failedPagesCount: number;
+  failedEnrichmentCount: number;
+}
+
+export interface PhaseTimings {
+  ordersFetchMs: number;
+  dbUpsertMs: number;
+  confirmationAgesMs: number;
+  systemLogsMs: number;
+  enrichmentMs: number;
+  totalDurationMs: number;
+}
+
 export interface SyncEngineStatus {
   isRunning: boolean;
+  cycleState: 'IDLE' | 'QUEUED' | 'RUNNING' | 'PARTIAL' | 'SUCCESS' | 'ERROR';
   lastSyncStartedAt: string | null;
   lastSyncCompletedAt: string | null;
   lastSuccessfulSyncAt: string | null;
+  nextScheduledRunAt: string | null;
   currentPhase: string;
   totalOrdersInDb: number;
   totalAlertsOpen: number;
   lastError: string | null;
   consecutiveFailures: number;
+  lastDurationMs: number | null;
+  phaseTimings: PhaseTimings | null;
+  detailedMetrics: DetailedSyncMetrics | null;
+}
+
+export interface StatusReconciliationItem {
+  status: string;
+  sourceCount: number;
+  localCount: number;
+  matchingCount: number;
+  sourceOnlyCount: number;
+  localOnlyCount: number;
+  statusMismatchCount: number;
+}
+
+export interface ReconciliationReport {
+  timestamp: string;
+  sourceTotalUnique: number;
+  localTotalUnique: number;
+  overallMatching: number;
+  missingLocallyCount: number;
+  missingInSourceCount: number;
+  statusMismatchTotal: number;
+  duplicateSourceIdsCount: number;
+  duplicateCanonicalInDbCount: number;
+  unresolvedStatusCount: number;
+  byStatus: Record<string, StatusReconciliationItem>;
+  sampleMismatches: Array<{
+    vendoorId: number;
+    sourceStatus: string;
+    localStatus: string;
+    sourceOrderNo?: string | null;
+  }>;
+  parityStatus: 'VERIFIED' | 'MISMATCH' | 'PARTIAL' | 'UNVERIFIED';
 }
 
 export interface AgeCalculationResult {
@@ -198,6 +258,82 @@ export function evaluateAddressQuality(address: string | null | undefined): {
   return { isConfirmedShort, isConfirmedLatin, wordCount, latinRatio, status };
 }
 
+/**
+ * Normalized comparison between existing local canonical order and incoming raw order.
+ * Strictly checks business fields and status; ignores observation metadata and local timestamps.
+ */
+export function detectOrderBusinessChanges(
+  existing: any,
+  rawOrder: VendoorRawOrder,
+  normalizedStatus: string,
+  multiWarehouseFlag: number,
+  distinctCount: number
+): {
+  businessFieldsChanged: boolean;
+  statusChanged: boolean;
+  changedFields: string[];
+} {
+  const changedFields: string[] = [];
+  const statusChanged = Boolean(existing && existing.current_status !== normalizedStatus);
+  if (statusChanged) {
+    changedFields.push('current_status');
+  }
+
+  if (!existing) {
+    return { businessFieldsChanged: true, statusChanged: false, changedFields: ['new_record'] };
+  }
+
+  // Compare normalized business fields only
+  if (rawOrder.random_number && existing.random_number !== rawOrder.random_number) {
+    changedFields.push('random_number');
+  }
+  if (rawOrder.order_no && existing.order_no !== rawOrder.order_no) {
+    changedFields.push('order_no');
+  }
+  if (rawOrder.order_type && existing.order_type !== rawOrder.order_type) {
+    changedFields.push('order_type');
+  }
+  if (rawOrder.full_name && existing.customer_name !== rawOrder.full_name) {
+    changedFields.push('customer_name');
+  }
+  if (rawOrder.phone && existing.customer_phone !== rawOrder.phone) {
+    changedFields.push('customer_phone');
+  }
+  if (rawOrder.governrate_name && existing.governorate !== rawOrder.governrate_name) {
+    changedFields.push('governorate');
+  }
+  if (rawOrder.address && existing.address !== rawOrder.address) {
+    changedFields.push('address');
+  }
+
+  const newTotal = parseFloat(rawOrder.total_order || '0') || 0;
+  if (newTotal > 0 && Math.abs((existing.total_order || 0) - newTotal) > 0.01) {
+    changedFields.push('total_order');
+  }
+
+  const newShipping = parseFloat(rawOrder.shipping_cost || '0') || 0;
+  if (newShipping > 0 && Math.abs((existing.shipping_cost || 0) - newShipping) > 0.01) {
+    changedFields.push('shipping_cost');
+  }
+
+  if (rawOrder.shipping_date && existing.shipping_date !== rawOrder.shipping_date) {
+    changedFields.push('shipping_date');
+  }
+  if (rawOrder.printed_date && existing.printed_date !== rawOrder.printed_date) {
+    changedFields.push('printed_date');
+  }
+
+  if (existing.multi_merchant_flag !== multiWarehouseFlag) {
+    changedFields.push('multi_merchant_flag');
+  }
+  if (existing.distinct_merchant_count !== distinctCount) {
+    changedFields.push('distinct_merchant_count');
+  }
+
+  const businessFieldsChanged = changedFields.some(f => f !== 'current_status');
+  return { businessFieldsChanged, statusChanged, changedFields };
+}
+
 type SSEListener = (data: { event: string; payload: any }) => void;
 
 export class SyncEngine {
@@ -206,14 +342,19 @@ export class SyncEngine {
   private sseClients: Set<SSEListener> = new Set();
   private status: SyncEngineStatus = {
     isRunning: false,
+    cycleState: 'IDLE',
     lastSyncStartedAt: null,
     lastSyncCompletedAt: null,
     lastSuccessfulSyncAt: null,
+    nextScheduledRunAt: null,
     currentPhase: 'IDLE',
     totalOrdersInDb: 0,
     totalAlertsOpen: 0,
     lastError: null,
     consecutiveFailures: 0,
+    lastDurationMs: null,
+    phaseTimings: null,
+    detailedMetrics: null,
   };
 
   public getStatus(): SyncEngineStatus {
@@ -509,14 +650,17 @@ export class SyncEngine {
   }
 
   /**
-   * Field-aware canonical order upsert using vendoor_id as primary source key
+   * Field-aware canonical order upsert using vendoor_id as primary source key.
+   * Compares business fields and status; does NOT flag unchanged records as updated.
    */
   public upsertCanonicalOrder(rawOrder: VendoorRawOrder, nowIso: string): {
     orderDbId: number;
     isNew: boolean;
     statusChanged: boolean;
+    businessFieldsChanged: boolean;
     previousStatus: string | null;
     currentStatus: string;
+    changedFields: string[];
   } {
     const vendoorId = rawOrder.id;
     if (!vendoorId) {
@@ -540,10 +684,13 @@ export class SyncEngine {
     let orderDbId: number;
     let isNew = false;
     let statusChanged = false;
+    let businessFieldsChanged = false;
     let previousStatus: string | null = null;
+    let changedFields: string[] = [];
 
     if (!existing) {
       isNew = true;
+      changedFields = ['new_order'];
       const res = db.prepare(`
         INSERT INTO orders (
           vendoor_id, random_number, order_no, order_type, current_status, status_raw,
@@ -552,7 +699,7 @@ export class SyncEngine {
           created_at_source, shipping_date, printed_date, distinct_merchant_count,
           multi_merchant_flag, state_entry_at, storage_tier,
           address_word_count, address_is_latin, address_quality_status,
-          last_observed_at, created_at, updated_at
+          validation_status, last_observed_at, created_at, updated_at
         ) VALUES (
           ?, ?, ?, ?, ?, ?,
           ?, ?, ?, ?, ?,
@@ -560,7 +707,7 @@ export class SyncEngine {
           ?, ?, ?, ?,
           ?, ?, ?,
           ?, ?, ?,
-          ?, ?, ?
+          ?, ?, ?, ?
         )
       `).run(
         vendoorId,
@@ -589,6 +736,7 @@ export class SyncEngine {
         addressEval.wordCount,
         addressEval.isConfirmedLatin ? 1 : 0,
         addressEval.status,
+        'VALIDATED',
         nowIso,
         nowIso,
         nowIso
@@ -615,86 +763,108 @@ export class SyncEngine {
     } else {
       orderDbId = existing.id;
       previousStatus = existing.current_status;
-      statusChanged = existing.current_status !== currentStatus;
 
-      db.prepare(`
-        UPDATE orders SET
-          vendoor_id = ?,
-          random_number = COALESCE(?, random_number),
-          order_no = COALESCE(?, order_no),
-          order_type = COALESCE(?, order_type),
-          current_status = ?,
-          status_raw = COALESCE(?, status_raw),
-          affiliate_code = COALESCE(?, affiliate_code),
-          affiliate_name = COALESCE(?, affiliate_name),
-          customer_name = COALESCE(?, customer_name),
-          customer_phone = COALESCE(?, customer_phone),
-          governorate = COALESCE(?, governorate),
-          address = COALESCE(?, address),
-          total_price = CASE WHEN ? > 0 THEN ? ELSE total_price END,
-          shipping_cost = CASE WHEN ? > 0 THEN ? ELSE shipping_cost END,
-          total_order = CASE WHEN ? > 0 THEN ? ELSE total_order END,
-          shipping_date = COALESCE(?, shipping_date),
-          printed_date = COALESCE(?, printed_date),
-          distinct_merchant_count = ?,
-          multi_merchant_flag = ?,
-          address_word_count = COALESCE(?, address_word_count),
-          address_is_latin = ?,
-          address_quality_status = ?,
-          state_entry_at = CASE WHEN current_status != ? THEN ? ELSE state_entry_at END,
-          last_observed_at = ?,
-          updated_at = ?
-        WHERE id = ?
-      `).run(
-        vendoorId,
-        rawOrder.random_number || null,
-        rawOrder.order_no || null,
-        rawOrder.order_type || null,
+      const changeDetection = detectOrderBusinessChanges(
+        existing,
+        rawOrder,
         currentStatus,
-        rawOrder.status || null,
-        rawOrder.affiliate_code || null,
-        rawOrder.affiliate_name || null,
-        rawOrder.full_name || null,
-        rawOrder.phone || null,
-        rawOrder.governrate_name || null,
-        rawOrder.address || null,
-        rawOrder.total_price || 0,
-        rawOrder.total_price || 0,
-        parseFloat(rawOrder.shipping_cost || '0') || 0,
-        parseFloat(rawOrder.shipping_cost || '0') || 0,
-        parseFloat(rawOrder.total_order || '0') || 0,
-        parseFloat(rawOrder.total_order || '0') || 0,
-        rawOrder.shipping_date || null,
-        rawOrder.printed_date || null,
-        distinctCount,
         multiWarehouseFlag,
-        addressEval.wordCount,
-        addressEval.isConfirmedLatin ? 1 : 0,
-        addressEval.status,
-        currentStatus,
-        nowIso,
-        nowIso,
-        nowIso,
-        orderDbId
+        distinctCount
       );
 
-      if (statusChanged) {
+      statusChanged = changeDetection.statusChanged;
+      businessFieldsChanged = changeDetection.businessFieldsChanged;
+      changedFields = changeDetection.changedFields;
+
+      if (statusChanged || businessFieldsChanged) {
         db.prepare(`
-          INSERT INTO order_status_events (
-            order_id, random_number, from_status, to_status, actor_name,
-            event_time_source, storage_tier, observed_at, source_channel
-          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+          UPDATE orders SET
+            vendoor_id = ?,
+            random_number = COALESCE(?, random_number),
+            order_no = COALESCE(?, order_no),
+            order_type = COALESCE(?, order_type),
+            current_status = ?,
+            status_raw = COALESCE(?, status_raw),
+            affiliate_code = COALESCE(?, affiliate_code),
+            affiliate_name = COALESCE(?, affiliate_name),
+            customer_name = COALESCE(?, customer_name),
+            customer_phone = COALESCE(?, customer_phone),
+            governorate = COALESCE(?, governorate),
+            address = COALESCE(?, address),
+            total_price = CASE WHEN ? > 0 THEN ? ELSE total_price END,
+            shipping_cost = CASE WHEN ? > 0 THEN ? ELSE shipping_cost END,
+            total_order = CASE WHEN ? > 0 THEN ? ELSE total_order END,
+            shipping_date = COALESCE(?, shipping_date),
+            printed_date = COALESCE(?, printed_date),
+            distinct_merchant_count = ?,
+            multi_merchant_flag = ?,
+            address_word_count = COALESCE(?, address_word_count),
+            address_is_latin = ?,
+            address_quality_status = ?,
+            state_entry_at = CASE WHEN current_status != ? THEN ? ELSE state_entry_at END,
+            validation_status = 'VALIDATED',
+            last_observed_at = ?,
+            updated_at = ?
+          WHERE id = ?
         `).run(
-          orderDbId,
-          rawOrder.random_number || existing.random_number,
-          previousStatus,
+          vendoorId,
+          rawOrder.random_number || null,
+          rawOrder.order_no || null,
+          rawOrder.order_type || null,
           currentStatus,
-          'النظام',
+          rawOrder.status || null,
+          rawOrder.affiliate_code || null,
+          rawOrder.affiliate_name || null,
+          rawOrder.full_name || null,
+          rawOrder.phone || null,
+          rawOrder.governrate_name || null,
+          rawOrder.address || null,
+          rawOrder.total_price || 0,
+          rawOrder.total_price || 0,
+          parseFloat(rawOrder.shipping_cost || '0') || 0,
+          parseFloat(rawOrder.shipping_cost || '0') || 0,
+          parseFloat(rawOrder.total_order || '0') || 0,
+          parseFloat(rawOrder.total_order || '0') || 0,
+          rawOrder.shipping_date || null,
+          rawOrder.printed_date || null,
+          distinctCount,
+          multiWarehouseFlag,
+          addressEval.wordCount,
+          addressEval.isConfirmedLatin ? 1 : 0,
+          addressEval.status,
+          currentStatus,
           nowIso,
-          orderTier,
           nowIso,
-          'poll_detection'
+          nowIso,
+          orderDbId
         );
+
+        if (statusChanged) {
+          db.prepare(`
+            INSERT INTO order_status_events (
+              order_id, random_number, from_status, to_status, actor_name,
+              event_time_source, storage_tier, observed_at, source_channel
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+          `).run(
+            orderDbId,
+            rawOrder.random_number || existing.random_number,
+            previousStatus,
+            currentStatus,
+            'النظام',
+            nowIso,
+            orderTier,
+            nowIso,
+            'poll_detection'
+          );
+        }
+      } else {
+        // Pure observation heartbeat: touch last_observed_at and mark validated without polluting updated_at
+        db.prepare(`
+          UPDATE orders SET
+            last_observed_at = ?,
+            validation_status = 'VALIDATED'
+          WHERE id = ?
+        `).run(nowIso, orderDbId);
       }
     }
 
@@ -702,130 +872,268 @@ export class SyncEngine {
       this.reconcileOrderProducts(orderDbId, rawProducts, nowIso);
     }
 
-    this.evaluateOrderAlerts(orderDbId, rawOrder.random_number || existing?.random_number || `VND_${vendoorId}`, currentStatus, multiWarehouseFlag, warehouses, nowIso);
+    this.evaluateOrderAlerts(
+      orderDbId,
+      rawOrder.random_number || existing?.random_number || `VND_${vendoorId}`,
+      currentStatus,
+      multiWarehouseFlag,
+      warehouses,
+      nowIso
+    );
 
-    return { orderDbId, isNew, statusChanged, previousStatus, currentStatus };
+    return {
+      orderDbId,
+      isNew,
+      statusChanged,
+      businessFieldsChanged,
+      previousStatus,
+      currentStatus,
+      changedFields,
+    };
   }
 
   /**
    * Full synchronization cycle:
-   * Covers all orders with full pagination across batches,
-   * updates canonical orders, synchronizes confirmation age pages,
-   * fetches full system logs, and enriches customer intelligence.
+   * 1. Paginates across all order batches with explicit request timeouts.
+   * 2. Deduplicates incoming rows by stable vendoor_id before DB execution.
+   * 3. Accurately separates new canonical orders, existing examined, and genuine business changes.
+   * 4. Synchronizes confirmation ages, system logs, and customer enrichment with bounded concurrency.
+   * 5. Tracks comprehensive phase timings and explicit audit metrics.
    */
   public async runFullSyncCycle(runType: 'INITIAL' | 'PERIODIC' | 'RECONCILIATION' | 'MANUAL') {
     if (this.isSyncing) return;
     this.isSyncing = true;
+    const tCycleStart = Date.now();
     const nowIso = new Date().toISOString();
     this.status.lastSyncStartedAt = nowIso;
     this.status.currentPhase = 'SCANNING_ORDERS';
+    this.status.cycleState = 'RUNNING';
 
-    let ordersScanned = 0;
-    let ordersCreated = 0;
-    let ordersUpdated = 0;
-    let eventsDetected = 0;
-    let alertsTriggered = 0;
+    const phaseTimings: PhaseTimings = {
+      ordersFetchMs: 0,
+      dbUpsertMs: 0,
+      confirmationAgesMs: 0,
+      systemLogsMs: 0,
+      enrichmentMs: 0,
+      totalDurationMs: 0,
+    };
+
+    let rawRowsReceived = 0;
+    let duplicateSourceIds = 0;
+    let invalidRecordsCount = 0;
+    let failedPagesCount = 0;
+    let failedEnrichmentCount = 0;
+    let totalChangedDuringScan = false;
     let errorsCount = 0;
     let hasFailedPage = false;
     let errorMessage: string | null = null;
 
-    try {
-      console.log(`[SyncEngine] Starting ${runType} sync cycle...`);
+    const ordersMap = new Map<number, VendoorRawOrder>();
 
-      // 1. Scan Orders: First page to get total and records
+    try {
+      console.log(`[SyncEngine] Starting ${runType} sync cycle at ${nowIso}...`);
+
+      // 1. Scan Orders: First page to get total and initial batch
+      const tOrdersStart = Date.now();
       const firstBatch = await vendoorClient.fetchOrdersBatch(0, 100);
       const totalOrdersInSource = firstBatch.recordsTotal;
-      let allOrders: VendoorRawOrder[] = [...firstBatch.data];
 
-      // In EVERY cycle (including PERIODIC), paginate through all pages to guarantee complete coverage
+      for (const ord of firstBatch.data) {
+        rawRowsReceived++;
+        if (!ord || typeof ord.id !== 'number') {
+          invalidRecordsCount++;
+          continue;
+        }
+        if (ordersMap.has(ord.id)) {
+          duplicateSourceIds++;
+        } else {
+          ordersMap.set(ord.id, ord);
+        }
+      }
+
+      // Paginate through all remaining pages to guarantee 100% full coverage
       const batchSize = 100;
       for (let start = 100; start < totalOrdersInSource; start += batchSize) {
         try {
           const nextBatch = await vendoorClient.fetchOrdersBatch(start, batchSize);
-          allOrders = allOrders.concat(nextBatch.data);
+          if (nextBatch.recordsTotal !== totalOrdersInSource) {
+            totalChangedDuringScan = true;
+          }
+          for (const ord of nextBatch.data) {
+            rawRowsReceived++;
+            if (!ord || typeof ord.id !== 'number') {
+              invalidRecordsCount++;
+              continue;
+            }
+            if (ordersMap.has(ord.id)) {
+              duplicateSourceIds++;
+            } else {
+              ordersMap.set(ord.id, ord);
+            }
+          }
         } catch (pageErr: any) {
           console.error(`[SyncEngine] Error fetching orders batch at start ${start}:`, pageErr.message);
           errorsCount++;
+          failedPagesCount++;
           hasFailedPage = true;
           errorMessage = `Failed to fetch page at offset ${start}: ${pageErr.message}`;
           break;
         }
       }
 
-      ordersScanned = allOrders.length;
-      this.status.currentPhase = 'PROCESSING_ORDERS';
-
-      const enrichmentQueue: { id: number; phone: string; vendoorId: number; random_number: string; status: string }[] = [];
-
-      db.exec('BEGIN TRANSACTION;');
-
-      for (const rawOrder of allOrders) {
-        if (!rawOrder.id) continue;
-        const upsertRes = this.upsertCanonicalOrder(rawOrder, nowIso);
-        if (upsertRes.isNew) ordersCreated++;
-        else ordersUpdated++;
-        if (upsertRes.statusChanged) eventsDetected++;
-
-        if (rawOrder.phone) {
-          enrichmentQueue.push({
-            id: upsertRes.orderDbId,
-            phone: rawOrder.phone,
-            vendoorId: rawOrder.id,
-            random_number: rawOrder.random_number || `VND_${rawOrder.id}`,
-            status: upsertRes.currentStatus,
-          });
-        }
+      // If source count shifted during pagination due to active concurrent order placements,
+      // run a fast verification pass of start=0 to guarantee top orders displaced by offset shifts are captured
+      if (totalChangedDuringScan && !hasFailedPage) {
+        try {
+          const topCheck = await vendoorClient.fetchOrdersBatch(0, 50);
+          for (const ord of topCheck.data) {
+            rawRowsReceived++;
+            if (ord && typeof ord.id === 'number' && !ordersMap.has(ord.id)) {
+              ordersMap.set(ord.id, ord);
+            }
+          }
+        } catch {}
       }
 
+      phaseTimings.ordersFetchMs = Date.now() - tOrdersStart;
+      this.status.currentPhase = 'PROCESSING_ORDERS';
+
+      // 2. Canonical DB Upsert and Change Detection
+      const tDbStart = Date.now();
+      let newOrdersInserted = 0;
+      let existingOrdersExamined = 0;
+      let recordsWithFieldChanges = 0;
+      let statusChangesCount = 0;
+      let unresolvedStatusCount = 0;
+
+      db.exec('BEGIN TRANSACTION;');
+      for (const rawOrder of ordersMap.values()) {
+        const upsertRes = this.upsertCanonicalOrder(rawOrder, nowIso);
+        if (upsertRes.isNew) {
+          newOrdersInserted++;
+        } else {
+          existingOrdersExamined++;
+          if (upsertRes.businessFieldsChanged) {
+            recordsWithFieldChanges++;
+          }
+          if (upsertRes.statusChanged) {
+            statusChangesCount++;
+          }
+        }
+        if (upsertRes.currentStatus === 'Unknown') {
+          unresolvedStatusCount++;
+        }
+      }
       db.exec('COMMIT;');
+      phaseTimings.dbUpsertMs = Date.now() - tDbStart;
 
-      // 2. Synchronize Confirmation Age Pages
+      // 3. Synchronize Confirmation Age Pages (Printed age monitoring)
       this.status.currentPhase = 'SYNCING_CONFIRMATION_AGES';
+      const tConfStart = Date.now();
       await this.syncConfirmationAges(nowIso);
+      phaseTimings.confirmationAgesMs = Date.now() - tConfStart;
 
-      // 3. Synchronize System Logs & Employee Canonical Events (full pagination)
+      // 4. Synchronize System Logs & Employee Canonical Events (full pagination)
       this.status.currentPhase = 'SYNCING_SYSTEM_LOGS';
+      const tLogsStart = Date.now();
       const logRes = await this.syncSystemLogs(nowIso);
       if (logRes.hasErrors) {
         errorsCount++;
       }
+      phaseTimings.systemLogsMs = Date.now() - tLogsStart;
 
-      // 4. Enrich Customer Intelligence and Extra Phones
+      // 5. Customer Intelligence and Phone Enrichment with Bounded Concurrency & Timeouts
       this.status.currentPhase = 'ENRICHING_CUSTOMERS';
-      await this.enrichCustomerIntelligenceBatch(enrichmentQueue.slice(0, 20), nowIso);
+      const tEnrichStart = Date.now();
+      const enrichStats = await this.enrichCustomersAndPhonesBounded(nowIso);
+      failedEnrichmentCount += enrichStats.failedEnrichments;
+      phaseTimings.enrichmentMs = Date.now() - tEnrichStart;
 
-      // 5. Enrich Additional Phone for Printed orders needing check
-      await this.enrichAdditionalPhones(nowIso);
+      const tCycleEnd = Date.now();
+      phaseTimings.totalDurationMs = tCycleEnd - tCycleStart;
+
+      const uniqueSourceIds = ordersMap.size;
+      const validRecordsParsed = rawRowsReceived - invalidRecordsCount;
+
+      const detailedMetrics: DetailedSyncMetrics = {
+        rawRowsReceived,
+        validRecordsParsed,
+        uniqueSourceIds,
+        duplicateSourceIds,
+        newOrdersInserted,
+        existingOrdersExamined,
+        recordsWithFieldChanges,
+        statusChangesCount,
+        unresolvedStatusCount,
+        invalidRecordsCount,
+        failedPagesCount,
+        failedEnrichmentCount,
+      };
 
       this.status.lastSuccessfulSyncAt = new Date().toISOString();
       this.status.lastSyncCompletedAt = this.status.lastSuccessfulSyncAt;
+      this.status.lastDurationMs = phaseTimings.totalDurationMs;
+      this.status.phaseTimings = phaseTimings;
+      this.status.detailedMetrics = detailedMetrics;
       this.status.consecutiveFailures = 0;
       this.status.lastError = hasFailedPage ? errorMessage : null;
       this.status.currentPhase = 'IDLE';
+      this.status.cycleState = hasFailedPage ? 'PARTIAL' : 'SUCCESS';
+
+      const intervalSec = parseInt(process.env.SYNC_INTERVAL_SECONDS || '30', 10);
+      this.status.nextScheduledRunAt = new Date(Date.now() + intervalSec * 1000).toISOString();
 
       const finalStatus = hasFailedPage ? 'PARTIAL' : 'SUCCESS';
 
       console.log(
-        `[SyncEngine] ${runType} sync completed (${finalStatus}): ${ordersScanned} scanned, ${ordersCreated} new, ${ordersUpdated} updated, ${eventsDetected} status changes.`
+        `[SyncEngine] ${runType} sync completed (${finalStatus}) in ${phaseTimings.totalDurationMs}ms: ` +
+        `Raw=${rawRowsReceived}, Unique=${uniqueSourceIds}, DupsAcrossPages=${duplicateSourceIds}, ` +
+        `New=${newOrdersInserted}, Examined=${existingOrdersExamined}, FieldChanges=${recordsWithFieldChanges}, ` +
+        `StatusChanges=${statusChangesCount}, FailedPages=${failedPagesCount}, FailedEnrich=${failedEnrichmentCount}`
       );
 
       db.prepare(`
         INSERT INTO sync_runs (
           run_type, status, orders_scanned, orders_created, orders_updated,
-          events_detected, alerts_triggered, errors_count, started_at, completed_at, error_message
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+          events_detected, alerts_triggered, errors_count, started_at, completed_at, error_message,
+          raw_rows_received, valid_records_parsed, unique_source_ids, duplicate_source_ids,
+          new_orders_inserted, existing_orders_examined, records_with_field_changes,
+          status_changes_count, unresolved_status_count, invalid_records_count,
+          failed_pages_count, failed_enrichment_count, duration_ms, phase_timings_json
+        ) VALUES (
+          ?, ?, ?, ?, ?,
+          ?, ?, ?, ?, ?, ?,
+          ?, ?, ?, ?,
+          ?, ?, ?,
+          ?, ?, ?,
+          ?, ?, ?, ?
+        )
       `).run(
         runType,
         finalStatus,
-        ordersScanned,
-        ordersCreated,
-        ordersUpdated,
-        eventsDetected,
-        alertsTriggered,
+        uniqueSourceIds,
+        newOrdersInserted,
+        recordsWithFieldChanges,
+        statusChangesCount,
+        0,
         errorsCount,
         nowIso,
         this.status.lastSyncCompletedAt,
-        hasFailedPage ? errorMessage : null
+        hasFailedPage ? errorMessage : null,
+        rawRowsReceived,
+        validRecordsParsed,
+        uniqueSourceIds,
+        duplicateSourceIds,
+        newOrdersInserted,
+        existingOrdersExamined,
+        recordsWithFieldChanges,
+        statusChangesCount,
+        unresolvedStatusCount,
+        invalidRecordsCount,
+        failedPagesCount,
+        failedEnrichmentCount,
+        phaseTimings.totalDurationMs,
+        JSON.stringify(phaseTimings)
       );
 
       this.broadcast('sync_completed', this.getStatus());
@@ -840,22 +1148,50 @@ export class SyncEngine {
       this.status.lastError = errorMessage;
       this.status.consecutiveFailures++;
       this.status.currentPhase = 'ERROR';
+      this.status.cycleState = 'ERROR';
+
+      const durationMs = Date.now() - tCycleStart;
+      this.status.lastDurationMs = durationMs;
 
       db.prepare(`
         INSERT INTO sync_runs (
           run_type, status, orders_scanned, orders_created, orders_updated,
-          errors_count, started_at, completed_at, error_message
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+          errors_count, started_at, completed_at, error_message,
+          raw_rows_received, valid_records_parsed, unique_source_ids, duplicate_source_ids,
+          new_orders_inserted, existing_orders_examined, records_with_field_changes,
+          status_changes_count, unresolved_status_count, invalid_records_count,
+          failed_pages_count, failed_enrichment_count, duration_ms
+        ) VALUES (
+          ?, ?, ?, ?, ?,
+          ?, ?, ?, ?,
+          ?, ?, ?, ?,
+          ?, ?, ?,
+          ?, ?, ?,
+          ?, ?, ?
+        )
       `).run(
         runType,
         'FAILED',
-        ordersScanned,
-        ordersCreated,
-        ordersUpdated,
+        ordersMap.size,
+        0,
+        0,
         errorsCount + 1,
         nowIso,
         new Date().toISOString(),
-        errorMessage
+        errorMessage,
+        rawRowsReceived,
+        rawRowsReceived - invalidRecordsCount,
+        ordersMap.size,
+        duplicateSourceIds,
+        0,
+        0,
+        0,
+        0,
+        0,
+        invalidRecordsCount,
+        failedPagesCount,
+        failedEnrichmentCount,
+        durationMs
       );
 
       this.broadcast('sync_error', { error: errorMessage });
@@ -892,17 +1228,21 @@ export class SyncEngine {
       )
     `);
 
-    for (const cat of categories) {
-      try {
-        const rows: ConfirmationRow[] = await vendoorClient.fetchConfirmationAgePage(cat.key);
-        for (const r of rows) {
-          if (!r.randomNumber) continue;
-          updateConfStmt.run(cat.label, nowIso, r.printedDate || null, r.randomNumber);
-          insertObsStmt.run(r.randomNumber, r.randomNumber, cat.label, r.invoiceNo, r.printedDate, nowIso);
+    // Bounded parallel execution in pairs of 2
+    for (let i = 0; i < categories.length; i += 2) {
+      const slice = categories.slice(i, i + 2);
+      await Promise.all(slice.map(async (cat) => {
+        try {
+          const rows: ConfirmationRow[] = await vendoorClient.fetchConfirmationAgePage(cat.key);
+          for (const r of rows) {
+            if (!r.randomNumber) continue;
+            updateConfStmt.run(cat.label, nowIso, r.printedDate || null, r.randomNumber);
+            insertObsStmt.run(r.randomNumber, r.randomNumber, cat.label, r.invoiceNo, r.printedDate, nowIso);
+          }
+        } catch (err: any) {
+          console.warn(`[SyncEngine] Warning fetching confirmation age page ${cat.key}:`, err.message);
         }
-      } catch (err: any) {
-        console.warn(`[SyncEngine] Warning fetching confirmation age page ${cat.key}:`, err.message);
-      }
+      }));
     }
   }
 
@@ -915,18 +1255,7 @@ export class SyncEngine {
       const dateToSync = targetDate || getCairoDateString();
       const firstPage = await vendoorClient.fetchSystemLogs(1, dateToSync, dateToSync);
       const totalPages = Math.max(1, firstPage.totalPages);
-      let allEntries: LogEntry[] = [...firstPage.entries];
-
-      for (let p = 2; p <= totalPages; p++) {
-        try {
-          const pageData = await vendoorClient.fetchSystemLogs(p, dateToSync, dateToSync);
-          allEntries = allEntries.concat(pageData.entries);
-        } catch (pageErr: any) {
-          console.warn(`[SyncEngine] Page ${p} log fetch failed:`, pageErr.message);
-          hasErrors = true;
-          break;
-        }
-      }
+      const maxPages = Math.min(totalPages, targetDate ? 50 : 20);
 
       const insertRawStmt = db.prepare(`
         INSERT OR IGNORE INTO raw_activity_events (
@@ -942,42 +1271,86 @@ export class SyncEngine {
         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       `);
 
+      let totalLogs = 0;
       let newCanonicalCount = 0;
-      for (const entry of allEntries) {
-        const rawText = decodeHtmlEntities(entry.rawActionText || '');
-        const hashInput = `${entry.orderCode}_${entry.actorName}_${rawText}_${entry.eventTimestamp}`;
-        const sourceHash = crypto.createHash('sha256').update(hashInput).digest('hex');
-        const logTier = isDateInHot(entry.eventTimestamp) ? 'HOT' : 'COLD';
 
-        const rawResult = insertRawStmt.run(
-          sourceHash,
-          entry.orderCode || null,
-          entry.actorName || 'غير معروف',
-          rawText,
-          entry.eventTimestamp,
-          logTier,
-          nowIso,
-          'log/system'
-        );
+      const processEntries = (entries: LogEntry[]): number => {
+        let newOnPage = 0;
+        db.exec('BEGIN TRANSACTION;');
+        try {
+          for (const entry of entries) {
+            totalLogs++;
+            const rawText = decodeHtmlEntities(entry.rawActionText || '');
+            const hashInput = `${entry.orderCode}_${entry.actorName}_${rawText}_${entry.eventTimestamp}`;
+            const sourceHash = crypto.createHash('sha256').update(hashInput).digest('hex');
+            const logTier = isDateInHot(entry.eventTimestamp) ? 'HOT' : 'COLD';
 
-        if (rawResult.changes > 0) {
-          const rawId = Number(rawResult.lastInsertRowid);
-          const { actionType, fromStatus, toStatus } = this.classifyAction(rawText);
-          const isSystem = (entry.actorName || '').toLowerCase().includes('system') || (entry.actorName || '').includes('تلقائي') || (entry.actorName || '').includes('النظام') ? 1 : 0;
+            const rawResult = insertRawStmt.run(
+              sourceHash,
+              entry.orderCode || null,
+              entry.actorName || 'غير معروف',
+              rawText,
+              entry.eventTimestamp,
+              logTier,
+              nowIso,
+              'log/system'
+            );
 
-          insertCanonicalStmt.run(
-            rawId,
-            entry.orderCode || null,
-            entry.actorName || 'غير معروف',
-            actionType,
-            fromStatus,
-            toStatus,
-            entry.eventTimestamp,
-            logTier,
-            isSystem,
-            nowIso
-          );
-          newCanonicalCount++;
+            if (rawResult.changes > 0) {
+              newOnPage++;
+              const rawId = Number(rawResult.lastInsertRowid);
+              const { actionType, fromStatus, toStatus } = this.classifyAction(rawText);
+              const isSystem = (entry.actorName || '').toLowerCase().includes('system') || (entry.actorName || '').includes('تلقائي') || (entry.actorName || '').includes('النظام') ? 1 : 0;
+
+              insertCanonicalStmt.run(
+                rawId,
+                entry.orderCode || null,
+                entry.actorName || 'غير معروف',
+                actionType,
+                fromStatus,
+                toStatus,
+                entry.eventTimestamp,
+                logTier,
+                isSystem,
+                nowIso
+              );
+              newCanonicalCount++;
+            }
+          }
+          db.exec('COMMIT;');
+        } catch (txErr) {
+          db.exec('ROLLBACK;');
+          throw txErr;
+        }
+        return newOnPage;
+      };
+
+      // Process first page
+      const newOnFirstPage = processEntries(firstPage.entries);
+
+      // Check if DB already has existing events
+      const existingEventsCount = (db.prepare('SELECT count(*) as c FROM raw_activity_events').get() as any)?.c || 0;
+
+      if (newOnFirstPage === 0 && existingEventsCount > 0 && !targetDate) {
+        // Fast exit: no new logs on page 1 since last sync cycle
+      } else {
+        // Scan backwards through recent pages until an entire page is already known
+        for (let p = 2; p <= maxPages; p++) {
+          try {
+            const pageData = await vendoorClient.fetchSystemLogs(p, dateToSync, dateToSync);
+            if (!pageData.entries || pageData.entries.length === 0) {
+              break;
+            }
+            const newOnPage = processEntries(pageData.entries);
+            // If an entire page contains only previously ingested events, earlier pages are guaranteed older
+            if (newOnPage === 0 && existingEventsCount > 0) {
+              break;
+            }
+          } catch (pageErr: any) {
+            console.warn(`[SyncEngine] Page ${p} log fetch failed:`, pageErr.message);
+            hasErrors = true;
+            break;
+          }
         }
       }
 
@@ -989,14 +1362,14 @@ export class SyncEngine {
         storageTier: isDateInHot(dateToSync) ? 'HOT' : 'COLD',
         pagesDiscovered: totalPages,
         pagesRead: totalPages,
-        recordsExtracted: allEntries.length,
+        recordsExtracted: totalLogs,
         recordsSaved: newCanonicalCount,
         completionStatus: hasErrors ? 'PARTIAL' : 'COMPLETE',
         lastAttemptedAt: nowIso,
         completedAt: hasErrors ? null : nowIso,
       });
 
-      return { totalLogs: allEntries.length, newSaved: newCanonicalCount, hasErrors };
+      return { totalLogs, newSaved: newCanonicalCount, hasErrors };
     } catch (err: any) {
       console.warn('[SyncEngine] Warning syncing system logs:', err.message);
       return { totalLogs: 0, newSaved: 0, hasErrors: true };
@@ -1091,12 +1464,25 @@ export class SyncEngine {
   }
 
   /**
-   * Enrich customer delivery rates using verified vendoor_id
+   * Bounded concurrency enrichment for customer intelligence and additional phone numbers.
+   * - Does not re-enrich orders that are already up-to-date.
+   * - Bounded concurrency (max 2 parallel).
+   * - Explicit timeouts on every network call.
+   * - Non-blocking: failures do not invalidate canonical order sync.
    */
-  private async enrichCustomerIntelligenceBatch(
-    items: { id: number; phone: string; vendoorId: number; random_number: string }[],
-    nowIso: string
-  ) {
+  public async enrichCustomersAndPhonesBounded(nowIso: string): Promise<{ failedEnrichments: number }> {
+    let failedEnrichments = 0;
+
+    // 1. Orders needing customer intelligence: checked_at IS NULL or > 24 hours old
+    const ordersToEnrich: any[] = db.prepare(`
+      SELECT id, vendoor_id, random_number, customer_phone, current_status
+      FROM orders
+      WHERE customer_phone IS NOT NULL AND customer_phone != ''
+        AND (customer_history_checked_at IS NULL OR customer_history_checked_at < datetime('now', '-24 hours'))
+      ORDER BY CASE WHEN current_status = 'Printed' THEN 0 WHEN current_status = 'New' THEN 1 ELSE 2 END, id DESC
+      LIMIT 10
+    `).all();
+
     const updateCustomerStmt = db.prepare(`
       UPDATE orders SET
         delivery_rate = ?,
@@ -1123,85 +1509,246 @@ export class SyncEngine {
       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `);
 
-    for (const item of items) {
-      try {
-        const hist = await vendoorClient.fetchCustomerIntelligence(item.phone, item.vendoorId);
-        updateCustomerStmt.run(
-          hist.deliveryRate,
-          hist.deliveriesNum,
-          hist.deliveriesDenom,
-          hist.cancelRate,
-          hist.cancelsNum,
-          hist.cancelsDenom,
-          hist.totalOrders,
-          hist.lastOrderStatus,
-          hist.lastOrderElapsed,
-          hist.repetitionsCount,
-          hist.warningText,
-          nowIso,
-          item.id
-        );
-
-        insertObsStmt.run(
-          item.id,
-          item.phone,
-          hist.totalOrders,
-          hist.deliveriesNum,
-          hist.deliveriesDenom,
-          hist.deliveryRate,
-          hist.cancelsNum,
-          hist.cancelsDenom,
-          hist.cancelRate,
-          hist.repetitionsCount,
-          hist.lastOrderStatus,
-          hist.lastOrderElapsed,
-          hist.warningText,
-          nowIso
-        );
-      } catch (err: any) {
-        console.warn(`[SyncEngine] Warning enriching customer ${item.phone}:`, err.message);
-      }
+    // Bounded execution with max 2 concurrent requests
+    for (let i = 0; i < ordersToEnrich.length; i += 2) {
+      const slice = ordersToEnrich.slice(i, i + 2);
+      await Promise.all(slice.map(async (item) => {
+        try {
+          const hist = await vendoorClient.fetchCustomerIntelligence(item.customer_phone, item.vendoor_id);
+          updateCustomerStmt.run(
+            hist.deliveryRate,
+            hist.deliveriesNum,
+            hist.deliveriesDenom,
+            hist.cancelRate,
+            hist.cancelsNum,
+            hist.cancelsDenom,
+            hist.totalOrders,
+            hist.lastOrderStatus,
+            hist.lastOrderElapsed,
+            hist.repetitionsCount,
+            hist.warningText,
+            nowIso,
+            item.id
+          );
+          insertObsStmt.run(
+            item.id,
+            item.customer_phone,
+            hist.totalOrders,
+            hist.deliveriesNum,
+            hist.deliveriesDenom,
+            hist.deliveryRate,
+            hist.cancelsNum,
+            hist.cancelsDenom,
+            hist.cancelRate,
+            hist.repetitionsCount,
+            hist.lastOrderStatus,
+            hist.lastOrderElapsed,
+            hist.warningText,
+            nowIso
+          );
+        } catch (err: any) {
+          failedEnrichments++;
+          console.info(`[SyncEngine] Non-blocking customer enrichment deferred for ${item.customer_phone}: ${err.message}`);
+          try {
+            db.prepare(`UPDATE orders SET customer_history_checked_at = ? WHERE id = ?`).run(nowIso, item.id);
+          } catch {}
+        }
+      }));
     }
-  }
 
-  /**
-   * Enrich Printed orders with additional phone numbers
-   */
-  private async enrichAdditionalPhones(nowIso: string) {
-    const ordersToEnrich: any[] = db.prepare(`
+    // 2. Extra phone lookups for Printed orders:
+    const printedNeedingPhone: any[] = db.prepare(`
       SELECT id, vendoor_id, random_number
       FROM orders
       WHERE current_status = 'Printed' AND (extra_phone_status = 'NOT_RETRIEVED' OR extra_phone_status IS NULL)
-      LIMIT 10
+      LIMIT 6
     `).all();
 
-    for (const ord of ordersToEnrich) {
-      try {
-        const res = await vendoorClient.fetchOrderDetailsEnrichment(ord.vendoor_id);
-        if (res.success) {
-          const status = res.anotherPhone ? 'PRESENT' : 'CONFIRMED_ABSENT';
-          db.prepare(`
-            UPDATE orders SET
-              customer_phone_extra = ?,
-              extra_phone_valid = ?,
-              extra_phone_status = ?,
-              last_enrichment_at = ?,
-              last_enrichment_status = 'SUCCESS'
-            WHERE id = ?
-          `).run(res.anotherPhone || null, res.extraPhoneValid ? 1 : 0, status, nowIso, ord.id);
-        } else {
-          db.prepare(`
-            UPDATE orders SET
-              extra_phone_status = 'RETRIEVAL_FAILED',
-              last_enrichment_at = ?,
-              last_enrichment_status = 'FAILED'
-            WHERE id = ?
-          `).run(nowIso, ord.id);
+    for (let i = 0; i < printedNeedingPhone.length; i += 2) {
+      const slice = printedNeedingPhone.slice(i, i + 2);
+      await Promise.all(slice.map(async (ord) => {
+        try {
+          const res = await vendoorClient.fetchOrderDetailsEnrichment(ord.vendoor_id);
+          if (res.success) {
+            const status = res.anotherPhone ? 'PRESENT' : 'CONFIRMED_ABSENT';
+            db.prepare(`
+              UPDATE orders SET
+                customer_phone_extra = ?,
+                extra_phone_valid = ?,
+                extra_phone_status = ?,
+                last_enrichment_at = ?,
+                last_enrichment_status = 'SUCCESS'
+              WHERE id = ?
+            `).run(res.anotherPhone || null, res.extraPhoneValid ? 1 : 0, status, nowIso, ord.id);
+          } else {
+            db.prepare(`
+              UPDATE orders SET
+                extra_phone_status = 'RETRIEVAL_FAILED',
+                last_enrichment_at = ?,
+                last_enrichment_status = 'FAILED'
+              WHERE id = ?
+            `).run(nowIso, ord.id);
+          }
+        } catch (err: any) {
+          failedEnrichments++;
+          console.warn(`[SyncEngine] Non-blocking order detail enrichment failure for ${ord.vendoor_id}:`, err.message);
         }
-      } catch (err: any) {
-        console.warn(`[SyncEngine] Warning enriching order ${ord.vendoor_id}:`, err.message);
+      }));
+    }
+
+    return { failedEnrichments };
+  }
+
+  /**
+   * Reconciles source order IDs against local SQLite database.
+   * Measures exact parity by status without guessing or altering data.
+   */
+  public reconcileSourceVsLocal(sourceOrders?: VendoorRawOrder[], scopeIds?: number[]): ReconciliationReport {
+    const timestamp = new Date().toISOString();
+    const sourceMap = new Map<number, VendoorRawOrder>();
+    let duplicateSourceIdsCount = 0;
+    let unresolvedStatusCount = 0;
+
+    if (sourceOrders) {
+      for (const ord of sourceOrders) {
+        if (!ord || typeof ord.id !== 'number') continue;
+        if (sourceMap.has(ord.id)) {
+          duplicateSourceIdsCount++;
+        } else {
+          sourceMap.set(ord.id, ord);
+        }
       }
     }
+
+    const localOrders: any[] = (scopeIds && scopeIds.length > 0)
+      ? db.prepare(`SELECT id, vendoor_id, random_number, order_no, current_status FROM orders WHERE vendoor_id IN (${scopeIds.map(() => '?').join(',')})`).all(...scopeIds)
+      : db.prepare('SELECT id, vendoor_id, random_number, order_no, current_status FROM orders').all();
+    const localMap = new Map<number, any>();
+    let duplicateCanonicalInDbCount = 0;
+
+    for (const ord of localOrders) {
+      if (localMap.has(ord.vendoor_id)) {
+        duplicateCanonicalInDbCount++;
+      } else {
+        localMap.set(ord.vendoor_id, ord);
+      }
+    }
+
+    const allStatuses = ['New', 'Pending', 'Processing', 'Printed', 'Canceling', 'Canceled'];
+    const byStatus: Record<string, StatusReconciliationItem> = {};
+    for (const st of allStatuses) {
+      byStatus[st] = {
+        status: st,
+        sourceCount: 0,
+        localCount: 0,
+        matchingCount: 0,
+        sourceOnlyCount: 0,
+        localOnlyCount: 0,
+        statusMismatchCount: 0,
+      };
+    }
+
+    const sampleMismatches: Array<{
+      vendoorId: number;
+      sourceStatus: string;
+      localStatus: string;
+      sourceOrderNo?: string | null;
+    }> = [];
+
+    let overallMatching = 0;
+    let missingLocallyCount = 0;
+    let statusMismatchTotal = 0;
+
+    if (sourceOrders && sourceOrders.length > 0) {
+      for (const [vId, sOrd] of sourceMap.entries()) {
+        const parsedStatus = this.parseStatusString(sOrd.status);
+        if (parsedStatus === 'Unknown') unresolvedStatusCount++;
+
+        if (!byStatus[parsedStatus]) {
+          byStatus[parsedStatus] = {
+            status: parsedStatus,
+            sourceCount: 0,
+            localCount: 0,
+            matchingCount: 0,
+            sourceOnlyCount: 0,
+            localOnlyCount: 0,
+            statusMismatchCount: 0,
+          };
+        }
+        byStatus[parsedStatus].sourceCount++;
+
+        if (localMap.has(vId)) {
+          const lOrd = localMap.get(vId);
+          if (lOrd.current_status === parsedStatus) {
+            byStatus[parsedStatus].matchingCount++;
+            overallMatching++;
+          } else {
+            byStatus[parsedStatus].statusMismatchCount++;
+            statusMismatchTotal++;
+            if (sampleMismatches.length < 15) {
+              sampleMismatches.push({
+                vendoorId: vId,
+                sourceStatus: parsedStatus,
+                localStatus: lOrd.current_status,
+                sourceOrderNo: sOrd.order_no || null,
+              });
+            }
+          }
+        } else {
+          byStatus[parsedStatus].sourceOnlyCount++;
+          missingLocallyCount++;
+        }
+      }
+    }
+
+    let missingInSourceCount = 0;
+    for (const [vId, lOrd] of localMap.entries()) {
+      const st = lOrd.current_status;
+      if (!byStatus[st]) {
+        byStatus[st] = {
+          status: st,
+          sourceCount: 0,
+          localCount: 0,
+          matchingCount: 0,
+          sourceOnlyCount: 0,
+          localOnlyCount: 0,
+          statusMismatchCount: 0,
+        };
+      }
+      byStatus[st].localCount++;
+
+      if (sourceOrders && sourceOrders.length > 0 && !sourceMap.has(vId)) {
+        byStatus[st].localOnlyCount++;
+        missingInSourceCount++;
+      }
+    }
+
+    let parityStatus: 'VERIFIED' | 'MISMATCH' | 'PARTIAL' | 'UNVERIFIED' = 'UNVERIFIED';
+    if (sourceOrders && sourceOrders.length > 0) {
+      if (missingLocallyCount === 0 && statusMismatchTotal === 0 && sourceMap.size === localMap.size) {
+        parityStatus = 'VERIFIED';
+      } else if (missingLocallyCount > 0 || statusMismatchTotal > 0) {
+        parityStatus = 'MISMATCH';
+      } else {
+        parityStatus = 'PARTIAL';
+      }
+    }
+
+    return {
+      timestamp,
+      sourceTotalUnique: sourceMap.size,
+      localTotalUnique: localMap.size,
+      overallMatching,
+      missingLocallyCount,
+      missingInSourceCount,
+      statusMismatchTotal,
+      duplicateSourceIdsCount,
+      duplicateCanonicalInDbCount,
+      unresolvedStatusCount,
+      byStatus,
+      sampleMismatches,
+      parityStatus,
+    };
   }
 
   /**

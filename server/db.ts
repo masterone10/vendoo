@@ -7,7 +7,10 @@ if (!fs.existsSync(DB_DIR)) {
   fs.mkdirSync(DB_DIR, { recursive: true });
 }
 
-const DB_PATH = process.env.DATABASE_PATH || path.join(DB_DIR, 'vendoor_intelligence.sqlite');
+const rawEnvDbPath = process.env.DATABASE_PATH;
+export const DB_PATH = (rawEnvDbPath && rawEnvDbPath !== 'false' && rawEnvDbPath !== 'undefined')
+  ? rawEnvDbPath
+  : path.join(DB_DIR, 'vendoor_intelligence.sqlite');
 
 export const db = new DatabaseSync(DB_PATH);
 
@@ -339,6 +342,20 @@ export function initDatabase() {
   tryRunMigration("ALTER TABLE canonical_activity_events ADD COLUMN storage_tier TEXT DEFAULT 'HOT'");
   tryRunMigration("ALTER TABLE customer_history_observations ADD COLUMN storage_tier TEXT DEFAULT 'HOT'");
   tryRunMigration("ALTER TABLE confirmation_age_observations ADD COLUMN storage_tier TEXT DEFAULT 'HOT'");
+  tryRunMigration("ALTER TABLE sync_runs ADD COLUMN raw_rows_received INTEGER DEFAULT 0");
+  tryRunMigration("ALTER TABLE sync_runs ADD COLUMN valid_records_parsed INTEGER DEFAULT 0");
+  tryRunMigration("ALTER TABLE sync_runs ADD COLUMN unique_source_ids INTEGER DEFAULT 0");
+  tryRunMigration("ALTER TABLE sync_runs ADD COLUMN duplicate_source_ids INTEGER DEFAULT 0");
+  tryRunMigration("ALTER TABLE sync_runs ADD COLUMN new_orders_inserted INTEGER DEFAULT 0");
+  tryRunMigration("ALTER TABLE sync_runs ADD COLUMN existing_orders_examined INTEGER DEFAULT 0");
+  tryRunMigration("ALTER TABLE sync_runs ADD COLUMN records_with_field_changes INTEGER DEFAULT 0");
+  tryRunMigration("ALTER TABLE sync_runs ADD COLUMN status_changes_count INTEGER DEFAULT 0");
+  tryRunMigration("ALTER TABLE sync_runs ADD COLUMN unresolved_status_count INTEGER DEFAULT 0");
+  tryRunMigration("ALTER TABLE sync_runs ADD COLUMN invalid_records_count INTEGER DEFAULT 0");
+  tryRunMigration("ALTER TABLE sync_runs ADD COLUMN failed_pages_count INTEGER DEFAULT 0");
+  tryRunMigration("ALTER TABLE sync_runs ADD COLUMN failed_enrichment_count INTEGER DEFAULT 0");
+  tryRunMigration("ALTER TABLE sync_runs ADD COLUMN duration_ms INTEGER DEFAULT 0");
+  tryRunMigration("ALTER TABLE sync_runs ADD COLUMN phase_timings_json TEXT");
 
   // 3. Create all indexes safely
   db.exec(`

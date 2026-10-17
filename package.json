@@ -5,11 +5,11 @@
   "type": "module",
   "scripts": {
     "dev": "tsx server.ts",
-    "build": "vite build && esbuild server.ts --bundle --platform=node --target=node22 --outfile=dist-server/server.js --external:node:sqlite --external:express --external:vite",
+    "build": "vite build && esbuild server.ts --bundle --platform=node --target=node22 --format=esm --outfile=dist-server/server.js --external:node:sqlite --external:express --external:vite",
     "start": "node dist-server/server.js",
     "clean": "rm -rf dist dist-server",
     "lint": "tsc --noEmit",
-    "test": "tsx server/tests/acceptance.test.ts && tsx server/tests/requirements_verification.test.ts"
+    "test": "tsx server/tests/acceptance.test.ts && tsx server/tests/requirements_verification.test.ts && tsx server/tests/sync_reconciliation_regression.test.ts"
   },
   "dependencies": {
     "@google/genai": "^2.4.0",

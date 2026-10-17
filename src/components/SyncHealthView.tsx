@@ -142,13 +142,13 @@ export const SyncHealthView: React.FC<SyncHealthViewProps> = ({
                   <th className="py-3 px-4 font-semibold">رقم الدورة</th>
                   <th className="py-3 px-4 font-semibold">نوع الدورة</th>
                   <th className="py-3 px-4 font-semibold">الحالة</th>
-                  <th className="py-3 px-4 font-semibold">الطلبات المفحوصة</th>
+                  <th className="py-3 px-4 font-semibold">الطلبات الفريدة (خام)</th>
                   <th className="py-3 px-4 font-semibold">طلبات جديدة</th>
-                  <th className="py-3 px-4 font-semibold">طلبات محدثة</th>
-                  <th className="py-3 px-4 font-semibold">أحداث مكتشفة</th>
-                  <th className="py-3 px-4 font-semibold">تنبيهات أُطلقت</th>
+                  <th className="py-3 px-4 font-semibold">تغييرات بيانات فعلية</th>
+                  <th className="py-3 px-4 font-semibold">تغير حالات المصدر</th>
+                  <th className="py-3 px-4 font-semibold">تكرار عبر الصفحات</th>
+                  <th className="py-3 px-4 font-semibold">المدة</th>
                   <th className="py-3 px-4 font-semibold">وقت البدء</th>
-                  <th className="py-3 px-4 font-semibold">وقت الإكمال</th>
                 </tr>
               </thead>
               <tbody className="divide-y divide-slate-800/60 font-mono">
@@ -179,22 +179,29 @@ export const SyncHealthView: React.FC<SyncHealthViewProps> = ({
                           className={`font-sans text-[11px] font-semibold px-2 py-0.5 rounded ${
                             run.status === 'SUCCESS'
                               ? 'bg-emerald-500/10 text-emerald-400 border border-emerald-500/20'
+                              : run.status === 'PARTIAL'
+                              ? 'bg-amber-500/10 text-amber-400 border border-amber-500/20'
                               : 'bg-rose-500/10 text-rose-400 border border-rose-500/20'
                           }`}
                         >
-                          {run.status === 'SUCCESS' ? 'ناجحة' : 'فشلت'}
+                          {run.status === 'SUCCESS' ? 'ناجحة' : run.status === 'PARTIAL' ? 'جزئية' : 'فشلت'}
                         </span>
                       </td>
-                      <td className="py-3 px-4 text-slate-200">{run.orders_scanned}</td>
-                      <td className="py-3 px-4 text-emerald-400">+{run.orders_created}</td>
-                      <td className="py-3 px-4 text-sky-400">{run.orders_updated}</td>
-                      <td className="py-3 px-4 text-amber-400">{run.events_detected}</td>
-                      <td className="py-3 px-4 text-rose-400 font-bold">{run.alerts_triggered}</td>
-                      <td className="py-3 px-4 text-slate-400 text-[11px]">
-                        {new Date(run.started_at).toLocaleTimeString('ar-EG')}
+                      <td className="py-3 px-4 text-slate-200">
+                        <span>{run.unique_source_ids || run.orders_scanned}</span>
+                        {run.raw_rows_received && run.raw_rows_received !== (run.unique_source_ids || run.orders_scanned) ? (
+                          <span className="text-[10px] text-slate-500 block">({run.raw_rows_received} صف خام)</span>
+                        ) : null}
+                      </td>
+                      <td className="py-3 px-4 text-emerald-400">+{run.new_orders_inserted ?? run.orders_created}</td>
+                      <td className="py-3 px-4 text-sky-400">{run.records_with_field_changes ?? 0}</td>
+                      <td className="py-3 px-4 text-amber-400">{run.status_changes_count ?? run.events_detected}</td>
+                      <td className="py-3 px-4 text-slate-400">{run.duplicate_source_ids ?? 0}</td>
+                      <td className="py-3 px-4 text-slate-300 text-[11px]">
+                        {run.duration_ms ? `${(run.duration_ms / 1000).toFixed(1)} ث` : '—'}
                       </td>
                       <td className="py-3 px-4 text-slate-400 text-[11px]">
-                        {run.completed_at ? new Date(run.completed_at).toLocaleTimeString('ar-EG') : '—'}
+                        {new Date(run.started_at).toLocaleTimeString('ar-EG')}
                       </td>
                     </tr>
                   ))

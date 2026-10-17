@@ -127,6 +127,25 @@ class VendoorClient {
     }
   }
 
+  private async fetchWithTimeout(url: string | URL, options: RequestInit = {}, timeoutMs = 15000): Promise<Response> {
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
+    try {
+      const res = await fetch(url.toString(), {
+        ...options,
+        signal: controller.signal,
+      });
+      return res;
+    } catch (err: any) {
+      if (err.name === 'AbortError') {
+        throw new Error(`Request timed out after ${timeoutMs}ms: ${url}`);
+      }
+      throw err;
+    } finally {
+      clearTimeout(timeoutId);
+    }
+  }
+
   public async ensureAuthenticated(): Promise<boolean> {
     const now = Date.now();
     // Re-check or re-authenticate after 45 minutes
@@ -147,13 +166,13 @@ class VendoorClient {
       try {
         this.cookieMap.clear();
 
-        // Step 1: GET Login Page
-        const getRes = await fetch(`${this.baseUrl}/dashboard/login`, {
+        // Step 1: GET Login Page (12s timeout)
+        const getRes = await this.fetchWithTimeout(`${this.baseUrl}/dashboard/login`, {
           headers: {
             'User-Agent': this.userAgent,
             'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
           },
-        });
+        }, 12000);
 
         this.updateCookies(getRes);
         const html = await getRes.text();
@@ -173,7 +192,7 @@ class VendoorClient {
         bodyParams.append('password', this.password);
         bodyParams.append('remember', 'on');
 
-        const postRes = await fetch(`${this.baseUrl}/dashboard/login`, {
+        const postRes = await this.fetchWithTimeout(`${this.baseUrl}/dashboard/login`, {
           method: 'POST',
           headers: {
             'User-Agent': this.userAgent,
@@ -184,7 +203,7 @@ class VendoorClient {
           },
           body: bodyParams.toString(),
           redirect: 'manual',
-        });
+        }, 15000);
 
         this.updateCookies(postRes);
 
@@ -239,7 +258,7 @@ class VendoorClient {
       url.searchParams.set('end_date', endDate);
     }
 
-    const res = await fetch(url.toString(), {
+    const res = await this.fetchWithTimeout(url.toString(), {
       headers: {
         'User-Agent': this.userAgent,
         'X-Requested-With': 'XMLHttpRequest',
@@ -247,7 +266,7 @@ class VendoorClient {
         'Cookie': this.getCookieHeader(),
         'Referer': `${this.baseUrl}/dashboard/orders`,
       },
-    });
+    }, 15000);
 
     this.updateCookies(res);
 
@@ -255,7 +274,7 @@ class VendoorClient {
       // Re-login and retry once
       this.isAuthenticated = false;
       await this.login();
-      const retryRes = await fetch(url.toString(), {
+      const retryRes = await this.fetchWithTimeout(url.toString(), {
         headers: {
           'User-Agent': this.userAgent,
           'X-Requested-With': 'XMLHttpRequest',
@@ -263,7 +282,7 @@ class VendoorClient {
           'Cookie': this.getCookieHeader(),
           'Referer': `${this.baseUrl}/dashboard/orders`,
         },
-      });
+      }, 15000);
       this.updateCookies(retryRes);
       if (!retryRes.ok) {
         throw new Error(`Failed to fetch orders from Vendoor after re-auth: HTTP ${retryRes.status}`);
@@ -283,22 +302,35 @@ class VendoorClient {
 
     const cleanPhone = phone.trim();
     const query = currentOrderId ? `?current_order_id=${currentOrderId}` : '';
-    const res = await fetch(`${this.baseUrl}/searchPhone/${cleanPhone}${query}`, {
+    const res = await this.fetchWithTimeout(`${this.baseUrl}/searchPhone/${cleanPhone}${query}`, {
       headers: {
         'User-Agent': this.userAgent,
         'X-Requested-With': 'XMLHttpRequest',
         'Accept': 'application/json',
         'Cookie': this.getCookieHeader(),
       },
-    });
+    }, 8000);
 
-    this.updateCookies(res);
-
-    if (!res.ok) {
-      throw new Error(`Failed to query customer history for phone ${cleanPhone}: HTTP ${res.status}`);
+    let activeRes = res;
+    if (activeRes.status === 400 || activeRes.status === 401 || activeRes.status === 419 || activeRes.url.includes('/login')) {
+      this.isAuthenticated = false;
+      await this.login();
+      activeRes = await this.fetchWithTimeout(`${this.baseUrl}/searchPhone/${cleanPhone}${query}`, {
+        headers: {
+          'User-Agent': this.userAgent,
+          'X-Requested-With': 'XMLHttpRequest',
+          'Accept': 'application/json',
+          'Cookie': this.getCookieHeader(),
+        },
+      }, 8000);
+      this.updateCookies(activeRes);
     }
 
-    const json = await res.json();
+    if (!activeRes.ok) {
+      throw new Error(`Failed to query customer history for phone ${cleanPhone}: HTTP ${activeRes.status}`);
+    }
+
+    const json = await activeRes.json();
 
     const result: ParsedCustomerHistory = {
       phone: cleanPhone,
@@ -373,20 +405,31 @@ class VendoorClient {
       over_three: 'over/three/day/order/confirmation',
     };
 
-    const res = await fetch(`${this.baseUrl}/dashboard/${pathMap[category]}`, {
+    const res = await this.fetchWithTimeout(`${this.baseUrl}/dashboard/${pathMap[category]}`, {
       headers: {
         'User-Agent': this.userAgent,
         'Cookie': this.getCookieHeader(),
       },
-    });
+    }, 12000);
 
-    this.updateCookies(res);
-
-    if (!res.ok) {
-      throw new Error(`Failed to fetch confirmation page for ${category}: HTTP ${res.status}`);
+    let activeRes = res;
+    if (activeRes.status === 400 || activeRes.status === 401 || activeRes.status === 419 || activeRes.url.includes('/login')) {
+      this.isAuthenticated = false;
+      await this.login();
+      activeRes = await this.fetchWithTimeout(`${this.baseUrl}/dashboard/${pathMap[category]}`, {
+        headers: {
+          'User-Agent': this.userAgent,
+          'Cookie': this.getCookieHeader(),
+        },
+      }, 12000);
+      this.updateCookies(activeRes);
     }
 
-    const html = await res.text();
+    if (!activeRes.ok) {
+      throw new Error(`Failed to fetch confirmation page for ${category}: HTTP ${activeRes.status}`);
+    }
+
+    const html = await activeRes.text();
     const rows: ConfirmationRow[] = [];
 
     // Parse table rows
@@ -439,20 +482,31 @@ class VendoorClient {
     if (startDate) url.searchParams.set('start_date', startDate);
     if (endDate) url.searchParams.set('end_date', endDate);
 
-    const res = await fetch(url.toString(), {
+    const res = await this.fetchWithTimeout(url.toString(), {
       headers: {
         'User-Agent': this.userAgent,
         'Cookie': this.getCookieHeader(),
       },
-    });
+    }, 12000);
 
-    this.updateCookies(res);
-
-    if (!res.ok) {
-      throw new Error(`Failed to fetch system logs page ${page}: HTTP ${res.status}`);
+    let activeRes = res;
+    if (activeRes.status === 400 || activeRes.status === 401 || activeRes.status === 419 || activeRes.url.includes('/login')) {
+      this.isAuthenticated = false;
+      await this.login();
+      activeRes = await this.fetchWithTimeout(url.toString(), {
+        headers: {
+          'User-Agent': this.userAgent,
+          'Cookie': this.getCookieHeader(),
+        },
+      }, 12000);
+      this.updateCookies(activeRes);
     }
 
-    const html = await res.text();
+    if (!activeRes.ok) {
+      throw new Error(`Failed to fetch system logs page ${page}: HTTP ${activeRes.status}`);
+    }
+
+    const html = await activeRes.text();
     const entries: LogEntry[] = [];
 
     // Parse log table rows
@@ -502,23 +556,39 @@ class VendoorClient {
   }> {
     await this.ensureAuthenticated();
 
-    const res = await fetch(
+    const res = await this.fetchWithTimeout(
       `${this.baseUrl}/dashboard/super-admin/orders/${vendoorOrderId}/edit?type=refactor`,
       {
         headers: {
           'User-Agent': this.userAgent,
           'Cookie': this.getCookieHeader(),
         },
-      }
+      },
+      10000
     );
 
-    this.updateCookies(res);
+    let activeRes = res;
+    if (activeRes.status === 400 || activeRes.status === 401 || activeRes.status === 419 || activeRes.url.includes('/login')) {
+      this.isAuthenticated = false;
+      await this.login();
+      activeRes = await this.fetchWithTimeout(
+        `${this.baseUrl}/dashboard/super-admin/orders/${vendoorOrderId}/edit?type=refactor`,
+        {
+          headers: {
+            'User-Agent': this.userAgent,
+            'Cookie': this.getCookieHeader(),
+          },
+        },
+        10000
+      );
+      this.updateCookies(activeRes);
+    }
 
-    if (!res.ok) {
+    if (!activeRes.ok) {
       return { success: false, anotherPhone: '', extraPhoneValid: false, merchantCodes: [], vendorIds: [], warehouseNames: [] };
     }
 
-    const html = await res.text();
+    const html = await activeRes.text();
 
     // Extract another_phone
     const phoneMatch = html.match(/name="another_phone"[^>]*value="([^"]*)"/i) || html.match(/value="([^"]*)"[^>]*name="another_phone"/i);
