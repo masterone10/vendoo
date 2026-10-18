@@ -328,8 +328,13 @@ export async function runSqliteToSupabaseImport(): Promise<ImportValidationResul
   };
 }
 
-// Standalone execution entry point
-if (import.meta.url === `file://${process.argv[1]}`) {
+// Standalone execution entry point - only when run directly as CLI script
+const isDirectExecution = typeof process.argv[1] === 'string' && (
+  process.argv[1].endsWith('importSqliteToSupabase.ts') ||
+  process.argv[1].endsWith('importSqliteToSupabase.js')
+);
+
+if (isDirectExecution) {
   runSqliteToSupabaseImport()
     .then((res) => {
       console.log('--- SQLITE TO SUPABASE IMPORT RESULT ---');

@@ -213,7 +213,7 @@ export const OrderDetailsModal: React.FC<OrderDetailsModalProps> = ({ orderCode,
                             {order.delivery_rate}%
                           </span>
                         ) : (
-                          <span className="text-slate-500 font-normal">غير متاحة</span>
+                          <span className="text-slate-400 font-normal text-xs">لا توجد طلبات سابقة (أول طلب للعميل)</span>
                         )}
                         {order.delivery_rate_num !== null && (
                           <span className="text-[10px] text-slate-500 font-normal">

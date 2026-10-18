@@ -323,6 +323,15 @@ export function initDatabase() {
       created_at TEXT NOT NULL,
       updated_at TEXT NOT NULL
     );
+
+    -- Archive checkpoints for Supabase cursor/pagination tracking
+    CREATE TABLE IF NOT EXISTS archive_checkpoints (
+      entity_type TEXT PRIMARY KEY,
+      last_archived_id INTEGER DEFAULT 0,
+      last_archived_at TEXT,
+      total_archived INTEGER DEFAULT 0,
+      updated_at TEXT NOT NULL
+    );
   `);
 
   // 2. Run soft schema migrations for existing database columns before creating indexes

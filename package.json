@@ -10,7 +10,7 @@
     "db:import-sqlite": "tsx server/importSqliteToSupabase.ts",
     "clean": "rm -rf dist dist-server",
     "lint": "tsc --noEmit",
-    "test": "tsx server/tests/acceptance.test.ts && tsx server/tests/requirements_verification.test.ts && tsx server/tests/sync_reconciliation_regression.test.ts"
+    "test": "tsx server/tests/acceptance.test.ts && tsx server/tests/requirements_verification.test.ts && tsx server/tests/sync_reconciliation_regression.test.ts && tsx server/tests/master_repair_verification.test.ts"
   },
   "dependencies": {
     "@google/genai": "^2.4.0",

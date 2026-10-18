@@ -486,29 +486,41 @@ apiRouter.get('/team', async (req: Request, res: Response) => {
     const effectiveDate = (date as string) || (period === 'today' ? getCairoDateString() : '');
     if (effectiveDate) {
       dateLabel = effectiveDate;
-      conditions.push('event_timestamp LIKE ?');
-      params.push(`${effectiveDate}%`);
+      const interval = getCairoDateInterval(effectiveDate);
+      conditions.push('event_timestamp >= ? AND event_timestamp < ?');
+      params.push(interval.startCairo, interval.endCairo);
       if (syncIfMissing === '1') {
         await syncEngine.syncHistoricalDate('logs', effectiveDate);
       }
     } else if (startDate && endDate) {
-      dateLabel = `${startDate} إلى ${endDate}`;
-      conditions.push('event_timestamp >= ? AND event_timestamp <= ?');
-      params.push(`${startDate} 00:00:00`, `${endDate} 23:59:59`);
+      if (startDate === endDate) {
+        dateLabel = String(startDate);
+        const interval = getCairoDateInterval(String(startDate));
+        conditions.push('event_timestamp >= ? AND event_timestamp < ?');
+        params.push(interval.startCairo, interval.endCairo);
+      } else {
+        dateLabel = `${startDate} إلى ${endDate}`;
+        const startInt = getCairoDateInterval(String(startDate));
+        const endInt = getCairoDateInterval(String(endDate));
+        conditions.push('event_timestamp >= ? AND event_timestamp < ?');
+        params.push(startInt.startCairo, endInt.endCairo);
+      }
     } else if (period === 'yesterday') {
       const now = new Date();
       const y = new Date(now.getTime() - 24 * 60 * 60 * 1000);
       const yStr = getCairoDateString(y);
       dateLabel = yStr;
-      conditions.push('event_timestamp LIKE ?');
-      params.push(`${yStr}%`);
+      const interval = getCairoDateInterval(yStr);
+      conditions.push('event_timestamp >= ? AND event_timestamp < ?');
+      params.push(interval.startCairo, interval.endCairo);
     } else if (period === 'all') {
       dateLabel = 'كل الفترات';
     } else {
       const todayStr = getCairoDateString();
       dateLabel = todayStr;
-      conditions.push('event_timestamp LIKE ?');
-      params.push(`${todayStr}%`);
+      const interval = getCairoDateInterval(todayStr);
+      conditions.push('event_timestamp >= ? AND event_timestamp < ?');
+      params.push(interval.startCairo, interval.endCairo);
     }
 
     conditions.push('is_system_actor = 0');
@@ -620,22 +632,33 @@ apiRouter.get('/team/:actorName/events', (req: Request, res: Response) => {
     const conditions: string[] = ['c.actor_name = ?'];
     const params: any[] = [actorName];
 
-    if (date) {
-      conditions.push('c.event_timestamp LIKE ?');
-      params.push(`${date}%`);
+    if (date && typeof date === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(date.trim())) {
+      const interval = getCairoDateInterval(date.trim());
+      conditions.push('c.event_timestamp >= ? AND c.event_timestamp < ?');
+      params.push(interval.startCairo, interval.endCairo);
     } else if (startDate && endDate) {
-      conditions.push('c.event_timestamp >= ? AND c.event_timestamp <= ?');
-      params.push(`${startDate} 00:00:00`, `${endDate} 23:59:59`);
+      if (startDate === endDate) {
+        const interval = getCairoDateInterval(String(startDate));
+        conditions.push('c.event_timestamp >= ? AND c.event_timestamp < ?');
+        params.push(interval.startCairo, interval.endCairo);
+      } else {
+        const startInt = getCairoDateInterval(String(startDate));
+        const endInt = getCairoDateInterval(String(endDate));
+        conditions.push('c.event_timestamp >= ? AND c.event_timestamp < ?');
+        params.push(startInt.startCairo, endInt.endCairo);
+      }
     } else if (period === 'yesterday') {
       const now = new Date();
       const y = new Date(now.getTime() - 24 * 60 * 60 * 1000);
       const yStr = getCairoDateString(y);
-      conditions.push('c.event_timestamp LIKE ?');
-      params.push(`${yStr}%`);
+      const interval = getCairoDateInterval(yStr);
+      conditions.push('c.event_timestamp >= ? AND c.event_timestamp < ?');
+      params.push(interval.startCairo, interval.endCairo);
     } else if (period === 'today') {
       const todayStr = getCairoDateString();
-      conditions.push('c.event_timestamp LIKE ?');
-      params.push(`${todayStr}%`);
+      const interval = getCairoDateInterval(todayStr);
+      conditions.push('c.event_timestamp >= ? AND c.event_timestamp < ?');
+      params.push(interval.startCairo, interval.endCairo);
     }
 
     const events: any[] = db.prepare(`
@@ -913,9 +936,10 @@ apiRouter.get('/logs', (req: Request, res: Response) => {
     const conditions: string[] = [];
     const params: any[] = [];
 
-    if (date) {
-      conditions.push('c.event_timestamp LIKE ?');
-      params.push(`${date}%`);
+    if (date && typeof date === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(date.trim())) {
+      const interval = getCairoDateInterval(date.trim());
+      conditions.push('c.event_timestamp >= ? AND c.event_timestamp < ?');
+      params.push(interval.startCairo, interval.endCairo);
     }
     if (actor) {
       conditions.push('c.actor_name = ?');

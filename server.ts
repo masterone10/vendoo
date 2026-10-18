@@ -1,19 +1,32 @@
 import express from 'express';
+import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import dotenv from 'dotenv';
 import { initDatabase } from './server/db.js';
 import { apiRouter } from './server/routes.js';
 import { syncEngine } from './server/syncEngine.js';
 import { startSupabaseArchiveWorker } from './server/supabaseArchiveWorker.js';
 
-dotenv.config({ override: true });
+// Safe environment loading: try dotenv first, fallback to Node 22 native loadEnvFile
+try {
+  const dotenv = await import('dotenv');
+  dotenv.default?.config?.({ override: true });
+} catch {
+  try {
+    // @ts-ignore Node 22 built-in env file loader
+    process.loadEnvFile?.();
+  } catch {
+    // In production container environments, environment variables are directly injected
+  }
+}
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
 const app = express();
-const port = parseInt(process.env.PORT || '3000', 10);
+const portArgIndex = process.argv.indexOf('--port');
+const cliPort = portArgIndex !== -1 && process.argv[portArgIndex + 1] ? parseInt(process.argv[portArgIndex + 1], 10) : null;
+const port = cliPort || (process.env.PORT && process.env.PORT !== '8080' ? parseInt(process.env.PORT, 10) : 3000);
 
 app.use(express.json());
 
@@ -42,13 +55,18 @@ async function startServer() {
     // Vite Dev Server middleware
     const { createServer } = await import('vite');
     const vite = await createServer({
-      server: { middlewareMode: true },
+      server: {
+        middlewareMode: true,
+        hmr: process.env.DISABLE_HMR === 'true' ? false : undefined,
+      },
       appType: 'spa',
     });
     app.use(vite.middlewares);
   } else {
     // Serve static frontend in production
-    const distPath = path.resolve(__dirname, 'dist');
+    const distPath = fs.existsSync(path.resolve(__dirname, 'dist'))
+      ? path.resolve(__dirname, 'dist')
+      : path.resolve(__dirname, '../dist');
     app.use(express.static(distPath));
     app.get('*', (_req, res) => {
       res.sendFile(path.resolve(distPath, 'index.html'));

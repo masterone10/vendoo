@@ -111,7 +111,7 @@ export const OrdersView: React.FC<OrdersViewProps> = ({
             }`}
           >
             <AlertTriangle className="w-3.5 h-3.5" />
-            <span>تعدد التجار فقط</span>
+            <span>تعدد المستودعات (Multi-Warehouse)</span>
           </button>
 
           <button
@@ -161,7 +161,7 @@ export const OrdersView: React.FC<OrdersViewProps> = ({
                 <th className="py-3 px-4 font-semibold">العميل</th>
                 <th className="py-3 px-4 font-semibold">الهاتف</th>
                 <th className="py-3 px-4 font-semibold">المحافظة</th>
-                <th className="py-3 px-4 font-semibold">أكواد التجار</th>
+                <th className="py-3 px-4 font-semibold">أكواد المستودعات (Warehouse)</th>
                 <th className="py-3 px-4 font-semibold">نسبة التسليم</th>
                 <th className="py-3 px-4 font-semibold">الإجمالي</th>
                 <th className="py-3 px-4 font-semibold">تاريخ الإنشاء</th>
@@ -232,15 +232,15 @@ export const OrdersView: React.FC<OrdersViewProps> = ({
                         {order.governorate || '—'}
                       </td>
 
-                      {/* Merchant Codes */}
+                      {/* Warehouse Codes */}
                       <td className="py-3 px-4">
                         {order.distinct_merchant_count > 1 ? (
                           <span className="text-rose-400 font-bold inline-flex items-center gap-1">
                             <AlertTriangle className="w-3.5 h-3.5" />
-                            <span>{order.distinct_merchant_count} تجار</span>
+                            <span>{order.distinct_merchant_count} مستودعات</span>
                           </span>
                         ) : (
-                          <span className="text-slate-400 text-xs">تاجر واحد</span>
+                          <span className="text-slate-400 text-xs">مستودع واحد</span>
                         )}
                       </td>
 
@@ -262,7 +262,7 @@ export const OrdersView: React.FC<OrdersViewProps> = ({
                             )}
                           </div>
                         ) : (
-                          <span className="text-slate-500 text-[11px]">—</span>
+                          <span className="text-slate-500 text-[11px]">لا توجد طلبات سابقة</span>
                         )}
                       </td>
 

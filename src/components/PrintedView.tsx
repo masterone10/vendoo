@@ -84,7 +84,7 @@ export const PrintedView: React.FC<PrintedViewProps> = ({
             }`}
           >
             <AlertTriangle className="w-3.5 h-3.5 text-rose-400" />
-            <span>فئة ب: تعدد أكواد التجار</span>
+            <span>فئة ب: تعدد أكواد المستودعات</span>
           </button>
           <button
             onClick={() => setSubTab('no_extra_phone')}
@@ -135,7 +135,7 @@ export const PrintedView: React.FC<PrintedViewProps> = ({
                 <th className="py-3 px-4 font-semibold">الهاتف الأساسي</th>
                 <th className="py-3 px-4 font-semibold">الهاتف الإضافي</th>
                 <th className="py-3 px-4 font-semibold">المحافظة</th>
-                <th className="py-3 px-4 font-semibold">أكواد التجار</th>
+                <th className="py-3 px-4 font-semibold">أكواد المستودعات</th>
                 <th className="py-3 px-4 font-semibold">نسبة التسليم</th>
                 <th className="py-3 px-4 font-semibold">الإجمالي</th>
                 <th className="py-3 px-4 font-semibold">تاريخ الطباعة</th>
@@ -220,11 +220,11 @@ export const PrintedView: React.FC<PrintedViewProps> = ({
                         {isMulti ? (
                           <span className="inline-flex items-center gap-1 text-rose-400 font-bold">
                             <AlertTriangle className="w-3.5 h-3.5" />
-                            <span>{order.distinct_merchant_count} تجار</span>
+                            <span>{order.distinct_merchant_count} مستودعات</span>
                           </span>
                         ) : (
                           <span className="text-slate-400 text-xs">
-                            تاجر واحد ({order.distinct_merchant_count})
+                            مستودع واحد ({order.distinct_merchant_count})
                           </span>
                         )}
                       </td>
@@ -247,7 +247,7 @@ export const PrintedView: React.FC<PrintedViewProps> = ({
                             )}
                           </div>
                         ) : (
-                          <span className="text-slate-500 text-[11px]">قيد الفحص</span>
+                          <span className="text-slate-500 text-[11px]">لا توجد طلبات سابقة</span>
                         )}
                       </td>
 

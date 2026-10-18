@@ -16,11 +16,24 @@ import {
   LogEntry,
 } from './vendoorClient.js';
 
+export interface ConfirmationAgeSyncStatus {
+  state: 'SUCCESS' | 'PARTIAL' | 'STALE' | 'NOT_AVAILABLE';
+  lastObservedAt: string | null;
+  lastSuccessAt: string | null;
+  lastError: string | null;
+  categoryStatuses: Record<'one' | 'two' | 'three' | 'over_three', 'SUCCESS' | 'TIMEOUT' | 'ERROR' | 'PENDING'>;
+  counts: Record<string, number>;
+}
+
 export interface DetailedSyncMetrics {
   rawRowsReceived: number;
   validRecordsParsed: number;
   uniqueSourceIds: number;
   duplicateSourceIds: number;
+  duplicatesAcrossPages: number;
+  duplicatesWithinPage: number;
+  recheckTopDuplicates: number;
+  recheckTopNewOrders: number;
   newOrdersInserted: number;
   existingOrdersExamined: number;
   recordsWithFieldChanges: number;
@@ -47,14 +60,17 @@ export interface SyncEngineStatus {
   lastSyncCompletedAt: string | null;
   lastSuccessfulSyncAt: string | null;
   nextScheduledRunAt: string | null;
+  configuredIntervalSeconds: number;
   currentPhase: string;
   totalOrdersInDb: number;
   totalAlertsOpen: number;
   lastError: string | null;
   consecutiveFailures: number;
+  skippedTicksCount: number;
   lastDurationMs: number | null;
   phaseTimings: PhaseTimings | null;
   detailedMetrics: DetailedSyncMetrics | null;
+  confirmationAgeStatus?: ConfirmationAgeSyncStatus;
 }
 
 export interface StatusReconciliationItem {
@@ -1029,46 +1045,75 @@ export class SyncEngine {
       db.exec('COMMIT;');
       phaseTimings.dbUpsertMs = Date.now() - tDbStart;
 
-      // 2b. Active Population Reconciliation:
-      // Orders previously marked active ('New', 'Pending', 'Processing') in our DB
-      // but no longer present in Vendoor's live active population have been deleted, canceled, or transitioned in Vendoor.
-      // Reconcile them to ensure 100% exact parity with Vendoor's live counts!
+      // 2b. Active Population Verification:
+      // Orders previously active in DB that are absent from the current active search window
+      // MUST NOT be blindly marked as 'Canceled'!
+      // Only transition status if an authoritative status-change log explicitly proves the new state.
+      // Otherwise, preserve the last verified status and mark validation_status as UNRESOLVED_ABSENT_FROM_VIEW.
       if (!hasFailedPage && totalOrdersInSource > 0) {
         const cairoToday = getCairoDateString();
         const activeDbOrders: any[] = db.prepare(`
           SELECT id, vendoor_id, random_number, current_status
           FROM orders
-          WHERE current_status IN ('New', 'Pending', 'Processing')
+          WHERE current_status IN ('New', 'Pending', 'Processing', 'Canceling')
             AND (created_at_source >= datetime('now', '-3 days') OR created_at_source LIKE ? OR created_at_source LIKE ?)
         `).all(`${cairoToday}%`, `${getCairoDateString(new Date(Date.now() - 86400000))}%`);
 
-        let reconciledCount = 0;
+        let verifiedViaLogsCount = 0;
+        let preservedUnresolvedCount = 0;
+
+        const findLatestStatusEventStmt = db.prepare(`
+          SELECT to_status, actor_name, event_timestamp
+          FROM canonical_activity_events
+          WHERE order_code = ? AND action_type = 'status_change' AND to_status IS NOT NULL
+          ORDER BY event_timestamp DESC
+          LIMIT 1
+        `);
+
         db.exec('BEGIN TRANSACTION;');
         for (const act of activeDbOrders) {
           if (!ordersMap.has(act.vendoor_id)) {
-            db.prepare(`
-              UPDATE orders
-              SET current_status = 'Canceled',
-                  last_observed_at = ?,
-                  updated_at = ?
-              WHERE id = ?
-            `).run(nowIso, nowIso, act.id);
+            // Check if there is an authoritative status change log from Vendoor
+            const latestEvent: any = findLatestStatusEventStmt.get(act.random_number);
 
-            db.prepare(`
-              INSERT INTO order_status_events (
-                order_id, random_number, from_status, to_status, actor_name,
-                event_time_source, storage_tier, observed_at, source_channel
-              ) VALUES (?, ?, ?, 'Canceled', 'مزامنة فيندور الحية', ?, 'HOT', ?, 'vendoor_reconciliation')
-            `).run(act.id, act.random_number, act.current_status, nowIso, nowIso);
+            if (latestEvent && latestEvent.to_status && latestEvent.to_status !== act.current_status) {
+              // Update strictly based on verified log evidence from Vendoor
+              db.prepare(`
+                UPDATE orders
+                SET current_status = ?,
+                    validation_status = 'VERIFIED_VIA_AUDIT_LOGS',
+                    last_observed_at = ?,
+                    updated_at = ?
+                WHERE id = ?
+              `).run(latestEvent.to_status, nowIso, nowIso, act.id);
 
-            reconciledCount++;
-            statusChangesCount++;
+              db.prepare(`
+                INSERT INTO order_status_events (
+                  order_id, random_number, from_status, to_status, actor_name,
+                  event_time_source, storage_tier, observed_at, source_channel
+                ) VALUES (?, ?, ?, ?, ?, ?, 'HOT', ?, 'vendoor_audit_log')
+              `).run(act.id, act.random_number, act.current_status, latestEvent.to_status, latestEvent.actor_name || 'سجلات فيندور', latestEvent.event_timestamp, nowIso);
+
+              verifiedViaLogsCount++;
+              statusChangesCount++;
+            } else {
+              // Retain last known verified status without guessing or forcing Canceled!
+              db.prepare(`
+                UPDATE orders
+                SET validation_status = 'UNRESOLVED_ABSENT_FROM_VIEW',
+                    last_observed_at = ?,
+                    updated_at = ?
+                WHERE id = ?
+              `).run(nowIso, nowIso, act.id);
+
+              preservedUnresolvedCount++;
+            }
           }
         }
         db.exec('COMMIT;');
 
-        if (reconciledCount > 0) {
-          console.log(`[SyncEngine] Reconciled ${reconciledCount} orders that left active Vendoor populations -> updated to Canceled`);
+        if (verifiedViaLogsCount > 0 || preservedUnresolvedCount > 0) {
+          console.log(`[SyncEngine] Verified ${activeDbOrders.length} orders absent from active view: ${verifiedViaLogsCount} resolved via logs, ${preservedUnresolvedCount} preserved in last known status (never auto-canceled)`);
         }
       }
 
