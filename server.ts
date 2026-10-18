@@ -5,6 +5,7 @@ import dotenv from 'dotenv';
 import { initDatabase } from './server/db.js';
 import { apiRouter } from './server/routes.js';
 import { syncEngine } from './server/syncEngine.js';
+import { startSupabaseArchiveWorker } from './server/supabaseArchiveWorker.js';
 
 dotenv.config({ override: true });
 
@@ -22,9 +23,17 @@ initDatabase();
 // Mount API routes
 app.use('/api', apiRouter);
 
+// Prevent unmatched /api routes from falling through to Vite HTML
+app.use('/api', (_req, res) => {
+  res.status(404).json({ error: 'API route not found' });
+});
+
 // Start background synchronization (responsive 45s interval for live tracking)
 const syncInterval = parseInt(process.env.SYNC_INTERVAL_SECONDS || '45', 10);
 syncEngine.start(syncInterval);
+
+// Start isolated Supabase background archive worker (separate 300s schedule, does not touch live counts)
+startSupabaseArchiveWorker(300);
 
 async function startServer() {
   const isProduction = process.env.NODE_ENV === 'production';

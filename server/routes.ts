@@ -21,6 +21,17 @@ import {
   isSupabaseConfigured,
 } from './supabaseClient.js';
 import { runSqliteToSupabaseImport } from './importSqliteToSupabase.js';
+import { getOrFetchHistoricalLogs } from './historicalLogsService.js';
+import { applyMerchantCodeMappings } from './excelMerchantCodes.js';
+import { getArchiveWorkerStatus, triggerArchivePass } from './supabaseArchiveWorker.js';
+
+export function isCSEmployee(actorName: string): boolean {
+  if (!actorName) return false;
+  const trimmed = actorName.trim();
+  const csRegex = /(?:^|[\s\-_/(\[])(?:CS|cs|Cs|cS)(?:$|[\s\-_/)\]])/;
+  const arabicRegex = /خدمة\s*العملاء/i;
+  return csRegex.test(trimmed) || arabicRegex.test(trimmed);
+}
 
 export const apiRouter = Router();
 
@@ -45,12 +56,24 @@ apiRouter.get('/dashboard/stats', (req: Request, res: Response) => {
     const coverageRecord = getCoverageRecord('orders', targetDate);
     const coverageStatus = isToday ? 'LIVE' : (coverageRecord?.completion_status || 'NOT_SYNCED');
 
-    // 1. Current Live Status Population in Database
-    const statusCountsRaw: any[] = db.prepare(`
-      SELECT current_status, COUNT(*) as count
-      FROM orders
-      GROUP BY current_status
-    `).all();
+    // 2. Target Date Activity
+    const dateInterval = getCairoDateInterval(targetDate);
+
+    // 1. Status Counts:
+    // When isToday: live active population in database (reconciled in real-time with Vendoor)
+    // When historical date: counts strictly scoped to orders created on that target date to prevent data mixing
+    const statusCountsRaw: any[] = isToday
+      ? db.prepare(`
+          SELECT current_status, COUNT(*) as count
+          FROM orders
+          GROUP BY current_status
+        `).all()
+      : db.prepare(`
+          SELECT current_status, COUNT(*) as count
+          FROM orders
+          WHERE created_at_source >= ? AND created_at_source < ?
+          GROUP BY current_status
+        `).all(dateInterval.startCairo, dateInterval.endCairo);
 
     const currentCounts = {
       New: 0,
@@ -67,8 +90,6 @@ apiRouter.get('/dashboard/stats', (req: Request, res: Response) => {
       }
     }
 
-    // 2. Target Date Activity
-    const dateInterval = getCairoDateInterval(targetDate);
     const dayTransitions: any[] = db.prepare(`
       SELECT to_status, COUNT(*) as count
       FROM order_status_events
@@ -553,8 +574,10 @@ apiRouter.get('/team', async (req: Request, res: Response) => {
       }
     }
 
-    const teamList = Object.values(userStats).map(u => ({
+    const isCsOnly = req.query.role !== 'all';
+    const allMembers = Object.values(userStats).map(u => ({
       ...u,
+      isCS: isCSEmployee(u.name),
       uniqueOrders: userOrdersMap[u.name]?.size || 0,
       printedPercent: u.actions > 0 ? Math.round((u.printed / u.actions) * 1000) / 10 : 0,
       pendingPercent: u.actions > 0 ? Math.round((u.pending / u.actions) * 1000) / 10 : 0,
@@ -563,10 +586,24 @@ apiRouter.get('/team', async (req: Request, res: Response) => {
       otherPercent: u.actions > 0 ? Math.round((u.other / u.actions) * 1000) / 10 : 0,
     })).sort((a, b) => b.actions - a.actions);
 
+    const csTeamList = allMembers.filter(m => m.isCS);
+    const nonCsStaff = allMembers.filter(m => !m.isCS);
+
+    const teamList = isCsOnly ? csTeamList : allMembers;
+    const csActionsTotal = csTeamList.reduce((acc, m) => acc + m.actions, 0);
+    const csUniqueOrdersTotal = new Set(
+      events.filter(e => isCSEmployee(e.actor_name || '')).map(e => e.order_code).filter(Boolean)
+    ).size;
+
     res.json({
       period: period || (date ? 'custom_date' : (startDate ? 'custom_range' : 'today')),
       dateFilter: dateLabel,
       team: teamList,
+      isCsOnly,
+      csStaffCount: csTeamList.length,
+      nonCsStaffCount: nonCsStaff.length,
+      csActionsTotal,
+      csUniqueOrdersTotal,
       totalActions: events.length,
       totalUniqueOrders: new Set(events.map(e => e.order_code).filter(Boolean)).size,
     });
@@ -928,6 +965,23 @@ apiRouter.get('/historical/coverage', (_req: Request, res: Response) => {
   }
 });
 
+apiRouter.get('/history/coverage', (_req: Request, res: Response) => {
+  try {
+    const coverage: any[] = db.prepare(`
+      SELECT * FROM historical_coverage
+      ORDER BY period_date DESC, source_domain ASC
+    `).all();
+
+    res.json({ coverage });
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+apiRouter.all('/history/ensure', (_req: Request, res: Response) => {
+  res.json({ success: true });
+});
+
 apiRouter.post('/historical/backfill', async (req: Request, res: Response) => {
   try {
     const { sourceDomain, date } = req.body;
@@ -939,6 +993,240 @@ apiRouter.post('/historical/backfill', async (req: Request, res: Response) => {
     res.json({ success: true, result });
   } catch (err: any) {
     res.status(500).json({ error: err.message });
+  }
+});
+
+apiRouter.post('/history/backfill', async (req: Request, res: Response) => {
+  try {
+    const { sourceDomain, date } = req.body;
+    if (!sourceDomain || !date) {
+      res.status(400).json({ error: 'sourceDomain and date are required' });
+      return;
+    }
+    const result = await syncEngine.syncHistoricalDate(sourceDomain, date);
+    res.json({ success: true, result });
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// 14b. Historical Logs with automatic fetch-on-missing & caching
+apiRouter.get('/historical/logs', async (req: Request, res: Response) => {
+  try {
+    const rawDate = typeof req.query.date === 'string' && req.query.date.trim()
+      ? req.query.date.trim().slice(0, 10)
+      : getCairoDateString();
+
+    const result = await getOrFetchHistoricalLogs(rawDate);
+    res.json(result);
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// 14c. Global Search (Order Code, Phone, or Customer Name)
+apiRouter.get('/search', (req: Request, res: Response) => {
+  try {
+    const query = typeof req.query.q === 'string' ? req.query.q.trim() : '';
+    if (!query || query.length < 2) {
+      res.json({ results: [], total: 0, query });
+      return;
+    }
+
+    const cleanDigits = query.replace(/[^\d]/g, '');
+    let normalizedPhonePattern = '';
+    if (cleanDigits.length >= 7) {
+      const localPhone = cleanDigits.startsWith('20') ? cleanDigits.slice(2) : cleanDigits;
+      normalizedPhonePattern = `%${localPhone}%`;
+    }
+
+    const isNumericId = /^\d+$/.test(query);
+
+    const conditions: string[] = [];
+    const params: any[] = [];
+
+    conditions.push('random_number LIKE ?');
+    params.push(`%${query}%`);
+
+    conditions.push('order_no LIKE ?');
+    params.push(`%${query}%`);
+
+    conditions.push('customer_name LIKE ?');
+    params.push(`%${query}%`);
+
+    if (isNumericId) {
+      conditions.push('vendoor_id = ?');
+      params.push(parseInt(query, 10));
+    }
+
+    if (normalizedPhonePattern) {
+      conditions.push('customer_phone LIKE ? OR customer_phone_extra LIKE ?');
+      params.push(normalizedPhonePattern, normalizedPhonePattern);
+    } else {
+      conditions.push('customer_phone LIKE ? OR customer_phone_extra LIKE ?');
+      params.push(`%${query}%`, `%${query}%`);
+    }
+
+    const sql = `
+      SELECT 
+        id, vendoor_id, random_number, order_no, order_type, current_status,
+        customer_name, customer_phone, customer_phone_extra, extra_phone_valid, extra_phone_status,
+        governorate, address, total_price, shipping_cost, total_order,
+        delivery_rate, delivery_rate_num, delivery_rate_denom,
+        cancel_rate, cancel_rate_num, cancel_rate_denom, total_customer_orders,
+        created_at_source, last_observed_at
+      FROM orders
+      WHERE ${conditions.join(' OR ')}
+      ORDER BY id DESC
+      LIMIT 25
+    `;
+
+    const orders: any[] = db.prepare(sql).all(...params);
+
+    const enrichedResults = orders.map(ord => {
+      const items: any[] = db.prepare(`
+        SELECT id, product_name, merchant_code, warehouse_name, sku, size, color, quantity, unit_price
+        FROM order_items
+        WHERE order_id = ?
+      `).all(ord.id);
+
+      const statusTimeline: any[] = db.prepare(`
+        SELECT from_status, to_status, actor_name, observed_at as event_time, 'status_transition' as event_type
+        FROM order_status_events
+        WHERE order_id = ?
+        ORDER BY observed_at ASC
+      `).all(ord.id);
+
+      const activityTimeline: any[] = db.prepare(`
+        SELECT action_type, from_status, to_status, actor_name, raw_action_text, event_timestamp as event_time, 'log_event' as event_type
+        FROM canonical_activity_events
+        WHERE order_code = ? OR order_code = ?
+        ORDER BY event_timestamp ASC
+      `).all(ord.random_number, String(ord.vendoor_id));
+
+      const hasPriorOrders = (ord.total_customer_orders !== null && ord.total_customer_orders > 0) ||
+                             (ord.delivery_rate_denom !== null && ord.delivery_rate_denom > 0);
+      const rateStatus = hasPriorOrders ? 'VERIFIED' : 'NO_HISTORY';
+
+      return {
+        ...ord,
+        items,
+        rateStatus,
+        rateLabel: !hasPriorOrders ? 'لا توجد طلبات سابقة' : `${ord.delivery_rate}%`,
+        timeline: [...statusTimeline, ...activityTimeline].sort((a, b) => (a.event_time > b.event_time ? 1 : -1)),
+      };
+    });
+
+    res.json({
+      query,
+      total: enrichedResults.length,
+      results: enrichedResults,
+    });
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// 14d. Excel Merchant Codes Import
+apiRouter.post('/merchants/excel-import', (req: Request, res: Response) => {
+  try {
+    const { rows } = req.body;
+    if (!Array.isArray(rows) || rows.length === 0) {
+      res.status(400).json({ error: 'rows must be a non-empty array of objects' });
+      return;
+    }
+
+    const report = applyMerchantCodeMappings(rows);
+    res.json({ success: true, report });
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// 14e. Reports Export (CSV with preserved text merchant codes and leading zeros)
+apiRouter.get('/reports/export', (req: Request, res: Response) => {
+  try {
+    const { startDate, endDate, status } = req.query;
+    const sDate = (startDate as string) || getCairoDateString();
+    const eDate = (endDate as string) || sDate;
+    const sInterval = getCairoDateInterval(sDate);
+    const eInterval = getCairoDateInterval(eDate);
+
+    const conditions = ['created_at_source >= ? AND created_at_source < ?'];
+    const params: any[] = [sInterval.startCairo, eInterval.endCairo];
+
+    if (status && status !== 'all') {
+      conditions.push('current_status = ?');
+      params.push(status);
+    }
+
+    const rows: any[] = db.prepare(`
+      SELECT 
+        o.vendoor_id, o.random_number, o.order_no, o.current_status,
+        o.customer_name, o.customer_phone, o.customer_phone_extra,
+        o.governorate, o.address, o.total_order, o.delivery_rate, o.created_at_source,
+        i.product_name, i.merchant_code, i.quantity
+      FROM orders o
+      LEFT JOIN order_items i ON o.id = i.order_id
+      WHERE ${conditions.join(' AND ')}
+      ORDER BY o.id DESC
+      LIMIT 1000
+    `).all(...params);
+
+    const headers = [
+      'Vendoor ID', 'Random Code', 'Order No', 'Status',
+      'Customer Name', 'Phone', 'Extra Phone', 'Governorate',
+      'Address', 'Total Order', 'Delivery Rate', 'Created At',
+      'Product Name', 'Merchant Code (Text)', 'Quantity'
+    ];
+
+    const escapeCsv = (val: any) => {
+      if (val === null || val === undefined) return '""';
+      const str = String(val).replace(/"/g, '""');
+      return `"${str}"`;
+    };
+
+    const csvLines = [headers.join(',')];
+    for (const r of rows) {
+      csvLines.push([
+        escapeCsv(r.vendoor_id),
+        escapeCsv(r.random_number),
+        escapeCsv(r.order_no),
+        escapeCsv(r.current_status),
+        escapeCsv(r.customer_name),
+        escapeCsv(r.customer_phone),
+        escapeCsv(r.customer_phone_extra),
+        escapeCsv(r.governorate),
+        escapeCsv(r.address),
+        escapeCsv(r.total_order),
+        escapeCsv(r.delivery_rate !== null ? `${r.delivery_rate}%` : 'N/A'),
+        escapeCsv(r.created_at_source),
+        escapeCsv(r.product_name),
+        escapeCsv(r.merchant_code || ''),
+        escapeCsv(r.quantity || 1)
+      ].join(','));
+    }
+
+    const csvContent = '\uFEFF' + csvLines.join('\r\n');
+    res.setHeader('Content-Type', 'text/csv; charset=utf-8');
+    res.setHeader('Content-Disposition', `attachment; filename="vendoor_report_${sDate}_${eDate}.csv"`);
+    res.send(csvContent);
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// 14f. Supabase Archival Worker Status & Trigger
+apiRouter.get('/supabase/archive/status', (_req: Request, res: Response) => {
+  res.json(getArchiveWorkerStatus());
+});
+
+apiRouter.post('/supabase/archive/run', async (_req: Request, res: Response) => {
+  try {
+    const result = await triggerArchivePass();
+    res.json(result);
+  } catch (err: any) {
+    res.status(500).json({ success: false, error: err.message });
   }
 });
 

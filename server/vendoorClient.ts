@@ -266,9 +266,11 @@ class VendoorClient {
       url.searchParams.set('status_filter', mappedVal);
     }
     if (startDate) {
+      url.searchParams.set('from_date', startDate);
       url.searchParams.set('start_date', startDate);
     }
     if (endDate) {
+      url.searchParams.set('to_date', endDate);
       url.searchParams.set('end_date', endDate);
     }
 

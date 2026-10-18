@@ -559,10 +559,12 @@ export class SyncEngine {
       triggered++;
     }
 
-    // 2. Low delivery rate (< 70% strictly, unknown is NOT low)
-    const orderRow: any = db.prepare('SELECT delivery_rate, customer_phone_extra, extra_phone_status, address_quality_status, created_at_source FROM orders WHERE id = ?').get(orderDbId);
+    // 2. Low delivery rate (< 70% strictly, unknown or no history is NOT low)
+    const orderRow: any = db.prepare('SELECT delivery_rate, customer_phone_extra, extra_phone_status, address_quality_status, created_at_source, total_customer_orders, delivery_rate_denom FROM orders WHERE id = ?').get(orderDbId);
     if (orderRow) {
-      if (orderRow.delivery_rate !== null && orderRow.delivery_rate !== undefined && orderRow.delivery_rate < 70) {
+      const hasValidEligibleHistory = (orderRow.delivery_rate_denom !== null && orderRow.delivery_rate_denom > 0) ||
+                                      (orderRow.total_customer_orders !== null && orderRow.total_customer_orders > 0);
+      if (orderRow.delivery_rate !== null && orderRow.delivery_rate !== undefined && orderRow.delivery_rate < 70 && hasValidEligibleHistory) {
         const alertKey = `LOW_DELIVERY_${randomNum}`;
         insertAlertStmt.run(
           alertKey,
@@ -573,7 +575,7 @@ export class SyncEngine {
           'OPEN',
           `نسبة تسليم منخفضة للعميل (${orderRow.delivery_rate}%) - (${randomNum})`,
           `العميل لديه نسبة تسليم مؤكدة أقل من 70% (${orderRow.delivery_rate}%)، يرجى مراجعة الجدية قبل الشحن.`,
-          JSON.stringify({ deliveryRate: orderRow.delivery_rate }),
+          JSON.stringify({ deliveryRate: orderRow.delivery_rate, totalOrders: orderRow.total_customer_orders, denom: orderRow.delivery_rate_denom }),
           0,
           nowIso,
           nowIso
@@ -1028,16 +1030,17 @@ export class SyncEngine {
       phaseTimings.dbUpsertMs = Date.now() - tDbStart;
 
       // 2b. Active Population Reconciliation:
-      // If this was a 100% complete, un-truncated scan of Vendoor,
-      // orders that were previously marked active ('New', 'Pending', 'Processing') in our DB
-      // but are NO LONGER present in Vendoor's active orders have been canceled or removed in Vendoor.
-      // Update them to 'Canceled' so active status populations (New, Pending, Processing) exactly mirror Vendoor!
-      if (!hasFailedPage && totalOrdersInSource > 0 && ordersMap.size >= (totalOrdersInSource - 15)) {
+      // Orders previously marked active ('New', 'Pending', 'Processing') in our DB
+      // but no longer present in Vendoor's live active population have been deleted, canceled, or transitioned in Vendoor.
+      // Reconcile them to ensure 100% exact parity with Vendoor's live counts!
+      if (!hasFailedPage && totalOrdersInSource > 0) {
+        const cairoToday = getCairoDateString();
         const activeDbOrders: any[] = db.prepare(`
           SELECT id, vendoor_id, random_number, current_status
           FROM orders
           WHERE current_status IN ('New', 'Pending', 'Processing')
-        `).all();
+            AND (created_at_source >= datetime('now', '-3 days') OR created_at_source LIKE ? OR created_at_source LIKE ?)
+        `).all(`${cairoToday}%`, `${getCairoDateString(new Date(Date.now() - 86400000))}%`);
 
         let reconciledCount = 0;
         db.exec('BEGIN TRANSACTION;');
@@ -1055,7 +1058,7 @@ export class SyncEngine {
               INSERT INTO order_status_events (
                 order_id, random_number, from_status, to_status, actor_name,
                 event_time_source, storage_tier, observed_at, source_channel
-              ) VALUES (?, ?, ?, 'Canceled', 'النظام', ?, 'HOT', ?, 'vendoor_reconciliation')
+              ) VALUES (?, ?, ?, 'Canceled', 'مزامنة فيندور الحية', ?, 'HOT', ?, 'vendoor_reconciliation')
             `).run(act.id, act.random_number, act.current_status, nowIso, nowIso);
 
             reconciledCount++;
