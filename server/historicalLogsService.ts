@@ -1,8 +1,9 @@
 import crypto from 'node:crypto';
-import { db, getCairoDateInterval } from './db.js';
+import { db, getCairoDateInterval, isDateInHot } from './db.js';
 import { vendoorClient } from './vendoorClient.js';
+import { syncEngine } from './syncEngine.js';
 
-interface LogBackfillState {
+export interface LogBackfillState {
   date: string;
   status: 'IDLE' | 'RUNNING' | 'COMPLETE' | 'PARTIAL' | 'FAILED';
   pagesFetched: number;
@@ -13,36 +14,167 @@ interface LogBackfillState {
   completedAt: string | null;
 }
 
+export interface PeriodLogsFetchReport {
+  success: boolean;
+  startDate: string;
+  endDate: string;
+  totalDays: number;
+  totalFetched: number;
+  totalSaved: number;
+  totalDuplicates: number;
+  failedPages: number;
+  coverageStatus: 'COMPLETE' | 'PARTIAL' | 'FAILED';
+  days: Array<{
+    date: string;
+    pagesTotal: number;
+    pagesFetched: number;
+    eventsFetched: number;
+    eventsSaved: number;
+    status: 'COMPLETE' | 'PARTIAL' | 'FAILED';
+    error?: string | null;
+  }>;
+  errorMessage?: string | null;
+}
+
 const activeJobs = new Map<string, LogBackfillState>();
 
 /**
- * Normalizes log action and determines action_type, from_status, to_status
+ * Persist log entries with deterministic SHA256 deduplication and Cairo business-date bounding.
+ * Preserves raw log entry, parses canonical action, and avoids inserting raw_action_text into canonical table.
  */
-function parseCanonicalLogAction(actionText: string) {
-  let actionType = 'other';
-  let fromStatus: string | null = null;
-  let toStatus: string | null = null;
+export function persistLogEntries(
+  entries: any[],
+  interval: { startCairo: string; endCairo: string }
+): { saved: number; duplicates: number } {
+  let saved = 0;
+  let duplicates = 0;
+  const nowIso = new Date().toISOString();
 
-  if (actionText.includes('تغيير حالة') || actionText.includes('حالة الطلب')) {
-    actionType = 'status_change';
-    const statusMatches = actionText.match(/من\s+([^\s]+)\s+إلى\s+([^\s]+)/i);
-    if (statusMatches) {
-      fromStatus = statusMatches[1].trim();
-      toStatus = statusMatches[2].trim();
+  const insertRawStmt = db.prepare(`
+    INSERT INTO raw_activity_events (source_hash, order_code, actor_name, raw_action_text, event_timestamp, storage_tier, observed_at, page_source)
+    VALUES (?, ?, ?, ?, ?, ?, ?, 'log/system')
+    ON CONFLICT(source_hash) DO NOTHING
+  `);
+
+  const insertCanonStmt = db.prepare(`
+    INSERT INTO canonical_activity_events (
+      raw_event_id, order_code, actor_name, action_type, from_status, to_status,
+      event_timestamp, storage_tier, is_system_actor, created_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `);
+
+  const findOrderStmt = db.prepare(`
+    SELECT id, random_number, current_status
+    FROM orders
+    WHERE random_number = ? OR order_no = ?
+    LIMIT 1
+  `);
+
+  for (const entry of entries) {
+    const rawActionText = (entry.rawActionText || '').trim();
+    const eventTime = entry.eventTimestamp || nowIso;
+    const actorName = (entry.actorName || 'النظام').trim();
+    const orderCode = (entry.orderCode || '').trim() || null;
+
+    // Check Cairo date isolation bounds [startCairo, endCairo)
+    if (eventTime < interval.startCairo || eventTime >= interval.endCairo) {
+      continue;
     }
-  } else if (actionText.includes('طباعة') || actionText.includes('بوليصة')) {
-    actionType = 'print';
-    toStatus = 'Printed';
-  } else if (actionText.includes('تأكيد')) {
-    actionType = 'confirm';
-  } else if (actionText.includes('إلغاء') || actionText.includes('الغاء')) {
-    actionType = 'cancel';
-    toStatus = 'Canceled';
-  } else if (actionText.includes('تعديل')) {
-    actionType = 'edit';
+
+    const sourceHash = crypto
+      .createHash('sha256')
+      .update(`${actorName}|${orderCode || ''}|${rawActionText}|${eventTime}`)
+      .digest('hex');
+
+    const logTier = isDateInHot(eventTime) ? 'HOT' : 'COLD';
+
+    // 1. Insert into raw_activity_events
+    let rawEventId: number | null = null;
+    try {
+      const res = insertRawStmt.run(sourceHash, orderCode, actorName, rawActionText, eventTime, logTier, nowIso);
+      if (res.changes > 0) {
+        rawEventId = Number(res.lastInsertRowid);
+      } else {
+        // Event hash already exists - retrieve existing rawEventId
+        const existingRow: any = db.prepare('SELECT id FROM raw_activity_events WHERE source_hash = ?').get(sourceHash);
+        rawEventId = existingRow?.id ? Number(existingRow.id) : null;
+        duplicates++;
+      }
+    } catch {
+      duplicates++;
+    }
+
+    // 2. Parse canonical details via syncEngine classifier
+    const parsed = syncEngine.classifyAction(rawActionText);
+    const isSystem = (
+      actorName === 'النظام' ||
+      actorName.toLowerCase() === 'system' ||
+      actorName.toLowerCase().includes('cron') ||
+      actorName.includes('تلقائي')
+    ) ? 1 : 0;
+
+    // Check if canonical event already exists for this exact order, actor, action, timestamp
+    const existingCanon: any = db.prepare(`
+      SELECT id FROM canonical_activity_events
+      WHERE order_code = ? AND actor_name = ? AND action_type = ? AND event_timestamp = ?
+    `).get(orderCode, actorName, parsed.actionType, eventTime);
+
+    if (!existingCanon) {
+      try {
+        const insRes = insertCanonStmt.run(
+          rawEventId,
+          orderCode,
+          actorName,
+          parsed.actionType,
+          parsed.fromStatus,
+          parsed.toStatus,
+          eventTime,
+          logTier,
+          isSystem,
+          nowIso
+        );
+
+        if (insRes.changes > 0) {
+          saved++;
+
+          // 3. If event provides verified status change and matches an existing order, link timeline
+          if (orderCode && parsed.actionType === 'status_change' && parsed.toStatus) {
+            const ord: any = findOrderStmt.get(orderCode, orderCode);
+            if (ord) {
+              db.prepare(`
+                INSERT INTO order_status_events (
+                  order_id, random_number, from_status, to_status, actor_name,
+                  event_time_source, storage_tier, observed_at, source_channel
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'system_log_audit')
+              `).run(
+                ord.id,
+                ord.random_number,
+                parsed.fromStatus || ord.current_status,
+                parsed.toStatus,
+                actorName,
+                eventTime,
+                logTier,
+                nowIso
+              );
+
+              // Update order current status if event is newer than state_entry_at
+              db.prepare(`
+                UPDATE orders
+                SET current_status = ?,
+                    validation_status = 'RESOLVED_VIA_AUDIT_LOGS',
+                    last_observed_at = ?
+                WHERE id = ? AND (state_entry_at IS NULL OR state_entry_at <= ?)
+              `).run(parsed.toStatus, nowIso, ord.id, eventTime);
+            }
+          }
+        }
+      } catch (err: any) {
+        // Safe duplicate or constraint handling
+      }
+    }
   }
 
-  return { actionType, fromStatus, toStatus };
+  return { saved, duplicates };
 }
 
 /**
@@ -74,11 +206,13 @@ export async function getOrFetchHistoricalLogs(targetDate: string): Promise<{
   if (isComplete) {
     const logs = db.prepare(`
       SELECT 
-        id, order_code, actor_name, action_type, from_status, to_status,
-        raw_action_text, event_timestamp, is_system_actor, created_at
-      FROM canonical_activity_events
-      WHERE event_timestamp >= ? AND event_timestamp < ?
-      ORDER BY event_timestamp DESC
+        c.id, c.order_code, c.actor_name, c.action_type, c.from_status, c.to_status,
+        COALESCE(r.raw_action_text, '') as raw_action_text,
+        c.event_timestamp, c.storage_tier, c.is_system_actor, c.created_at
+      FROM canonical_activity_events c
+      LEFT JOIN raw_activity_events r ON c.raw_event_id = r.id
+      WHERE c.event_timestamp >= ? AND c.event_timestamp < ?
+      ORDER BY c.event_timestamp DESC
     `).all(interval.startCairo, interval.endCairo);
 
     return {
@@ -94,7 +228,6 @@ export async function getOrFetchHistoricalLogs(targetDate: string): Promise<{
   let job = activeJobs.get(cleanDate);
 
   if (!job || job.status === 'FAILED' || job.status === 'PARTIAL') {
-    // Start background job asynchronously
     job = {
       date: cleanDate,
       status: 'RUNNING',
@@ -107,7 +240,6 @@ export async function getOrFetchHistoricalLogs(targetDate: string): Promise<{
     };
     activeJobs.set(cleanDate, job);
 
-    // Launch background worker without awaiting
     runHistoricalLogJob(cleanDate).catch((err) => {
       console.error(`[HistoricalLogs] Background job failed for ${cleanDate}:`, err.message);
     });
@@ -116,11 +248,13 @@ export async function getOrFetchHistoricalLogs(targetDate: string): Promise<{
   // Return currently available records with fetching status
   const currentLogs = db.prepare(`
     SELECT 
-      id, order_code, actor_name, action_type, from_status, to_status,
-      raw_action_text, event_timestamp, is_system_actor, created_at
-    FROM canonical_activity_events
-    WHERE event_timestamp >= ? AND event_timestamp < ?
-    ORDER BY event_timestamp DESC
+      c.id, c.order_code, c.actor_name, c.action_type, c.from_status, c.to_status,
+      COALESCE(r.raw_action_text, '') as raw_action_text,
+      c.event_timestamp, c.storage_tier, c.is_system_actor, c.created_at
+    FROM canonical_activity_events c
+    LEFT JOIN raw_activity_events r ON c.raw_event_id = r.id
+    WHERE c.event_timestamp >= ? AND c.event_timestamp < ?
+    ORDER BY c.event_timestamp DESC
   `).all(interval.startCairo, interval.endCairo);
 
   return {
@@ -141,9 +275,18 @@ export async function getOrFetchHistoricalLogs(targetDate: string): Promise<{
 /**
  * Worker that paginates through Vendoor system logs for a specific Cairo business date.
  */
-async function runHistoricalLogJob(targetDate: string): Promise<void> {
-  const job = activeJobs.get(targetDate);
-  if (!job) return;
+export async function runHistoricalLogJob(targetDate: string): Promise<void> {
+  const job = activeJobs.get(targetDate) || {
+    date: targetDate,
+    status: 'RUNNING',
+    pagesFetched: 0,
+    pagesTotal: 1,
+    eventsSaved: 0,
+    errorMessage: null,
+    startedAt: new Date().toISOString(),
+    completedAt: null,
+  };
+  activeJobs.set(targetDate, job);
 
   const interval = getCairoDateInterval(targetDate);
   let hasFailedPage = false;
@@ -153,13 +296,17 @@ async function runHistoricalLogJob(targetDate: string): Promise<void> {
   try {
     console.log(`[HistoricalLogs] Starting log retrieval for date ${targetDate}...`);
 
+    if (!vendoorClient.isConfigured()) {
+      throw new Error('Vendoor credentials are not configured in environment or secrets.');
+    }
+
     // Fetch page 1 with date filter
     const page1 = await vendoorClient.fetchSystemLogs(1, targetDate, targetDate);
     pagesDiscovered = Math.max(1, page1.totalPages);
     job.pagesTotal = pagesDiscovered;
 
-    // Process page 1 entries
-    totalSaved += persistLogEntries(page1.entries, interval);
+    const p1Result = persistLogEntries(page1.entries, interval);
+    totalSaved += p1Result.saved;
     job.pagesFetched = 1;
     job.eventsSaved = totalSaved;
 
@@ -167,7 +314,8 @@ async function runHistoricalLogJob(targetDate: string): Promise<void> {
     for (let p = 2; p <= pagesDiscovered; p++) {
       try {
         const nextBatch = await vendoorClient.fetchSystemLogs(p, targetDate, targetDate);
-        totalSaved += persistLogEntries(nextBatch.entries, interval);
+        const batchRes = persistLogEntries(nextBatch.entries, interval);
+        totalSaved += batchRes.saved;
         job.pagesFetched = p;
         job.eventsSaved = totalSaved;
       } catch (pageErr: any) {
@@ -186,15 +334,16 @@ async function runHistoricalLogJob(targetDate: string): Promise<void> {
     db.prepare(`
       INSERT INTO historical_coverage (
         period_date, source_domain, storage_tier, pages_discovered, pages_read,
-        records_saved, completion_status, last_attempted_at, verified_at
-      ) VALUES (?, 'logs', 'HOT', ?, ?, ?, ?, ?, ?)
-      ON CONFLICT(period_date, source_domain) DO UPDATE SET
-        pages_discovered = EXCLUDED.pages_discovered,
-        pages_read = EXCLUDED.pages_read,
-        records_saved = EXCLUDED.records_saved,
-        completion_status = EXCLUDED.completion_status,
-        last_attempted_at = EXCLUDED.last_attempted_at,
-        verified_at = CASE WHEN EXCLUDED.completion_status = 'COMPLETE' THEN EXCLUDED.last_attempted_at ELSE historical_coverage.verified_at END
+        records_saved, completion_status, last_attempted_at, completed_at, verified_at
+      ) VALUES (?, 'logs', 'HOT', ?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT(source_domain, period_date) DO UPDATE SET
+        pages_discovered = excluded.pages_discovered,
+        pages_read = excluded.pages_read,
+        records_saved = excluded.records_saved,
+        completion_status = excluded.completion_status,
+        last_attempted_at = excluded.last_attempted_at,
+        completed_at = excluded.completed_at,
+        verified_at = CASE WHEN excluded.completion_status = 'COMPLETE' THEN excluded.last_attempted_at ELSE historical_coverage.verified_at END
     `).run(
       targetDate,
       pagesDiscovered,
@@ -202,6 +351,7 @@ async function runHistoricalLogJob(targetDate: string): Promise<void> {
       totalSaved,
       finalStatus,
       new Date().toISOString(),
+      finalStatus === 'COMPLETE' ? new Date().toISOString() : null,
       finalStatus === 'COMPLETE' ? new Date().toISOString() : null
     );
 
@@ -209,91 +359,169 @@ async function runHistoricalLogJob(targetDate: string): Promise<void> {
   } catch (err: any) {
     job.status = 'FAILED';
     job.errorMessage = err.message;
-    console.error(`[HistoricalLogs] Fatal failure for ${targetDate}:`, err.message);
+    console.error(`[HistoricalLogs] Failure for ${targetDate}:`, err.message);
 
     db.prepare(`
       INSERT INTO historical_coverage (
         period_date, source_domain, storage_tier, pages_discovered, pages_read,
-        records_saved, completion_status, last_attempted_at
-      ) VALUES (?, 'logs', 'HOT', ?, ?, ?, 'FAILED', ?)
-      ON CONFLICT(period_date, source_domain) DO UPDATE SET
+        records_saved, completion_status, last_attempted_at, error_message
+      ) VALUES (?, 'logs', 'HOT', ?, ?, ?, 'FAILED', ?, ?)
+      ON CONFLICT(source_domain, period_date) DO UPDATE SET
         completion_status = 'FAILED',
-        last_attempted_at = EXCLUDED.last_attempted_at
-    `).run(targetDate, pagesDiscovered, job.pagesFetched, totalSaved, new Date().toISOString());
+        error_message = excluded.error_message,
+        last_attempted_at = excluded.last_attempted_at
+    `).run(targetDate, pagesDiscovered, job.pagesFetched, totalSaved, new Date().toISOString(), err.message);
   }
 }
 
 /**
- * Persist log entries with deduplication and Cairo business-date bounding
+ * Fetch and persist logs for a custom period (range of dates) on user demand:
+ * «جلب وحفظ لوجز الفترة»
  */
-function persistLogEntries(
-  entries: any[],
-  interval: { startCairo: string; endCairo: string }
-): number {
-  let saved = 0;
+export async function fetchAndPersistLogsForPeriod(
+  startDateStr: string,
+  endDateStr: string
+): Promise<PeriodLogsFetchReport> {
+  const start = startDateStr.slice(0, 10);
+  const end = endDateStr.slice(0, 10);
 
-  for (const entry of entries) {
-    const rawActionText = (entry.rawActionText || '').trim();
-    const eventTime = entry.eventTimestamp || new Date().toISOString();
-    const actorName = (entry.actorName || 'النظام').trim();
-    const orderCode = (entry.orderCode || '').trim() || null;
-
-    // Check Cairo date isolation bounds [startCairo, endCairo)
-    if (eventTime < interval.startCairo || eventTime >= interval.endCairo) {
-      continue;
-    }
-
-    const sourceHash = crypto
-      .createHash('sha256')
-      .update(`${actorName}|${orderCode || ''}|${rawActionText}|${eventTime}`)
-      .digest('hex');
-
-    // 1. Insert into raw_activity_events
-    let rawEventId: number | null = null;
-    try {
-      const res = db.prepare(`
-        INSERT INTO raw_activity_events (source_hash, order_code, actor_name, raw_action_text, event_timestamp)
-        VALUES (?, ?, ?, ?, ?)
-        ON CONFLICT(source_hash) DO NOTHING
-      `).run(sourceHash, orderCode, actorName, rawActionText, eventTime);
-
-      if (res.changes > 0) {
-        rawEventId = Number(res.lastInsertRowid);
-      }
-    } catch {
-      // Already exists
-    }
-
-    // 2. Parse canonical details
-    const parsed = parseCanonicalLogAction(rawActionText);
-    const isSystem = (actorName === 'النظام' || actorName.toLowerCase() === 'system' || actorName === 'cron') ? 1 : 0;
-
-    try {
-      const insRes = db.prepare(`
-        INSERT INTO canonical_activity_events (
-          raw_event_id, order_code, actor_name, action_type, from_status, to_status,
-          raw_action_text, event_timestamp, is_system_actor, created_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-      `).run(
-        rawEventId,
-        orderCode,
-        actorName,
-        parsed.actionType,
-        parsed.fromStatus,
-        parsed.toStatus,
-        rawActionText,
-        eventTime,
-        isSystem,
-        new Date().toISOString()
-      );
-
-      if (insRes.changes > 0) {
-        saved++;
-      }
-    } catch {
-      // Duplicate
-    }
+  if (start > end) {
+    throw new Error('تاريخ البداية يجب أن يكون قبل أو يساوي تاريخ النهاية');
   }
 
-  return saved;
+  // Generate list of dates in period
+  const dates: string[] = [];
+  const curr = new Date(`${start}T00:00:00Z`);
+  const stop = new Date(`${end}T00:00:00Z`);
+
+  while (curr <= stop) {
+    dates.push(curr.toISOString().slice(0, 10));
+    curr.setUTCDate(curr.getUTCDate() + 1);
+  }
+
+  let totalFetched = 0;
+  let totalSaved = 0;
+  let totalDuplicates = 0;
+  let failedPages = 0;
+  const daysReport: PeriodLogsFetchReport['days'] = [];
+
+  for (const date of dates) {
+    const interval = getCairoDateInterval(date);
+    let dayPagesTotal = 1;
+    let dayPagesFetched = 0;
+    let dayEventsFetched = 0;
+    let dayEventsSaved = 0;
+    let dayStatus: 'COMPLETE' | 'PARTIAL' | 'FAILED' = 'COMPLETE';
+    let dayError: string | null = null;
+
+    try {
+      if (!vendoorClient.isConfigured()) {
+        throw new Error('بيانات دخول Vendoor غير مهيأة في بيئة التشغيل');
+      }
+
+      // Fetch page 1
+      const p1 = await vendoorClient.fetchSystemLogs(1, date, date);
+      dayPagesTotal = Math.max(1, p1.totalPages);
+      dayPagesFetched = 1;
+      dayEventsFetched += p1.entries.length;
+
+      const p1Res = persistLogEntries(p1.entries, interval);
+      dayEventsSaved += p1Res.saved;
+      totalDuplicates += p1Res.duplicates;
+
+      // Remaining pages
+      for (let p = 2; p <= dayPagesTotal; p++) {
+        try {
+          const nextP = await vendoorClient.fetchSystemLogs(p, date, date);
+          dayPagesFetched = p;
+          dayEventsFetched += nextP.entries.length;
+          const nextRes = persistLogEntries(nextP.entries, interval);
+          dayEventsSaved += nextRes.saved;
+          totalDuplicates += nextRes.duplicates;
+        } catch (pageErr: any) {
+          failedPages++;
+          dayStatus = 'PARTIAL';
+          dayError = `فشل في الصفحة ${p}: ${pageErr.message}`;
+          break;
+        }
+      }
+
+      // Update coverage record for this day
+      db.prepare(`
+        INSERT INTO historical_coverage (
+          period_date, source_domain, storage_tier, pages_discovered, pages_read,
+          records_saved, completion_status, last_attempted_at, completed_at, verified_at
+        ) VALUES (?, 'logs', 'HOT', ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(source_domain, period_date) DO UPDATE SET
+          pages_discovered = excluded.pages_discovered,
+          pages_read = excluded.pages_read,
+          records_saved = excluded.records_saved,
+          completion_status = excluded.completion_status,
+          last_attempted_at = excluded.last_attempted_at,
+          completed_at = excluded.completed_at,
+          verified_at = CASE WHEN excluded.completion_status = 'COMPLETE' THEN excluded.last_attempted_at ELSE historical_coverage.verified_at END
+      `).run(
+        date,
+        dayPagesTotal,
+        dayPagesFetched,
+        dayEventsSaved,
+        dayStatus,
+        new Date().toISOString(),
+        dayStatus === 'COMPLETE' ? new Date().toISOString() : null,
+        dayStatus === 'COMPLETE' ? new Date().toISOString() : null
+      );
+    } catch (dayErr: any) {
+      dayStatus = 'FAILED';
+      dayError = dayErr.message;
+      failedPages++;
+
+      db.prepare(`
+        INSERT INTO historical_coverage (
+          period_date, source_domain, storage_tier, pages_discovered, pages_read,
+          records_saved, completion_status, last_attempted_at, error_message
+        ) VALUES (?, 'logs', 'HOT', ?, ?, ?, 'FAILED', ?, ?)
+        ON CONFLICT(source_domain, period_date) DO UPDATE SET
+          completion_status = 'FAILED',
+          error_message = excluded.error_message,
+          last_attempted_at = excluded.last_attempted_at
+      `).run(date, dayPagesTotal, dayPagesFetched, dayEventsSaved, new Date().toISOString(), dayErr.message);
+    }
+
+    totalFetched += dayEventsFetched;
+    totalSaved += dayEventsSaved;
+
+    daysReport.push({
+      date,
+      pagesTotal: dayPagesTotal,
+      pagesFetched: dayPagesFetched,
+      eventsFetched: dayEventsFetched,
+      eventsSaved: dayEventsSaved,
+      status: dayStatus,
+      error: dayError,
+    });
+  }
+
+  const overallStatus: 'COMPLETE' | 'PARTIAL' | 'FAILED' =
+    failedPages === 0
+      ? 'COMPLETE'
+      : totalSaved > 0
+      ? 'PARTIAL'
+      : 'FAILED';
+
+  return {
+    success: overallStatus !== 'FAILED',
+    startDate: start,
+    endDate: end,
+    totalDays: dates.length,
+    totalFetched,
+    totalSaved,
+    totalDuplicates,
+    failedPages,
+    coverageStatus: overallStatus,
+    days: daysReport,
+  };
+}
+
+export function getActiveJobStatus(targetDate: string): LogBackfillState | null {
+  return activeJobs.get(targetDate) || null;
 }

@@ -21,7 +21,11 @@ import {
   isSupabaseConfigured,
 } from './supabaseClient.js';
 import { runSqliteToSupabaseImport } from './importSqliteToSupabase.js';
-import { getOrFetchHistoricalLogs } from './historicalLogsService.js';
+import {
+  getOrFetchHistoricalLogs,
+  fetchAndPersistLogsForPeriod,
+  getActiveJobStatus,
+} from './historicalLogsService.js';
 import { applyMerchantCodeMappings } from './excelMerchantCodes.js';
 import { getArchiveWorkerStatus, triggerArchivePass } from './supabaseArchiveWorker.js';
 
@@ -1090,20 +1094,37 @@ apiRouter.get('/comparison', (req: Request, res: Response) => {
 // 13. System Activity Logs Filter
 apiRouter.get('/logs', (req: Request, res: Response) => {
   try {
-    const { date, actor, actionType, orderCode, limit = '50', offset = '0' } = req.query;
+    const {
+      date,
+      startDate,
+      endDate,
+      actor,
+      actionType,
+      orderCode,
+      search,
+      limit = '50',
+      offset = '0',
+    } = req.query;
     const conditions: string[] = [];
     const params: any[] = [];
 
-    if (date && typeof date === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(date.trim())) {
+    // Date range or single date filtering with exact Cairo date isolation bounds [startCairo, endCairo)
+    if (startDate && endDate && typeof startDate === 'string' && typeof endDate === 'string') {
+      const sInterval = getCairoDateInterval(startDate.trim());
+      const eInterval = getCairoDateInterval(endDate.trim());
+      conditions.push('c.event_timestamp >= ? AND c.event_timestamp < ?');
+      params.push(sInterval.startCairo, eInterval.endCairo);
+    } else if (date && typeof date === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(date.trim())) {
       const interval = getCairoDateInterval(date.trim());
       conditions.push('c.event_timestamp >= ? AND c.event_timestamp < ?');
       params.push(interval.startCairo, interval.endCairo);
     }
-    if (actor) {
+
+    if (actor && actor !== 'all') {
       conditions.push('c.actor_name = ?');
       params.push(actor);
     }
-    if (actionType) {
+    if (actionType && actionType !== 'all') {
       conditions.push('c.action_type = ?');
       params.push(actionType);
     }
@@ -1111,25 +1132,59 @@ apiRouter.get('/logs', (req: Request, res: Response) => {
       conditions.push('c.order_code = ?');
       params.push(orderCode);
     }
+    if (search && typeof search === 'string' && search.trim()) {
+      const term = `%${search.trim()}%`;
+      conditions.push('(c.order_code LIKE ? OR r.raw_action_text LIKE ? OR c.actor_name LIKE ?)');
+      params.push(term, term, term);
+    }
 
     const whereClause = conditions.length > 0 ? `WHERE ${conditions.join(' AND ')}` : '';
     const limitNum = Math.min(200, Math.max(1, parseInt(limit as string, 10)));
     const offsetNum = Math.max(0, parseInt(offset as string, 10));
 
-    const total = (db.prepare(`SELECT COUNT(*) as c FROM canonical_activity_events c ${whereClause}`).get(...params) as any)?.c || 0;
+    const total = (
+      db.prepare(`
+        SELECT COUNT(*) as c
+        FROM canonical_activity_events c
+        LEFT JOIN raw_activity_events r ON c.raw_event_id = r.id
+        ${whereClause}
+      `).get(...params) as any
+    )?.c || 0;
 
     const logs: any[] = db.prepare(`
-      SELECT c.*, r.raw_action_text
+      SELECT 
+        c.id, c.order_code, c.actor_name, c.action_type, c.from_status, c.to_status,
+        c.event_timestamp, c.storage_tier, c.is_system_actor, c.created_at,
+        COALESCE(r.raw_action_text, '') as raw_action_text
       FROM canonical_activity_events c
       LEFT JOIN raw_activity_events r ON c.raw_event_id = r.id
       ${whereClause}
-      ORDER BY c.id DESC
+      ORDER BY c.event_timestamp DESC, c.id DESC
       LIMIT ? OFFSET ?
     `).all(...params, limitNum, offsetNum);
 
     res.json({ logs, total, limit: limitNum, offset: offsetNum });
   } catch (err: any) {
     res.status(500).json({ error: err.message });
+  }
+});
+
+// Explicit Period Logs Fetch & Save Action: «جلب وحفظ لوجز الفترة»
+apiRouter.post('/logs/fetch-period', async (req: Request, res: Response) => {
+  try {
+    const { startDate, endDate } = req.body;
+    if (!startDate || !endDate) {
+      res.status(400).json({ error: 'startDate and endDate are required in YYYY-MM-DD format' });
+      return;
+    }
+
+    const cleanStart = String(startDate).slice(0, 10);
+    const cleanEnd = String(endDate).slice(0, 10);
+
+    const report = await fetchAndPersistLogsForPeriod(cleanStart, cleanEnd);
+    res.json({ success: true, report });
+  } catch (err: any) {
+    res.status(500).json({ success: false, error: err.message });
   }
 });
 

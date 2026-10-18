@@ -1,5 +1,6 @@
 import React, { useState, useEffect } from 'react';
 import { ArrowRightLeft, Calendar, TrendingUp, TrendingDown, Minus, CheckCircle2, AlertTriangle, RefreshCw } from 'lucide-react';
+import { DateCalendarPicker } from './common/DateCalendarPicker';
 
 export const ComparisonView: React.FC = () => {
   const cairoToday = new Intl.DateTimeFormat('en-CA', {
@@ -120,25 +121,18 @@ export const ComparisonView: React.FC = () => {
               </span>
             )}
           </div>
-          <div className="grid grid-cols-2 gap-3">
-            <div>
-              <label className="text-[11px] text-stone-400 block mb-1">من تاريخ:</label>
-              <input
-                type="date"
-                value={periodAStart}
-                onChange={(e) => setPeriodAStart(e.target.value)}
-                className="w-full bg-stone-950 border border-stone-800 rounded-lg px-2.5 py-1.5 text-xs text-stone-200"
-              />
-            </div>
-            <div>
-              <label className="text-[11px] text-stone-400 block mb-1">إلى تاريخ:</label>
-              <input
-                type="date"
-                value={periodAEnd}
-                onChange={(e) => setPeriodAEnd(e.target.value)}
-                className="w-full bg-stone-950 border border-stone-800 rounded-lg px-2.5 py-1.5 text-xs text-stone-200"
-              />
-            </div>
+          <div className="pt-1">
+            <DateCalendarPicker
+              mode="range"
+              startDate={periodAStart}
+              endDate={periodAEnd}
+              onRangeChange={(s, e) => {
+                setPeriodAStart(s);
+                setPeriodAEnd(e);
+              }}
+              label="تحديد نطاق الفترة الأولى بالتقويم:"
+              showPresets={true}
+            />
           </div>
         </div>
 
@@ -156,25 +150,18 @@ export const ComparisonView: React.FC = () => {
               </span>
             )}
           </div>
-          <div className="grid grid-cols-2 gap-3">
-            <div>
-              <label className="text-[11px] text-stone-400 block mb-1">من تاريخ:</label>
-              <input
-                type="date"
-                value={periodBStart}
-                onChange={(e) => setPeriodBStart(e.target.value)}
-                className="w-full bg-stone-950 border border-stone-800 rounded-lg px-2.5 py-1.5 text-xs text-stone-200"
-              />
-            </div>
-            <div>
-              <label className="text-[11px] text-stone-400 block mb-1">إلى تاريخ:</label>
-              <input
-                type="date"
-                value={periodBEnd}
-                onChange={(e) => setPeriodBEnd(e.target.value)}
-                className="w-full bg-stone-950 border border-stone-800 rounded-lg px-2.5 py-1.5 text-xs text-stone-200"
-              />
-            </div>
+          <div className="pt-1">
+            <DateCalendarPicker
+              mode="range"
+              startDate={periodBStart}
+              endDate={periodBEnd}
+              onRangeChange={(s, e) => {
+                setPeriodBStart(s);
+                setPeriodBEnd(e);
+              }}
+              label="تحديد نطاق الفترة الثانية بالتقويم:"
+              showPresets={true}
+            />
           </div>
         </div>
       </div>

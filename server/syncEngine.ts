@@ -582,12 +582,13 @@ export class SyncEngine {
       triggered++;
     }
 
-    // 2. Low delivery rate (< 70% strictly, unknown or no history is NOT low)
-    const orderRow: any = db.prepare('SELECT delivery_rate, customer_phone_extra, extra_phone_status, address_quality_status, created_at_source, total_customer_orders, delivery_rate_denom FROM orders WHERE id = ?').get(orderDbId);
+    // 2. Low delivery rate (< 70% strictly, unknown or 0%/0% or no history is NOT low)
+    const orderRow: any = db.prepare('SELECT delivery_rate, cancel_rate, customer_phone_extra, extra_phone_status, address_quality_status, created_at_source, total_customer_orders, delivery_rate_denom FROM orders WHERE id = ?').get(orderDbId);
     if (orderRow) {
       const hasValidEligibleHistory = (orderRow.delivery_rate_denom !== null && orderRow.delivery_rate_denom > 0) ||
                                       (orderRow.total_customer_orders !== null && orderRow.total_customer_orders > 0);
-      if (orderRow.delivery_rate !== null && orderRow.delivery_rate !== undefined && orderRow.delivery_rate < 70 && hasValidEligibleHistory) {
+      const is0_0 = orderRow.delivery_rate === 0 && (orderRow.cancel_rate === null || orderRow.cancel_rate === 0);
+      if (orderRow.delivery_rate !== null && orderRow.delivery_rate !== undefined && orderRow.delivery_rate < 70 && hasValidEligibleHistory && !is0_0) {
         const alertKey = `LOW_DELIVERY_${randomNum}`;
         insertAlertStmt.run(
           alertKey,

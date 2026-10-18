@@ -26,7 +26,7 @@ const __dirname = path.dirname(__filename);
 const app = express();
 const portArgIndex = process.argv.indexOf('--port');
 const cliPort = portArgIndex !== -1 && process.argv[portArgIndex + 1] ? parseInt(process.argv[portArgIndex + 1], 10) : null;
-const port = cliPort || (process.env.PORT && process.env.PORT !== '8080' ? parseInt(process.env.PORT, 10) : 3000);
+const port = cliPort || 3000;
 
 app.use(express.json());
 

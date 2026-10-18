@@ -1,6 +1,7 @@
 import React, { useState, useEffect } from 'react';
 import { AlertTriangle, PhoneCall, ShoppingBag, CheckCircle, Search, Eye } from 'lucide-react';
 import { Order } from '../types';
+import { isLowDeliveryRate } from '../utils/delivery';
 
 interface PrintedViewProps {
   initialSubTab?: 'all' | 'no_extra_phone' | 'multi_merchant' | 'low_delivery';
@@ -158,7 +159,7 @@ export const PrintedView: React.FC<PrintedViewProps> = ({
               ) : (
                 filtered.map((order) => {
                   const isMulti = order.multi_merchant_flag === 1;
-                  const hasLowDelivery = order.delivery_rate !== null && order.delivery_rate < 70;
+                  const hasLowDelivery = isLowDeliveryRate(order.delivery_rate, order.cancel_rate, order.total_customer_orders, order.delivery_rate_denom);
                   const noExtraPhone = !order.customer_phone_extra || order.extra_phone_valid === 0;
 
                   return (
@@ -231,11 +232,11 @@ export const PrintedView: React.FC<PrintedViewProps> = ({
 
                       {/* Customer Delivery Rate */}
                       <td className="py-3 px-4">
-                        {order.delivery_rate !== null ? (
+                        {order.delivery_rate !== null && (order.delivery_rate_denom || order.total_customer_orders) ? (
                           <div className="flex items-center gap-1.5">
                             <span
                               className={`font-mono font-bold ${
-                                order.delivery_rate < 70 ? 'text-rose-400' : 'text-emerald-400'
+                                hasLowDelivery ? 'text-rose-400' : 'text-emerald-400'
                               }`}
                             >
                               {order.delivery_rate}%
@@ -247,7 +248,7 @@ export const PrintedView: React.FC<PrintedViewProps> = ({
                             )}
                           </div>
                         ) : (
-                          <span className="text-slate-500 text-[11px]">لا توجد طلبات سابقة</span>
+                          <span className="text-slate-500 text-[11px]">أول طلب للعميل</span>
                         )}
                       </td>
 

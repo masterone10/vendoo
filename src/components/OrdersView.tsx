@@ -1,6 +1,7 @@
 import React, { useState, useEffect } from 'react';
 import { Search, Filter, Eye, AlertTriangle, Layers, ChevronRight, ChevronLeft } from 'lucide-react';
 import { Order } from '../types';
+import { isLowDeliveryRate } from '../utils/delivery';
 
 interface OrdersViewProps {
   initialStatus?: string;
@@ -246,11 +247,11 @@ export const OrdersView: React.FC<OrdersViewProps> = ({
 
                       {/* Delivery Rate */}
                       <td className="py-3 px-4">
-                        {order.delivery_rate !== null ? (
+                        {order.delivery_rate !== null && (order.delivery_rate_denom || order.total_customer_orders) ? (
                           <div className="flex items-center gap-1.5 font-mono">
                             <span
                               className={`font-bold ${
-                                order.delivery_rate < 70 ? 'text-rose-400' : 'text-emerald-400'
+                                isLowDeliveryRate(order.delivery_rate, order.cancel_rate, order.total_customer_orders, order.delivery_rate_denom) ? 'text-rose-400' : 'text-emerald-400'
                               }`}
                             >
                               {order.delivery_rate}%
@@ -262,7 +263,7 @@ export const OrdersView: React.FC<OrdersViewProps> = ({
                             )}
                           </div>
                         ) : (
-                          <span className="text-slate-500 text-[11px]">لا توجد طلبات سابقة</span>
+                          <span className="text-slate-500 text-[11px]">أول طلب للعميل</span>
                         )}
                       </td>
 

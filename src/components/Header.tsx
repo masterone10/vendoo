@@ -1,6 +1,7 @@
 import React from 'react';
 import { RefreshCw, ShieldAlert, Wifi, WifiOff, Layers, Calendar, ChevronRight, ChevronLeft } from 'lucide-react';
 import { SyncStatus } from '../types';
+import { DateCalendarPicker } from './common/DateCalendarPicker';
 
 interface HeaderProps {
   syncStatus: SyncStatus | null;
@@ -87,12 +88,12 @@ export const Header: React.FC<HeaderProps> = ({
           <ChevronRight className="w-3.5 h-3.5" />
         </button>
 
-        {/* Date Input */}
-        <input
-          type="date"
+        {/* Date Calendar Picker */}
+        <DateCalendarPicker
+          mode="single"
           value={selectedDate}
-          onChange={(e) => e.target.value && onDateChange(e.target.value)}
-          className="bg-slate-900 border border-slate-700/80 text-slate-200 text-xs rounded px-2 py-0.5 font-mono focus:outline-none focus:border-amber-500"
+          onChange={onDateChange}
+          showPresets={true}
         />
 
         {/* Next Day Button */}

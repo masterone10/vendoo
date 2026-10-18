@@ -332,9 +332,22 @@ export function initDatabase() {
       total_archived INTEGER DEFAULT 0,
       updated_at TEXT NOT NULL
     );
+
+    -- Dedicated Merchant Code Mappings table
+    CREATE TABLE IF NOT EXISTS merchant_code_mappings (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      merchant_code TEXT NOT NULL,
+      merchant_name TEXT,
+      source_sheet_name TEXT,
+      excel_row_index INTEGER,
+      notes TEXT,
+      created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+      UNIQUE(merchant_code, source_sheet_name)
+    );
   `);
 
   // 2. Run soft schema migrations for existing database columns before creating indexes
+  tryRunMigration("ALTER TABLE historical_coverage ADD COLUMN verified_at TEXT");
   tryRunMigration("ALTER TABLE orders ADD COLUMN validation_status TEXT DEFAULT 'PENDING_VALIDATION'");
   tryRunMigration("ALTER TABLE orders ADD COLUMN storage_tier TEXT DEFAULT 'HOT'");
   tryRunMigration("ALTER TABLE orders ADD COLUMN canceling_date TEXT");
@@ -654,3 +667,11 @@ export function populateInitialCoverageFromExistingData() {
     });
   }
 }
+
+// Auto-initialize schema on module load
+try {
+  initDatabase();
+} catch (err: any) {
+  // Safe if already initialized
+}
+

@@ -1,6 +1,7 @@
 import React, { useState, useEffect } from 'react';
 import { Users, Clock, CheckCircle2, RotateCw, XCircle, ChevronLeft, Calendar, Info, X } from 'lucide-react';
 import { TeamMember } from '../types';
+import { DateCalendarPicker } from './common/DateCalendarPicker';
 
 interface TeamViewProps {
   selectedDate?: string;
@@ -149,11 +150,11 @@ export const TeamView: React.FC<TeamViewProps> = ({ selectedDate, onSelectOrder 
             تاريخ محدد
           </button>
           {period === 'custom' && (
-            <input
-              type="date"
+            <DateCalendarPicker
+              mode="single"
               value={customDate}
-              onChange={(e) => setCustomDate(e.target.value)}
-              className="px-2 py-1 bg-slate-950 border border-slate-700 rounded text-slate-200 text-xs focus:outline-none focus:border-amber-400"
+              onChange={(d) => setCustomDate(d)}
+              showPresets={true}
             />
           )}
         </div>

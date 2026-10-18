@@ -13,6 +13,7 @@ import {
   ExternalLink,
 } from 'lucide-react';
 import { Order, OrderItem, Alert } from '../types';
+import { isLowDeliveryRate } from '../utils/delivery';
 
 interface OrderDetailsModalProps {
   orderCode: string | null;
@@ -208,8 +209,8 @@ export const OrderDetailsModal: React.FC<OrderDetailsModalProps> = ({ orderCode,
                     <div className="flex justify-between">
                       <span className="text-slate-500">نسبة التسليم:</span>
                       <div className="flex items-center gap-1 font-mono font-bold">
-                        {order.delivery_rate !== null ? (
-                          <span className={order.delivery_rate < 70 ? 'text-rose-400' : 'text-emerald-400'}>
+                        {order.delivery_rate !== null && (order.delivery_rate_denom || order.total_customer_orders) ? (
+                          <span className={isLowDeliveryRate(order.delivery_rate, order.cancel_rate, order.total_customer_orders, order.delivery_rate_denom) ? 'text-rose-400' : 'text-emerald-400'}>
                             {order.delivery_rate}%
                           </span>
                         ) : (

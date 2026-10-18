@@ -24,6 +24,7 @@ import {
   CheckCircle2,
   Filter,
 } from 'lucide-react';
+import { DateCalendarPicker } from './common/DateCalendarPicker';
 
 interface ReportsViewProps {
   onSelectOrder?: (orderCode: string) => void;
@@ -466,31 +467,24 @@ export const ReportsView: React.FC<ReportsViewProps> = ({ onSelectOrder }) => {
         <div className="p-4 bg-slate-900/90 border border-slate-800 rounded-2xl flex flex-wrap items-center gap-4 text-xs shadow-lg">
           <div className="flex items-center gap-2 text-slate-200 font-semibold">
             <Calendar className="w-4 h-4 text-amber-400" />
-            <span>تحديد النطاق الزمني باليوم:</span>
+            <span>تحديد النطاق الزمني بالتقويم:</span>
           </div>
-          <div className="flex items-center gap-2">
-            <span className="text-slate-400 text-xs">من:</span>
-            <input
-              type="date"
-              value={startDate}
-              onChange={(e) => setStartDate(e.target.value)}
-              className="px-3 py-1.5 bg-slate-950 border border-slate-700 rounded-lg text-slate-200 text-xs focus:outline-none focus:border-amber-500 font-mono"
-            />
-          </div>
-          <div className="flex items-center gap-2">
-            <span className="text-slate-400 text-xs">إلى:</span>
-            <input
-              type="date"
-              value={endDate}
-              onChange={(e) => setEndDate(e.target.value)}
-              className="px-3 py-1.5 bg-slate-950 border border-slate-700 rounded-lg text-slate-200 text-xs focus:outline-none focus:border-amber-500 font-mono"
-            />
-          </div>
+          <DateCalendarPicker
+            mode="range"
+            startDate={startDate}
+            endDate={endDate}
+            onRangeChange={(s, e) => {
+              setStartDate(s);
+              setEndDate(e);
+            }}
+            placeholder="اختر فترة التقرير"
+            showPresets={true}
+          />
           <button
             onClick={fetchReport}
             className="px-4 py-1.5 bg-amber-500 hover:bg-amber-400 text-slate-950 font-bold rounded-lg transition-colors cursor-pointer mr-auto shadow"
           >
-            تطبيق الفلترة
+            تحديث التقرير
           </button>
         </div>
       )}
