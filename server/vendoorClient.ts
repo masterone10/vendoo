@@ -91,20 +91,26 @@ class VendoorClient {
   private readonly baseUrl = 'https://aff.ven-door.com';
   private readonly userAgent = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36';
 
+  public isConfigured(): boolean {
+    const em = process.env.VENDOOR_EMAIL;
+    const pw = process.env.VENDOOR_PASSWORD;
+    return Boolean(em && em.trim().length > 0 && pw && pw.trim().length > 0);
+  }
+
   private get email(): string {
     const em = process.env.VENDOOR_EMAIL;
-    if (!em) {
+    if (!em || !em.trim()) {
       throw new Error('VENDOOR_EMAIL environment variable is not defined.');
     }
-    return em;
+    return em.trim();
   }
 
   private get password(): string {
     const pw = process.env.VENDOOR_PASSWORD;
-    if (!pw) {
+    if (!pw || !pw.trim()) {
       throw new Error('VENDOOR_PASSWORD environment variable is not defined.');
     }
-    return pw;
+    return pw.trim();
   }
 
   private getCookieHeader(): string {
@@ -158,6 +164,10 @@ class VendoorClient {
   private loginPromise: Promise<boolean> | null = null;
 
   public async login(): Promise<boolean> {
+    if (!this.isConfigured()) {
+      throw new Error('VENDOOR_EMAIL and VENDOOR_PASSWORD environment variables are not defined.');
+    }
+
     if (this.loginPromise) {
       return this.loginPromise;
     }
@@ -424,9 +434,12 @@ class VendoorClient {
     const res = await this.fetchWithTimeout(`${this.baseUrl}/dashboard/${pathMap[category]}`, {
       headers: {
         'User-Agent': this.userAgent,
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+        'Accept-Language': 'ar,en;q=0.9',
         'Cookie': this.getCookieHeader(),
+        'Referer': `${this.baseUrl}/dashboard`,
       },
-    }, 12000);
+    }, 15000);
 
     let activeRes = res;
     if (activeRes.status === 400 || activeRes.status === 401 || activeRes.status === 419 || activeRes.url.includes('/login')) {
@@ -435,9 +448,12 @@ class VendoorClient {
       activeRes = await this.fetchWithTimeout(`${this.baseUrl}/dashboard/${pathMap[category]}`, {
         headers: {
           'User-Agent': this.userAgent,
+          'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+          'Accept-Language': 'ar,en;q=0.9',
           'Cookie': this.getCookieHeader(),
+          'Referer': `${this.baseUrl}/dashboard`,
         },
-      }, 12000);
+      }, 15000);
       this.updateCookies(activeRes);
     }
 

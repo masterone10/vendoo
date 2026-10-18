@@ -23,9 +23,13 @@ export interface MerchantCodeImportReport {
 
 // Recognized dedicated Excel headers for merchant code (never parsed from product title)
 export const DEDICATED_MERCHANT_CODE_HEADERS = [
+  'كود المخزن',
+  'المخزن',
   'كود التاجر',
   'كود التاجر في الاكسيل',
   'كود المورد',
+  'warehouse_code',
+  'Warehouse Code',
   'merchant_code',
   'Merchant Code',
   'MerchantCode',

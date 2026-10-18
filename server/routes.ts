@@ -793,10 +793,19 @@ apiRouter.get('/reports', (req: Request, res: Response) => {
       WHERE period_date >= ? AND period_date <= ? AND source_domain = 'orders'
     `).all(sDate, eDate);
 
-    // Orders Created in period
-    const createdCount = (db.prepare(`
-      SELECT COUNT(*) as c FROM orders
+    // Orders Created in period with financial totals
+    const createdData = db.prepare(`
+      SELECT COUNT(*) as c, COALESCE(SUM(total_order), 0) as total_val FROM orders
       WHERE created_at_source >= ? AND created_at_source < ?
+    `).get(startTime, endTime) as any;
+    const createdCount = createdData?.c || 0;
+    const totalOrderValue = Math.round((createdData?.total_val || 0) * 100) / 100;
+    const averageOrderValue = createdCount > 0 ? Math.round((totalOrderValue / createdCount) * 10) / 10 : 0;
+
+    // Multi-warehouse orders created in period
+    const multiWarehouseCount = (db.prepare(`
+      SELECT COUNT(*) as c FROM orders
+      WHERE created_at_source >= ? AND created_at_source < ? AND multi_merchant_flag = 1
     `).get(startTime, endTime) as any)?.c || 0;
 
     // Orders Touched in period (distinct orders with canonical activity events in period)
@@ -820,6 +829,18 @@ apiRouter.get('/reports', (req: Request, res: Response) => {
       ORDER BY count DESC
     `).all(startTime, endTime);
 
+    // Key status transition counts
+    let printedTransitions = 0;
+    let pendingTransitions = 0;
+    let processingTransitions = 0;
+    let cancelingTransitions = 0;
+    for (const t of transitions) {
+      if (t.to_status === 'Printed') printedTransitions += t.count;
+      else if (t.to_status === 'Pending') pendingTransitions += t.count;
+      else if (t.to_status === 'Processing') processingTransitions += t.count;
+      else if (t.to_status === 'Canceling') cancelingTransitions += t.count;
+    }
+
     // Cancellations in period
     const cancellations: any[] = db.prepare(`
       SELECT to_status, COUNT(*) as count
@@ -830,11 +851,127 @@ apiRouter.get('/reports', (req: Request, res: Response) => {
 
     // Employee activity in period
     const employees: any[] = db.prepare(`
-      SELECT actor_name, COUNT(*) as action_count, COUNT(DISTINCT order_code) as unique_orders
+      SELECT 
+        actor_name, 
+        COUNT(*) as action_count, 
+        COUNT(DISTINCT order_code) as unique_orders,
+        SUM(CASE WHEN to_status = 'Printed' THEN 1 ELSE 0 END) as printed_count,
+        SUM(CASE WHEN to_status = 'Canceled' OR to_status = 'Canceling' THEN 1 ELSE 0 END) as cancel_count
       FROM canonical_activity_events
       WHERE event_timestamp >= ? AND event_timestamp < ? AND is_system_actor = 0
       GROUP BY actor_name
       ORDER BY action_count DESC
+    `).all(startTime, endTime);
+
+    // Status breakdown of orders created in period
+    let ordersByStatus: any[] = db.prepare(`
+      SELECT 
+        current_status as status, 
+        COUNT(*) as count, 
+        COALESCE(SUM(total_order), 0) as total_value
+      FROM orders
+      WHERE created_at_source >= ? AND created_at_source < ?
+      GROUP BY current_status
+      ORDER BY count DESC
+    `).all(startTime, endTime);
+
+    if (ordersByStatus.length === 0) {
+      ordersByStatus = db.prepare(`
+        SELECT 
+          current_status as status, 
+          COUNT(*) as count, 
+          COALESCE(SUM(total_order), 0) as total_value
+        FROM orders
+        GROUP BY current_status
+        ORDER BY count DESC
+      `).all();
+    }
+
+    // Multi-warehouse vs single-warehouse detailed breakdown
+    const multiWarehouseStats = db.prepare(`
+      SELECT 
+        COUNT(*) as total_orders,
+        SUM(CASE WHEN multi_merchant_flag = 1 THEN 1 ELSE 0 END) as multi_orders,
+        SUM(CASE WHEN multi_merchant_flag = 0 THEN 1 ELSE 0 END) as single_orders,
+        COALESCE(SUM(CASE WHEN multi_merchant_flag = 1 THEN total_order ELSE 0 END), 0) as multi_value,
+        COALESCE(SUM(CASE WHEN multi_merchant_flag = 0 THEN total_order ELSE 0 END), 0) as single_value
+      FROM orders
+      WHERE created_at_source >= ? AND created_at_source < ?
+    `).get(startTime, endTime) as any;
+
+    // Daily created trend
+    const dailyCreated: any[] = db.prepare(`
+      SELECT 
+        substr(created_at_source, 1, 10) as date,
+        COUNT(*) as created_count,
+        COALESCE(SUM(total_order), 0) as daily_revenue
+      FROM orders
+      WHERE created_at_source >= ? AND created_at_source < ?
+      GROUP BY date
+      ORDER BY date ASC
+    `).all(startTime, endTime);
+
+    // Warehouses breakdown in period
+    let warehouses: any[] = db.prepare(`
+      SELECT 
+        COALESCE(oi.merchant_code, 'غير محدد') as warehouse_code,
+        COUNT(DISTINCT oi.order_id) as orders_count,
+        SUM(oi.quantity) as items_quantity,
+        COALESCE(SUM(o.total_order), 0) as associated_revenue
+      FROM order_items oi
+      JOIN orders o ON oi.order_id = o.id
+      WHERE o.created_at_source >= ? AND o.created_at_source < ?
+      GROUP BY oi.merchant_code
+      ORDER BY items_quantity DESC
+      LIMIT 50
+    `).all(startTime, endTime);
+
+    if (warehouses.length === 0) {
+      warehouses = db.prepare(`
+        SELECT 
+          COALESCE(oi.merchant_code, 'غير محدد') as warehouse_code,
+          COUNT(DISTINCT oi.order_id) as orders_count,
+          SUM(oi.quantity) as items_quantity,
+          COALESCE(SUM(o.total_order), 0) as associated_revenue
+        FROM order_items oi
+        JOIN orders o ON oi.order_id = o.id
+        GROUP BY oi.merchant_code
+        ORDER BY items_quantity DESC
+        LIMIT 50
+      `).all();
+    }
+
+    // Top Governorates
+    let governorates: any[] = db.prepare(`
+      SELECT governorate, COUNT(*) as count, COALESCE(SUM(total_order), 0) as total_value
+      FROM orders
+      WHERE created_at_source >= ? AND created_at_source < ? AND governorate IS NOT NULL AND length(governorate) > 0
+      GROUP BY governorate
+      ORDER BY count DESC
+      LIMIT 12
+    `).all(startTime, endTime);
+
+    if (governorates.length === 0) {
+      governorates = db.prepare(`
+        SELECT governorate, COUNT(*) as count, COALESCE(SUM(total_order), 0) as total_value
+        FROM orders
+        WHERE governorate IS NOT NULL AND length(governorate) > 0
+        GROUP BY governorate
+        ORDER BY count DESC
+        LIMIT 12
+      `).all();
+    }
+
+    // Daily activity trend in period
+    const timeline: any[] = db.prepare(`
+      SELECT 
+        substr(event_timestamp, 1, 10) as date,
+        COUNT(*) as events_count,
+        COUNT(DISTINCT order_code) as unique_orders
+      FROM canonical_activity_events
+      WHERE event_timestamp >= ? AND event_timestamp < ?
+      GROUP BY date
+      ORDER BY date ASC
     `).all(startTime, endTime);
 
     res.json({
@@ -842,11 +979,32 @@ apiRouter.get('/reports', (req: Request, res: Response) => {
       endDate: eDate,
       period: period || 'custom',
       createdCount,
+      totalOrderValue,
+      averageOrderValue,
+      multiWarehouseCount,
+      multiWarehouseStats: {
+        totalOrders: multiWarehouseStats?.total_orders || createdCount,
+        multiOrders: multiWarehouseStats?.multi_orders || multiWarehouseCount,
+        singleOrders: multiWarehouseStats?.single_orders || (createdCount - multiWarehouseCount),
+        multiValue: Math.round((multiWarehouseStats?.multi_value || 0) * 100) / 100,
+        singleValue: Math.round((multiWarehouseStats?.single_value || 0) * 100) / 100,
+      },
       touchedCount,
       totalEvents,
+      statusCounts: {
+        printed: printedTransitions,
+        pending: pendingTransitions,
+        processing: processingTransitions,
+        canceling: cancelingTransitions,
+      },
+      ordersByStatus,
+      dailyCreated,
       transitions,
       cancellations,
       employees,
+      warehouses,
+      governorates,
+      timeline,
       coverage: {
         totalDays: covRows.length,
         completeDays: covRows.filter(r => r.completion_status === 'COMPLETE').length,

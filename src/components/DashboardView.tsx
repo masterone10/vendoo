@@ -207,7 +207,7 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
             <div className="flex items-center justify-between text-xs text-rose-300 mb-2">
               <span className="font-bold flex items-center gap-1.5">
                 <AlertTriangle className="w-4 h-4 text-rose-400" />
-                <span>تعدد أكواد المستودعات (Multi-Warehouse)</span>
+                <span>تعدد أكواد المخازن (Multi-Warehouse)</span>
               </span>
               <span className="text-[10px] text-rose-400 uppercase tracking-widest font-mono">حرج</span>
             </div>
@@ -215,7 +215,7 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
               {riskIndicators.multiMerchantPrinted}
             </div>
             <p className="mt-1.5 text-[11px] text-slate-400 leading-relaxed">
-              طلبات مؤكدة تحتوي منتجات من أكثر من كود مستودع مستقل (Multi-Warehouse Orders).
+              طلبات مؤكدة تحتوي منتجات من أكثر من كود مخزن مستقل.
             </p>
           </div>
 

@@ -187,7 +187,7 @@ export const Header: React.FC<HeaderProps> = ({
           }`}
         >
           <ShieldAlert className={`w-4 h-4 ${openAlertsCount > 0 ? 'text-rose-400 animate-bounce' : 'text-slate-400'}`} />
-          <span>تنبيهات التجار</span>
+          <span>تنبيهات المخازن</span>
           {openAlertsCount > 0 && (
             <span className="bg-rose-600 text-white font-bold px-1.5 py-0.2 rounded text-[11px] leading-tight">
               {openAlertsCount}

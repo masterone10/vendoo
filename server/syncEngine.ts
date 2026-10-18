@@ -363,11 +363,13 @@ export class SyncEngine {
     lastSyncCompletedAt: null,
     lastSuccessfulSyncAt: null,
     nextScheduledRunAt: null,
+    configuredIntervalSeconds: 45,
     currentPhase: 'IDLE',
     totalOrdersInDb: 0,
     totalAlertsOpen: 0,
     lastError: null,
     consecutiveFailures: 0,
+    skippedTicksCount: 0,
     lastDurationMs: null,
     phaseTimings: null,
     detailedMetrics: null,
@@ -403,6 +405,7 @@ export class SyncEngine {
 
   public start(intervalSeconds = 30) {
     if (this.intervalTimer) return;
+    this.status.configuredIntervalSeconds = intervalSeconds;
     this.status.isRunning = true;
     console.log(`[SyncEngine] Starting background sync worker (interval: ${intervalSeconds}s)...`);
 
@@ -412,6 +415,10 @@ export class SyncEngine {
     });
 
     this.intervalTimer = setInterval(() => {
+      if (this.isSyncing) {
+        this.status.skippedTicksCount = (this.status.skippedTicksCount || 0) + 1;
+        return;
+      }
       this.runFullSyncCycle('PERIODIC').catch(err => {
         console.error('[SyncEngine] Periodic sync error:', err.message);
       });
@@ -920,6 +927,16 @@ export class SyncEngine {
    */
   public async runFullSyncCycle(runType: 'INITIAL' | 'PERIODIC' | 'RECONCILIATION' | 'MANUAL') {
     if (this.isSyncing) return;
+
+    if (!vendoorClient.isConfigured()) {
+      const msg = 'Vendoor credentials (VENDOOR_EMAIL / VENDOOR_PASSWORD) are not configured. Background polling paused until credentials are provided in environment or secrets.';
+      this.status.currentPhase = 'AWAITING_CREDENTIALS';
+      this.status.cycleState = 'IDLE';
+      this.status.lastError = msg;
+      console.warn(`[SyncEngine] ${msg}`);
+      return;
+    }
+
     this.isSyncing = true;
     const tCycleStart = Date.now();
     const nowIso = new Date().toISOString();
@@ -938,6 +955,10 @@ export class SyncEngine {
 
     let rawRowsReceived = 0;
     let duplicateSourceIds = 0;
+    let duplicatesAcrossPages = 0;
+    let duplicatesWithinPage = 0;
+    let recheckTopDuplicates = 0;
+    let recheckTopNewOrders = 0;
     let invalidRecordsCount = 0;
     let failedPagesCount = 0;
     let failedEnrichmentCount = 0;
@@ -956,17 +977,23 @@ export class SyncEngine {
       const firstBatch = await vendoorClient.fetchOrdersBatch(0, 100);
       const totalOrdersInSource = firstBatch.recordsTotal;
 
+      const seenInPage0 = new Set<number>();
       for (const ord of firstBatch.data) {
         rawRowsReceived++;
         if (!ord || typeof ord.id !== 'number') {
           invalidRecordsCount++;
           continue;
         }
-        if (ordersMap.has(ord.id)) {
+        if (seenInPage0.has(ord.id)) {
+          duplicatesWithinPage++;
+          duplicateSourceIds++;
+        } else if (ordersMap.has(ord.id)) {
+          duplicatesAcrossPages++;
           duplicateSourceIds++;
         } else {
           ordersMap.set(ord.id, ord);
         }
+        seenInPage0.add(ord.id);
       }
 
       // Paginate through all remaining pages to guarantee 100% full coverage
@@ -977,17 +1004,23 @@ export class SyncEngine {
           if (nextBatch.recordsTotal !== totalOrdersInSource) {
             totalChangedDuringScan = true;
           }
+          const seenInSubPage = new Set<number>();
           for (const ord of nextBatch.data) {
             rawRowsReceived++;
             if (!ord || typeof ord.id !== 'number') {
               invalidRecordsCount++;
               continue;
             }
-            if (ordersMap.has(ord.id)) {
+            if (seenInSubPage.has(ord.id)) {
+              duplicatesWithinPage++;
+              duplicateSourceIds++;
+            } else if (ordersMap.has(ord.id)) {
+              duplicatesAcrossPages++;
               duplicateSourceIds++;
             } else {
               ordersMap.set(ord.id, ord);
             }
+            seenInSubPage.add(ord.id);
           }
         } catch (pageErr: any) {
           console.error(`[SyncEngine] Error fetching orders batch at start ${start}:`, pageErr.message);
@@ -1006,8 +1039,16 @@ export class SyncEngine {
           const topCheck = await vendoorClient.fetchOrdersBatch(0, 50);
           for (const ord of topCheck.data) {
             rawRowsReceived++;
-            if (ord && typeof ord.id === 'number' && !ordersMap.has(ord.id)) {
+            if (!ord || typeof ord.id !== 'number') {
+              invalidRecordsCount++;
+              continue;
+            }
+            if (ordersMap.has(ord.id)) {
+              recheckTopDuplicates++;
+              duplicateSourceIds++;
+            } else {
               ordersMap.set(ord.id, ord);
+              recheckTopNewOrders++;
             }
           }
         } catch {}
@@ -1059,7 +1100,12 @@ export class SyncEngine {
             AND (created_at_source >= datetime('now', '-3 days') OR created_at_source LIKE ? OR created_at_source LIKE ?)
         `).all(`${cairoToday}%`, `${getCairoDateString(new Date(Date.now() - 86400000))}%`);
 
-        let verifiedViaLogsCount = 0;
+        const absentOrders = activeDbOrders.filter(act => !ordersMap.has(act.vendoor_id));
+        const totalActiveInDb = activeDbOrders.length;
+        const absentFromActiveViewTotal = absentOrders.length;
+
+        let resolvedViaLogsCount = 0;
+        let confirmedCurrentStatusViaLogsCount = 0;
         let preservedUnresolvedCount = 0;
 
         const findLatestStatusEventStmt = db.prepare(`
@@ -1071,49 +1117,61 @@ export class SyncEngine {
         `);
 
         db.exec('BEGIN TRANSACTION;');
-        for (const act of activeDbOrders) {
-          if (!ordersMap.has(act.vendoor_id)) {
-            // Check if there is an authoritative status change log from Vendoor
-            const latestEvent: any = findLatestStatusEventStmt.get(act.random_number);
+        for (const act of absentOrders) {
+          // Check if there is an authoritative status change log from Vendoor
+          const latestEvent: any = findLatestStatusEventStmt.get(act.random_number);
 
-            if (latestEvent && latestEvent.to_status && latestEvent.to_status !== act.current_status) {
-              // Update strictly based on verified log evidence from Vendoor
-              db.prepare(`
-                UPDATE orders
-                SET current_status = ?,
-                    validation_status = 'VERIFIED_VIA_AUDIT_LOGS',
-                    last_observed_at = ?,
-                    updated_at = ?
-                WHERE id = ?
-              `).run(latestEvent.to_status, nowIso, nowIso, act.id);
+          if (latestEvent && latestEvent.to_status && latestEvent.to_status !== act.current_status) {
+            // Update strictly based on verified log evidence from Vendoor
+            db.prepare(`
+              UPDATE orders
+              SET current_status = ?,
+                  validation_status = 'RESOLVED_VIA_AUDIT_LOGS',
+                  last_observed_at = ?,
+                  updated_at = ?
+              WHERE id = ?
+            `).run(latestEvent.to_status, nowIso, nowIso, act.id);
 
-              db.prepare(`
-                INSERT INTO order_status_events (
-                  order_id, random_number, from_status, to_status, actor_name,
-                  event_time_source, storage_tier, observed_at, source_channel
-                ) VALUES (?, ?, ?, ?, ?, ?, 'HOT', ?, 'vendoor_audit_log')
-              `).run(act.id, act.random_number, act.current_status, latestEvent.to_status, latestEvent.actor_name || 'سجلات فيندور', latestEvent.event_timestamp, nowIso);
+            db.prepare(`
+              INSERT INTO order_status_events (
+                order_id, random_number, from_status, to_status, actor_name,
+                event_time_source, storage_tier, observed_at, source_channel
+              ) VALUES (?, ?, ?, ?, ?, ?, 'HOT', ?, 'vendoor_audit_log')
+            `).run(act.id, act.random_number, act.current_status, latestEvent.to_status, latestEvent.actor_name || 'سجلات فيندور', latestEvent.event_timestamp, nowIso);
 
-              verifiedViaLogsCount++;
-              statusChangesCount++;
-            } else {
-              // Retain last known verified status without guessing or forcing Canceled!
-              db.prepare(`
-                UPDATE orders
-                SET validation_status = 'UNRESOLVED_ABSENT_FROM_VIEW',
-                    last_observed_at = ?,
-                    updated_at = ?
-                WHERE id = ?
-              `).run(nowIso, nowIso, act.id);
+            resolvedViaLogsCount++;
+            statusChangesCount++;
+          } else if (latestEvent && latestEvent.to_status && latestEvent.to_status === act.current_status) {
+            // Log explicitly confirmed order remains in current status
+            db.prepare(`
+              UPDATE orders
+              SET validation_status = 'CONFIRMED_VIA_AUDIT_LOGS',
+                  last_observed_at = ?,
+                  updated_at = ?
+              WHERE id = ?
+            `).run(nowIso, nowIso, act.id);
 
-              preservedUnresolvedCount++;
-            }
+            confirmedCurrentStatusViaLogsCount++;
+          } else {
+            // Retain last known verified status without guessing or forcing Canceled!
+            db.prepare(`
+              UPDATE orders
+              SET validation_status = 'UNRESOLVED_ABSENT_FROM_VIEW',
+                  last_observed_at = ?,
+                  updated_at = ?
+              WHERE id = ?
+            `).run(nowIso, nowIso, act.id);
+
+            preservedUnresolvedCount++;
           }
         }
         db.exec('COMMIT;');
 
-        if (verifiedViaLogsCount > 0 || preservedUnresolvedCount > 0) {
-          console.log(`[SyncEngine] Verified ${activeDbOrders.length} orders absent from active view: ${verifiedViaLogsCount} resolved via logs, ${preservedUnresolvedCount} preserved in last known status (never auto-canceled)`);
+        if (absentFromActiveViewTotal > 0) {
+          console.log(
+            `[SyncEngine] Active orders verification: TotalActiveInDb=${totalActiveInDb}, PresentInScan=${totalActiveInDb - absentFromActiveViewTotal}, ` +
+            `AbsentFromScan=${absentFromActiveViewTotal} (ResolvedViaLogs=${resolvedViaLogsCount}, ConfirmedStatusViaLogs=${confirmedCurrentStatusViaLogsCount}, PreservedUnresolved=${preservedUnresolvedCount})`
+          );
         }
       }
 
@@ -1150,6 +1208,10 @@ export class SyncEngine {
         validRecordsParsed,
         uniqueSourceIds,
         duplicateSourceIds,
+        duplicatesAcrossPages,
+        duplicatesWithinPage,
+        recheckTopDuplicates,
+        recheckTopNewOrders,
         newOrdersInserted,
         existingOrdersExamined,
         recordsWithFieldChanges,
@@ -1170,16 +1232,23 @@ export class SyncEngine {
       this.status.currentPhase = 'IDLE';
       this.status.cycleState = hasFailedPage ? 'PARTIAL' : 'SUCCESS';
 
-      const intervalSec = parseInt(process.env.SYNC_INTERVAL_SECONDS || '30', 10);
+      const intervalSec = this.status.configuredIntervalSeconds || parseInt(process.env.SYNC_INTERVAL_SECONDS || '45', 10);
       this.status.nextScheduledRunAt = new Date(Date.now() + intervalSec * 1000).toISOString();
 
       const finalStatus = hasFailedPage ? 'PARTIAL' : 'SUCCESS';
 
       console.log(
         `[SyncEngine] ${runType} sync completed (${finalStatus}) in ${phaseTimings.totalDurationMs}ms: ` +
-        `Raw=${rawRowsReceived}, Unique=${uniqueSourceIds}, DupsAcrossPages=${duplicateSourceIds}, ` +
+        `Raw=${rawRowsReceived}, Valid=${validRecordsParsed}, Unique=${uniqueSourceIds}, ` +
+        `DupsAcrossPages=${duplicatesAcrossPages}, DupsWithinPage=${duplicatesWithinPage}, ` +
+        `RecheckTopDups=${recheckTopDuplicates}, RecheckTopNew=${recheckTopNewOrders}, Invalid=${invalidRecordsCount}, ` +
         `New=${newOrdersInserted}, Examined=${existingOrdersExamined}, FieldChanges=${recordsWithFieldChanges}, ` +
-        `StatusChanges=${statusChangesCount}, FailedPages=${failedPagesCount}, FailedEnrich=${failedEnrichmentCount}`
+        `StatusChanges=${statusChangesCount}, UnreachablePages=${failedPagesCount}, EnrichmentRetries=${failedEnrichmentCount}`
+      );
+      console.log(
+        `[SyncEngine] Phase timings: ordersFetch=${phaseTimings.ordersFetchMs}ms, dbUpsert=${phaseTimings.dbUpsertMs}ms, ` +
+        `confirmationAges=${phaseTimings.confirmationAgesMs}ms, systemLogs=${phaseTimings.systemLogsMs}ms, ` +
+        `enrichment=${phaseTimings.enrichmentMs}ms, total=${phaseTimings.totalDurationMs}ms`
       );
 
       db.prepare(`
@@ -1228,7 +1297,11 @@ export class SyncEngine {
 
       this.broadcast('sync_completed', this.getStatus());
     } catch (err: any) {
-      console.error('[SyncEngine Detailed Error]:', err);
+      if (err.message?.includes('VENDOOR_EMAIL') || err.message?.includes('VENDOOR_PASSWORD')) {
+        console.warn('[SyncEngine] Authentication credentials missing:', err.message);
+      } else {
+        console.error('[SyncEngine Detailed Error]:', err);
+      }
       try {
         db.exec('ROLLBACK;');
       } catch {
@@ -1301,6 +1374,13 @@ export class SyncEngine {
       { key: 'over_three', label: 'over_3_days' },
     ];
 
+    const categoryStatuses: Record<'one' | 'two' | 'three' | 'over_three', 'SUCCESS' | 'TIMEOUT' | 'ERROR' | 'PENDING'> = {
+      one: 'PENDING',
+      two: 'PENDING',
+      three: 'PENDING',
+      over_three: 'PENDING',
+    };
+
     const updateConfStmt = db.prepare(`
       UPDATE orders SET
         confirmation_age_category = ?,
@@ -1318,22 +1398,67 @@ export class SyncEngine {
       )
     `);
 
-    // Bounded parallel execution in pairs of 2
-    for (let i = 0; i < categories.length; i += 2) {
-      const slice = categories.slice(i, i + 2);
-      await Promise.all(slice.map(async (cat) => {
-        try {
-          const rows: ConfirmationRow[] = await vendoorClient.fetchConfirmationAgePage(cat.key);
-          for (const r of rows) {
-            if (!r.randomNumber) continue;
-            updateConfStmt.run(cat.label, nowIso, r.printedDate || null, r.randomNumber);
-            insertObsStmt.run(r.randomNumber, r.randomNumber, cat.label, r.invoiceNo, r.printedDate, nowIso);
-          }
-        } catch (err: any) {
-          console.warn(`[SyncEngine] Warning fetching confirmation age page ${cat.key}:`, err.message);
+    // Sequential execution to keep connection pool stable and prevent connection reset on Vendoor
+    for (const cat of categories) {
+      try {
+        const rows: ConfirmationRow[] = await vendoorClient.fetchConfirmationAgePage(cat.key);
+        for (const r of rows) {
+          if (!r.randomNumber) continue;
+          updateConfStmt.run(cat.label, nowIso, r.printedDate || null, r.randomNumber);
+          insertObsStmt.run(r.randomNumber, r.randomNumber, cat.label, r.invoiceNo, r.printedDate, nowIso);
         }
-      }));
+        categoryStatuses[cat.key] = 'SUCCESS';
+      } catch (err: any) {
+        const isTimeout = err.name === 'AbortError' || err.message?.includes('timeout') || err.message?.includes('15000ms');
+        categoryStatuses[cat.key] = isTimeout ? 'TIMEOUT' : 'ERROR';
+        console.info(`[SyncEngine] Confirmation age endpoint ${cat.key} check: ${categoryStatuses[cat.key]} (${err.message})`);
+      }
+      await new Promise(r => setTimeout(r, 300));
     }
+
+    // Read current database counts so existing verified observations are preserved without zeroing out
+    const dbAgeRows: any[] = db.prepare(`
+      SELECT confirmation_age_category, COUNT(*) as c
+      FROM orders
+      WHERE current_status = 'Printed' AND confirmation_age_category IS NOT NULL
+      GROUP BY confirmation_age_category
+    `).all();
+
+    const counts: Record<string, number> = {
+      '1_day': 0,
+      '2_days': 0,
+      '3_days': 0,
+      'over_3_days': 0,
+    };
+    for (const r of dbAgeRows) {
+      if (r.confirmation_age_category in counts) {
+        counts[r.confirmation_age_category] = r.c;
+      }
+    }
+
+    const statuses = Object.values(categoryStatuses);
+    const successCount = statuses.filter(s => s === 'SUCCESS').length;
+    let overallState: 'SUCCESS' | 'PARTIAL' | 'STALE' | 'NOT_AVAILABLE';
+    if (successCount === 4) {
+      overallState = 'SUCCESS';
+    } else if (successCount > 0) {
+      overallState = 'PARTIAL';
+    } else if (this.status.confirmationAgeStatus?.lastSuccessAt) {
+      overallState = 'STALE';
+    } else {
+      overallState = 'NOT_AVAILABLE';
+    }
+
+    this.status.confirmationAgeStatus = {
+      state: overallState,
+      lastObservedAt: nowIso,
+      lastSuccessAt: successCount > 0 ? nowIso : (this.status.confirmationAgeStatus?.lastSuccessAt || null),
+      lastError: successCount < 4 ? `Non-successful categories: ${Object.entries(categoryStatuses).filter(([_, s]) => s !== 'SUCCESS').map(([k, s]) => `${k}=${s}`).join(', ')}` : null,
+      categoryStatuses,
+      counts,
+    };
+
+    console.log(`[SyncEngine] Confirmation Age observation summary (${overallState}): 1_day=${counts['1_day']}, 2_days=${counts['2_days']}, 3_days=${counts['3_days']}, over_3_days=${counts['over_3_days']}`);
   }
 
   /**

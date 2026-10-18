@@ -84,7 +84,7 @@ export const PrintedView: React.FC<PrintedViewProps> = ({
             }`}
           >
             <AlertTriangle className="w-3.5 h-3.5 text-rose-400" />
-            <span>فئة ب: تعدد أكواد المستودعات</span>
+            <span>فئة ب: تعدد أكواد المخازن</span>
           </button>
           <button
             onClick={() => setSubTab('no_extra_phone')}
@@ -135,7 +135,7 @@ export const PrintedView: React.FC<PrintedViewProps> = ({
                 <th className="py-3 px-4 font-semibold">الهاتف الأساسي</th>
                 <th className="py-3 px-4 font-semibold">الهاتف الإضافي</th>
                 <th className="py-3 px-4 font-semibold">المحافظة</th>
-                <th className="py-3 px-4 font-semibold">أكواد المستودعات</th>
+                <th className="py-3 px-4 font-semibold">أكواد المخازن</th>
                 <th className="py-3 px-4 font-semibold">نسبة التسليم</th>
                 <th className="py-3 px-4 font-semibold">الإجمالي</th>
                 <th className="py-3 px-4 font-semibold">تاريخ الطباعة</th>
@@ -215,16 +215,16 @@ export const PrintedView: React.FC<PrintedViewProps> = ({
                         {order.governorate || '—'}
                       </td>
 
-                      {/* Merchant Codes */}
+                      {/* Warehouse Codes */}
                       <td className="py-3 px-4">
                         {isMulti ? (
                           <span className="inline-flex items-center gap-1 text-rose-400 font-bold">
                             <AlertTriangle className="w-3.5 h-3.5" />
-                            <span>{order.distinct_merchant_count} مستودعات</span>
+                            <span>{order.distinct_merchant_count} مخازن</span>
                           </span>
                         ) : (
                           <span className="text-slate-400 text-xs">
-                            مستودع واحد ({order.distinct_merchant_count})
+                            مخزن واحد ({order.distinct_merchant_count})
                           </span>
                         )}
                       </td>

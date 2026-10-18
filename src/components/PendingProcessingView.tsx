@@ -186,7 +186,7 @@ export const PendingProcessingView: React.FC<PendingProcessingViewProps> = ({
                 <th className="py-3 px-4 font-semibold">المحافظة</th>
                 <th className="py-3 px-4 font-semibold">عمر الحالة الحالية</th>
                 <th className="py-3 px-4 font-semibold">تاريخ الإنشاء</th>
-                <th className="py-3 px-4 font-semibold">أكواد التجار</th>
+                <th className="py-3 px-4 font-semibold">أكواد المخازن</th>
                 <th className="py-3 px-4 font-semibold">الإجمالي</th>
                 <th className="py-3 px-4 font-semibold text-center">إجراء</th>
               </tr>
@@ -259,15 +259,15 @@ export const PendingProcessingView: React.FC<PendingProcessingViewProps> = ({
                         {order.created_at_source || '—'}
                       </td>
 
-                      {/* Merchant Codes */}
+                      {/* Warehouse Codes */}
                       <td className="py-3 px-4">
                         {order.distinct_merchant_count > 1 ? (
                           <span className="text-rose-400 font-bold inline-flex items-center gap-1">
                             <AlertTriangle className="w-3.5 h-3.5" />
-                            <span>{order.distinct_merchant_count} تجار</span>
+                            <span>{order.distinct_merchant_count} مخازن</span>
                           </span>
                         ) : (
-                          <span className="text-slate-400 text-xs">تاجر واحد</span>
+                          <span className="text-slate-400 text-xs">مخزن واحد</span>
                         )}
                       </td>
 

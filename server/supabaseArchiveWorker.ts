@@ -300,17 +300,28 @@ export async function triggerArchivePass(): Promise<{
 
     const passDuration = Date.now() - startTime;
     status.lastDurationMs = passDuration;
-    status.failedCount = failedCount;
-    status.lastSuccessAt = new Date().toISOString();
-    status.lastError = null;
-    status.totalOrdersArchived += ordersArchived;
-    status.totalEventsArchived += eventsArchived;
-    status.totalRawLogsArchived += rawLogsArchived;
+    const totalArchivedThisPass = ordersArchived + eventsArchived + rawLogsArchived;
+    const totalWaitingBeforePass = totalOrdersWaiting + totalCanonWaiting + totalRawWaiting;
 
-    const passStatus = failedCount === 0 ? 'SUCCESS' : (ordersArchived > 0 || eventsArchived > 0 || rawLogsArchived > 0 ? 'PARTIAL' : 'FAILED');
+    let passStatus: 'SUCCESS' | 'PARTIAL' | 'FAILED' | 'IDLE';
+    if (failedCount > 0) {
+      passStatus = totalArchivedThisPass > 0 ? 'PARTIAL' : 'FAILED';
+    } else if (totalArchivedThisPass > 0) {
+      passStatus = 'SUCCESS';
+    } else {
+      passStatus = 'IDLE';
+    }
     status.status = passStatus;
 
-    console.log(`[SupabaseArchive] Archival pass (${passStatus}) completed in ${passDuration}ms: ${ordersArchived} orders (waiting: ${totalOrdersWaiting}, remaining: ${ordersRemaining}), ${eventsArchived} canonical events (waiting: ${totalCanonWaiting}, remaining: ${eventsRemaining}), ${rawLogsArchived} raw logs (waiting: ${totalRawWaiting}, remaining: ${rawLogsRemaining}). Errors: ${failedCount}`);
+    if (totalArchivedThisPass > 0) {
+      status.lastSuccessAt = new Date().toISOString();
+    }
+
+    if (totalWaitingBeforePass === 0 && totalArchivedThisPass === 0) {
+      console.log(`[SupabaseArchive] Archival worker idle — queue empty (0 records waiting).`);
+    } else {
+      console.log(`[SupabaseArchive] Archival pass (${passStatus}) completed in ${passDuration}ms: ${ordersArchived} orders (waiting: ${totalOrdersWaiting}, remaining: ${ordersRemaining}), ${eventsArchived} canonical events (waiting: ${totalCanonWaiting}, remaining: ${eventsRemaining}), ${rawLogsArchived} raw logs (waiting: ${totalRawWaiting}, remaining: ${rawLogsRemaining}). UnsyncedCount: ${failedCount}`);
+    }
 
     // If there is significant backlog remaining, schedule next pass sooner (10 seconds)
     if (ordersRemaining > 0 || eventsRemaining > 0 || rawLogsRemaining > 0) {

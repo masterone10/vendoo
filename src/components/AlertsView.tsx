@@ -66,13 +66,13 @@ export const AlertsView: React.FC<AlertsViewProps> = ({ onSelectOrder }) => {
         <div>
           <h2 className="text-xl font-bold text-slate-100 flex items-center gap-2">
             <ShieldAlert className="w-5 h-5 text-rose-400" />
-            <span>مركز التنبيهات الحرجة (تعدد أكواد التجار)</span>
+            <span>مركز التنبيهات الحرجة (تعدد أكواد المخازن)</span>
             <span className="text-xs font-mono font-semibold px-2 py-0.5 rounded bg-rose-500/10 border border-rose-500/20 text-rose-400">
               {alerts.length} تنبيه
             </span>
           </h2>
           <p className="text-xs text-slate-400 mt-1">
-            كشف فوري للطلبات التي دخلت حالة التأكيد (Printed) وتحتوي على منتجات تابعة لأكثر من تاجر مستقل
+            كشف فوري للطلبات التي دخلت حالة التأكيد (Printed) وتحتوي على منتجات تابعة لأكثر من كود مخزن مستقل
           </p>
         </div>
 
@@ -131,7 +131,7 @@ export const AlertsView: React.FC<AlertsViewProps> = ({ onSelectOrder }) => {
           <CheckCircle className="w-8 h-8 text-emerald-400 mx-auto" />
           <div className="font-semibold text-slate-200">لا توجد تنبيهات حرجة في هذه القائمة</div>
           <div className="text-xs text-slate-500">
-            جميع الطلبات المؤكدة ملتزمة بكود تاجر واحد أو تم حسم مراجعتها.
+            جميع الطلبات المؤكدة ملتزمة بكود مخزن واحد أو تم حسم مراجعتها.
           </div>
         </div>
       ) : (
@@ -203,11 +203,11 @@ export const AlertsView: React.FC<AlertsViewProps> = ({ onSelectOrder }) => {
                     {details?.products && (
                       <div className="mt-3 p-3 rounded-lg bg-slate-950/60 border border-slate-800/80 space-y-2">
                         <div className="text-[11px] font-semibold text-slate-400">
-                          أصناف الطلب وتوزيع التجار:
+                          أصناف الطلب وتوزيع المخازن:
                         </div>
                         <div className="grid grid-cols-1 sm:grid-cols-2 gap-2 text-xs">
                           {details.products.map((p: any, idx: number) => {
-                            const mCode = details.merchantCodes?.[idx] || 'تاجر';
+                            const mCode = details.merchantCodes?.[idx] || 'مخزن';
                             return (
                               <div
                                 key={idx}
@@ -317,7 +317,7 @@ export const AlertsView: React.FC<AlertsViewProps> = ({ onSelectOrder }) => {
                   rows={3}
                   value={actionNotes}
                   onChange={(e) => setActionNotes(e.target.value)}
-                  placeholder="مثال: تم التواصل مع التاجر وفصل البوليصة في فيندور..."
+                  placeholder="مثال: تم التواصل مع المخزن وتنسيق البوليصة في فيندور..."
                   className="w-full bg-slate-950 border border-slate-800 rounded-lg p-3 text-slate-200 placeholder-slate-500 focus:outline-none focus:border-amber-500/50"
                 />
               </div>
