@@ -249,7 +249,21 @@ class VendoorClient {
     url.searchParams.set('start', String(start));
     url.searchParams.set('length', String(length));
     if (statusFilter) {
-      url.searchParams.set('status_filter', statusFilter);
+      const statusMap: Record<string, string> = {
+        'New': '1',
+        'جديد': '1',
+        'Processing': '2',
+        'Pending': '3',
+        'معلق': '3',
+        'Shipped': '4',
+        'Canceled': '12',
+        'ملغي': '12',
+        'Printed': '13',
+        'مطبوع': '13',
+        'Delivered': '8',
+      };
+      const mappedVal = statusMap[statusFilter] || statusFilter;
+      url.searchParams.set('status_filter', mappedVal);
     }
     if (startDate) {
       url.searchParams.set('start_date', startDate);

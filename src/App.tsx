@@ -8,6 +8,11 @@ import { OrdersView } from './components/OrdersView';
 import { TeamView } from './components/TeamView';
 import { AlertsView } from './components/AlertsView';
 import { SyncHealthView } from './components/SyncHealthView';
+import { ReportsView } from './components/ReportsView';
+import { ComparisonView } from './components/ComparisonView';
+import { LogsView } from './components/LogsView';
+import { ArchiveView } from './components/ArchiveView';
+import { SettingsView } from './components/SettingsView';
 import { OrderDetailsModal } from './components/OrderDetailsModal';
 import { useLiveUpdates } from './hooks/useLiveUpdates';
 import { DashboardStats } from './types';
@@ -119,6 +124,8 @@ export default function App() {
         onDateChange={handleDateChange}
         storageTier={stats?.storageTier}
         coverageStatus={stats?.coverageStatus}
+        databaseMode={stats?.databaseMode}
+        onNavigateToSettings={() => setCurrentTab('settings')}
       />
 
       {/* Main Layout */}
@@ -184,8 +191,27 @@ export default function App() {
             />
           )}
 
+          {currentTab === 'reports' && (
+            <ReportsView onSelectOrder={(code) => setSelectedOrderCode(code)} />
+          )}
+
+          {currentTab === 'comparison' && (
+            <ComparisonView />
+          )}
+
+          {currentTab === 'logs' && (
+            <LogsView
+              onSelectOrder={(code) => setSelectedOrderCode(code)}
+              selectedDate={selectedBusinessDate}
+            />
+          )}
+
           {currentTab === 'alerts' && (
             <AlertsView onSelectOrder={(code) => setSelectedOrderCode(code)} />
+          )}
+
+          {currentTab === 'archive' && (
+            <ArchiveView />
           )}
 
           {currentTab === 'sync_health' && (
@@ -194,6 +220,10 @@ export default function App() {
               onManualSync={handleManualSync}
               isSyncingManual={isSyncingManual}
             />
+          )}
+
+          {currentTab === 'settings' && (
+            <SettingsView />
           )}
         </main>
       </div>

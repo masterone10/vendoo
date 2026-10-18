@@ -13,6 +13,8 @@ interface HeaderProps {
   onDateChange: (date: string) => void;
   storageTier?: 'HOT' | 'COLD';
   coverageStatus?: string;
+  databaseMode?: 'SUPABASE_POSTGRES' | 'SQLITE_AWAITING_CONFIG';
+  onNavigateToSettings?: () => void;
 }
 
 export const Header: React.FC<HeaderProps> = ({
@@ -26,6 +28,8 @@ export const Header: React.FC<HeaderProps> = ({
   onDateChange,
   storageTier = 'HOT',
   coverageStatus,
+  databaseMode = 'SQLITE_AWAITING_CONFIG',
+  onNavigateToSettings,
 }) => {
   // Format last sync time in Cairo locale
   const lastSyncText = syncStatus?.lastSuccessfulSyncAt
@@ -123,7 +127,21 @@ export const Header: React.FC<HeaderProps> = ({
         </span>
       </div>
 
-      <div className="flex items-center gap-4">
+      <div className="flex items-center gap-3">
+        {/* Authoritative Database Indicator */}
+        <button
+          onClick={onNavigateToSettings}
+          className={`hidden md:flex items-center gap-1.5 px-2.5 py-1 text-[11px] font-mono font-bold rounded border transition-colors cursor-pointer ${
+            databaseMode === 'SUPABASE_POSTGRES'
+              ? 'bg-emerald-500/15 text-emerald-300 border-emerald-500/30 hover:bg-emerald-500/25'
+              : 'bg-amber-500/15 text-amber-300 border-amber-500/30 hover:bg-amber-500/25'
+          }`}
+          title={databaseMode === 'SUPABASE_POSTGRES' ? 'قاعدة بيانات Supabase PostgreSQL متصلة ومعتمدة' : 'في انتظار ربط Supabase PostgreSQL (انقر لفتح الإعدادات)'}
+        >
+          <span className={`w-2 h-2 rounded-full ${databaseMode === 'SUPABASE_POSTGRES' ? 'bg-emerald-400' : 'bg-amber-400 animate-pulse'}`}></span>
+          <span>{databaseMode === 'SUPABASE_POSTGRES' ? 'Supabase PG' : 'ربط Supabase'}</span>
+        </button>
+
         {/* Connection & Sync Status Indicator */}
         <div className="hidden sm:flex items-center gap-2.5 text-xs text-slate-300 bg-slate-950/60 border border-slate-800 px-3 py-1.5 rounded-md">
           {isConnected ? (

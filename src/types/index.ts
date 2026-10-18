@@ -129,6 +129,22 @@ export interface DashboardStats {
     total: number;
   };
   syncStatus: SyncStatus;
+  databaseMode?: 'SUPABASE_POSTGRES' | 'SQLITE_AWAITING_CONFIG';
+  supabaseConfigured?: boolean;
+}
+
+export interface SupabaseStatus {
+  isConfigured: boolean;
+  isConnected: boolean;
+  latencyMs: number | null;
+  mode: 'SUPABASE_POSTGRES' | 'SQLITE_AWAITING_CONFIG';
+  host?: string;
+  database?: string;
+  missingTables: string[];
+  presentTables: string[];
+  tableCounts: Record<string, number>;
+  canonicalConstraintPresent: boolean;
+  error?: string | null;
 }
 
 export interface SyncStatus {

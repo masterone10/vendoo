@@ -14,6 +14,13 @@ import {
   calculateAgeBucket,
   getProcessingTransitionTime,
 } from './syncEngine.js';
+import {
+  checkSupabaseConnection,
+  applySupabaseMigration,
+  getDatabaseUrl,
+  isSupabaseConfigured,
+} from './supabaseClient.js';
+import { runSqliteToSupabaseImport } from './importSqliteToSupabase.js';
 
 export const apiRouter = Router();
 
@@ -214,6 +221,8 @@ apiRouter.get('/dashboard/stats', (req: Request, res: Response) => {
       pendingAge,
       processingAge,
       syncStatus,
+      databaseMode: isSupabaseConfigured() ? 'SUPABASE_POSTGRES' : 'SQLITE_AWAITING_CONFIG',
+      supabaseConfigured: isSupabaseConfigured(),
     });
   } catch (err: any) {
     console.error('Error in /dashboard/stats:', err);
@@ -958,7 +967,7 @@ apiRouter.get('/sync/runs', (_req: Request, res: Response) => {
 
 apiRouter.get('/sync/reconcile', async (_req: Request, res: Response) => {
   try {
-    const report = syncEngine.reconcileSourceVsLocal();
+    const report = await syncEngine.reconcileLiveWithVendoor();
     res.json(report);
   } catch (err: any) {
     res.status(500).json({ error: err.message });
@@ -974,7 +983,35 @@ apiRouter.post('/alerts/scan-multi-merchant', async (_req: Request, res: Respons
   }
 });
 
-// 16. Server-Sent Events (SSE) Stream
+// 16. Supabase Management & Migration
+apiRouter.get('/supabase/status', async (_req: Request, res: Response) => {
+  try {
+    const status = await checkSupabaseConnection();
+    res.json(status);
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+apiRouter.post('/supabase/migrate', async (_req: Request, res: Response) => {
+  try {
+    const result = await applySupabaseMigration();
+    res.json(result);
+  } catch (err: any) {
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+apiRouter.post('/supabase/import-sqlite', async (_req: Request, res: Response) => {
+  try {
+    const result = await runSqliteToSupabaseImport();
+    res.json(result);
+  } catch (err: any) {
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// 17. Server-Sent Events (SSE) Stream
 apiRouter.get('/events/live', (req: Request, res: Response) => {
   res.setHeader('Content-Type', 'text/event-stream');
   res.setHeader('Cache-Control', 'no-cache');
@@ -997,20 +1034,40 @@ apiRouter.get('/events/live', (req: Request, res: Response) => {
   });
 });
 
-// 17. System Settings & Configuration Status
-apiRouter.get('/settings', (_req: Request, res: Response) => {
+// 18. System Settings & Configuration Status
+apiRouter.get('/settings', async (_req: Request, res: Response) => {
   try {
     const email = process.env.VENDOOR_EMAIL || '';
     const maskedEmail = email ? email.replace(/^(.{2})(.*)(@.*)$/, (_, a, b, c) => `${a}***${c}`) : 'غير محدد';
     const dbSize = (db.prepare('SELECT page_count * page_size as size FROM pragma_page_count(), pragma_page_size()').get() as any)?.size || 0;
     const walMode = (db.prepare('PRAGMA journal_mode').get() as any)?.journal_mode || 'unknown';
 
+    const supabaseStatus = await checkSupabaseConnection();
+    const dbUrl = getDatabaseUrl();
+    const maskedDbUrl = dbUrl
+      ? dbUrl.replace(/:\/\/([^:]+):([^@]+)@/, '://$1:***@')
+      : null;
+
     res.json({
       authEmail: maskedEmail,
       loginUrl: process.env.VENDOOR_LOGIN_URL || 'https://aff.ven-door.com/dashboard/login',
       timezone: 'Africa/Cairo',
-      syncInterval: parseInt(process.env.SYNC_INTERVAL_SECONDS || '30', 10),
-      database: {
+      syncInterval: parseInt(process.env.SYNC_INTERVAL_SECONDS || '25', 10),
+      databaseMode: isSupabaseConfigured() ? 'SUPABASE_POSTGRES' : 'SQLITE_AWAITING_CONFIG',
+      supabase: {
+        configured: isSupabaseConfigured(),
+        connected: supabaseStatus.isConnected,
+        url: maskedDbUrl,
+        latencyMs: supabaseStatus.latencyMs,
+        database: supabaseStatus.database,
+        host: supabaseStatus.host,
+        missingTables: supabaseStatus.missingTables,
+        presentTables: supabaseStatus.presentTables,
+        tableCounts: supabaseStatus.tableCounts,
+        canonicalConstraintPresent: supabaseStatus.canonicalConstraintPresent,
+        error: supabaseStatus.error,
+      },
+      sqlite: {
         path: DB_PATH,
         sizeBytes: dbSize,
         journalMode: walMode,

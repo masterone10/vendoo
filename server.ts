@@ -22,8 +22,8 @@ initDatabase();
 // Mount API routes
 app.use('/api', apiRouter);
 
-// Start background synchronization
-const syncInterval = parseInt(process.env.SYNC_INTERVAL_SECONDS || '25', 10);
+// Start background synchronization (responsive 45s interval for live tracking)
+const syncInterval = parseInt(process.env.SYNC_INTERVAL_SECONDS || '45', 10);
 syncEngine.start(syncInterval);
 
 async function startServer() {

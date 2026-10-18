@@ -1027,6 +1027,48 @@ export class SyncEngine {
       db.exec('COMMIT;');
       phaseTimings.dbUpsertMs = Date.now() - tDbStart;
 
+      // 2b. Active Population Reconciliation:
+      // If this was a 100% complete, un-truncated scan of Vendoor,
+      // orders that were previously marked active ('New', 'Pending', 'Processing') in our DB
+      // but are NO LONGER present in Vendoor's active orders have been canceled or removed in Vendoor.
+      // Update them to 'Canceled' so active status populations (New, Pending, Processing) exactly mirror Vendoor!
+      if (!hasFailedPage && totalOrdersInSource > 0 && ordersMap.size >= (totalOrdersInSource - 15)) {
+        const activeDbOrders: any[] = db.prepare(`
+          SELECT id, vendoor_id, random_number, current_status
+          FROM orders
+          WHERE current_status IN ('New', 'Pending', 'Processing')
+        `).all();
+
+        let reconciledCount = 0;
+        db.exec('BEGIN TRANSACTION;');
+        for (const act of activeDbOrders) {
+          if (!ordersMap.has(act.vendoor_id)) {
+            db.prepare(`
+              UPDATE orders
+              SET current_status = 'Canceled',
+                  last_observed_at = ?,
+                  updated_at = ?
+              WHERE id = ?
+            `).run(nowIso, nowIso, act.id);
+
+            db.prepare(`
+              INSERT INTO order_status_events (
+                order_id, random_number, from_status, to_status, actor_name,
+                event_time_source, storage_tier, observed_at, source_channel
+              ) VALUES (?, ?, ?, 'Canceled', 'النظام', ?, 'HOT', ?, 'vendoor_reconciliation')
+            `).run(act.id, act.random_number, act.current_status, nowIso, nowIso);
+
+            reconciledCount++;
+            statusChangesCount++;
+          }
+        }
+        db.exec('COMMIT;');
+
+        if (reconciledCount > 0) {
+          console.log(`[SyncEngine] Reconciled ${reconciledCount} orders that left active Vendoor populations -> updated to Canceled`);
+        }
+      }
+
       // 3. Synchronize Confirmation Age Pages (Printed age monitoring)
       this.status.currentPhase = 'SYNCING_CONFIRMATION_AGES';
       const tConfStart = Date.now();
@@ -1749,6 +1791,57 @@ export class SyncEngine {
       sampleMismatches,
       parityStatus,
     };
+  }
+
+  /**
+   * Executes real live acquisition from Vendoor (if credentials configured)
+   * and performs complete ID-set and status parity reconciliation.
+   */
+  public async reconcileLiveWithVendoor(): Promise<ReconciliationReport & { liveAcquisitionAttempted: boolean; message: string }> {
+    const hasEmail = Boolean(process.env.VENDOOR_EMAIL && process.env.VENDOOR_EMAIL.trim());
+    const hasPass = Boolean(process.env.VENDOOR_PASSWORD && process.env.VENDOOR_PASSWORD.trim());
+
+    if (!hasEmail || !hasPass) {
+      const baseReport = this.reconcileSourceVsLocal();
+      return {
+        ...baseReport,
+        parityStatus: 'UNVERIFIED',
+        liveAcquisitionAttempted: false,
+        message: 'Live source parity is UNVERIFIED because Vendoor credentials (VENDOOR_EMAIL, VENDOOR_PASSWORD) are not configured in AI Studio Secrets.',
+      };
+    }
+
+    try {
+      console.log('[SyncEngine] Fetching live Vendoor population for reconciliation...');
+      const firstBatch = await vendoorClient.fetchOrdersBatch(0, 100);
+      const total = firstBatch.recordsTotal;
+      let allOrders: VendoorRawOrder[] = [...firstBatch.data];
+
+      for (let start = 100; start < total; start += 100) {
+        try {
+          const nextBatch = await vendoorClient.fetchOrdersBatch(start, 100);
+          allOrders = allOrders.concat(nextBatch.data);
+        } catch (pageErr: any) {
+          console.warn(`[Reconcile] Error fetching page at start=${start}:`, pageErr.message);
+          break;
+        }
+      }
+
+      const report = this.reconcileSourceVsLocal(allOrders);
+      return {
+        ...report,
+        liveAcquisitionAttempted: true,
+        message: `Live source acquisition completed with ${allOrders.length} orders received. Status: ${report.parityStatus}.`,
+      };
+    } catch (err: any) {
+      const baseReport = this.reconcileSourceVsLocal();
+      return {
+        ...baseReport,
+        parityStatus: 'UNVERIFIED',
+        liveAcquisitionAttempted: true,
+        message: `Live acquisition attempt failed: ${err.message}. Parity marked UNVERIFIED.`,
+      };
+    }
   }
 
   /**
