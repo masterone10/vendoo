@@ -14,8 +14,20 @@ import {
   XCircle,
   X,
   ShieldCheck,
+  Download,
+  Eye,
+  Layers,
+  ArrowRightLeft,
+  MessageSquare,
+  MapPin,
+  Phone,
+  Tag,
+  AlertCircle,
+  Users,
 } from 'lucide-react';
 import { DateCalendarPicker, getCairoToday, formatDateArabic } from './common/DateCalendarPicker';
+import { SystemLogEvent, LogStats } from '../types';
+import { LogDetailsModal } from './LogDetailsModal';
 
 interface LogsViewProps {
   onSelectOrder?: (orderCode: string) => void;
@@ -49,13 +61,20 @@ export const LogsView: React.FC<LogsViewProps> = ({ onSelectOrder, selectedDate 
   const [startDate, setStartDate] = useState<string>(selectedDate || cairoToday);
   const [endDate, setEndDate] = useState<string>(selectedDate || cairoToday);
 
-  const [logs, setLogs] = useState<any[]>([]);
+  const [logs, setLogs] = useState<SystemLogEvent[]>([]);
   const [loading, setLoading] = useState<boolean>(false);
   const [search, setSearch] = useState<string>('');
   const [actor, setActor] = useState<string>('all');
   const [actionType, setActionType] = useState<string>('all');
+  const [matchStatus, setMatchStatus] = useState<string>('all');
+  const [isAdministrative, setIsAdministrative] = useState<string>('all');
   const [totalCount, setTotalCount] = useState<number>(0);
   const [page, setPage] = useState<number>(1);
+  const [stats, setStats] = useState<LogStats | null>(null);
+
+  // Active inspectors & modals
+  const [selectedLog, setSelectedLog] = useState<SystemLogEvent | null>(null);
+  const [expandedLogIds, setExpandedLogIds] = useState<Set<number>>(new Set());
 
   // Period Logs Fetching state
   const [isFetchingPeriod, setIsFetchingPeriod] = useState<boolean>(false);
@@ -71,26 +90,37 @@ export const LogsView: React.FC<LogsViewProps> = ({ onSelectOrder, selectedDate 
 
   useEffect(() => {
     fetchLogs();
-  }, [page, actor, actionType, startDate, endDate]);
+  }, [page, actor, actionType, matchStatus, isAdministrative, startDate, endDate]);
 
   async function fetchLogs() {
     setLoading(true);
     try {
-      let url = `/api/logs?page=${page}&limit=50`;
-      if (search) url += `&search=${encodeURIComponent(search)}`;
-      if (actor && actor !== 'all') url += `&actor=${encodeURIComponent(actor)}`;
-      if (actionType && actionType !== 'all') url += `&actionType=${encodeURIComponent(actionType)}`;
+      const params = new URLSearchParams();
+      params.set('page', String(page));
+      params.set('limit', '50');
+      params.set('offset', String((page - 1) * 50));
+
+      if (search) params.set('search', search.trim());
+      if (actor && actor !== 'all') params.set('actor', actor);
+      if (actionType && actionType !== 'all') params.set('actionType', actionType);
+      if (matchStatus && matchStatus !== 'all') params.set('matchStatus', matchStatus);
+      if (isAdministrative && isAdministrative !== 'all') params.set('isAdministrative', isAdministrative);
+
       if (startDate && endDate) {
-        url += `&startDate=${startDate}&endDate=${endDate}`;
+        params.set('startDate', startDate);
+        params.set('endDate', endDate);
       } else if (startDate) {
-        url += `&date=${startDate}`;
+        params.set('date', startDate);
       }
 
-      const res = await fetch(url);
+      const res = await fetch(`/api/logs?${params.toString()}`);
       if (res.ok) {
         const json = await res.json();
         setLogs(json.logs || []);
         setTotalCount(json.total || 0);
+        if (json.stats) {
+          setStats(json.stats);
+        }
       }
     } catch (err) {
       console.error('Error fetching logs:', err);
@@ -103,6 +133,36 @@ export const LogsView: React.FC<LogsViewProps> = ({ onSelectOrder, selectedDate 
     e.preventDefault();
     setPage(1);
     fetchLogs();
+  }
+
+  function toggleExpandLog(id: number) {
+    setExpandedLogIds((prev) => {
+      const next = new Set(prev);
+      if (next.has(id)) {
+        next.delete(id);
+      } else {
+        next.add(id);
+      }
+      return next;
+    });
+  }
+
+  function handleExportCsv() {
+    const params = new URLSearchParams();
+    params.set('format', 'csv');
+    if (search) params.set('search', search.trim());
+    if (actor && actor !== 'all') params.set('actor', actor);
+    if (actionType && actionType !== 'all') params.set('actionType', actionType);
+    if (matchStatus && matchStatus !== 'all') params.set('matchStatus', matchStatus);
+    if (isAdministrative && isAdministrative !== 'all') params.set('isAdministrative', isAdministrative);
+    if (startDate && endDate) {
+      params.set('startDate', startDate);
+      params.set('endDate', endDate);
+    } else if (startDate) {
+      params.set('date', startDate);
+    }
+
+    window.open(`/api/logs?${params.toString()}`, '_blank');
   }
 
   // Trigger Stage 6 action: «جلب وحفظ لوجز الفترة»
@@ -122,7 +182,6 @@ export const LogsView: React.FC<LogsViewProps> = ({ onSelectOrder, selectedDate 
       const data = await res.json();
       if (data.success && data.report) {
         setFetchReport(data.report);
-        // Refresh local table
         fetchLogs();
       } else {
         setFetchError(data.error || 'تعذر جلب لوجز الفترة من المصدر');
@@ -134,6 +193,33 @@ export const LogsView: React.FC<LogsViewProps> = ({ onSelectOrder, selectedDate 
     }
   }
 
+  const getActionBadge = (type: string) => {
+    switch (type) {
+      case 'status_change':
+        return { label: 'تغيير حالة', className: 'bg-amber-500/10 text-amber-400 border-amber-500/20' };
+      case 'note_added':
+        return { label: 'إضافة ملاحظة', className: 'bg-emerald-500/10 text-emerald-400 border-emerald-500/20' };
+      case 'address_edit':
+        return { label: 'تعديل عنوان', className: 'bg-sky-500/10 text-sky-400 border-sky-500/20' };
+      case 'phone_edit':
+        return { label: 'تعديل هاتف', className: 'bg-violet-500/10 text-violet-400 border-violet-500/20' };
+      case 'order_created':
+        return { label: 'إنشاء طلب', className: 'bg-blue-500/10 text-blue-400 border-blue-500/20' };
+      case 'customer_edit':
+        return { label: 'تعديل عميل', className: 'bg-teal-500/10 text-teal-400 border-teal-500/20' };
+      case 'financial_edit':
+        return { label: 'تعديل مالي', className: 'bg-amber-600/10 text-amber-300 border-amber-600/20' };
+      case 'product_edit':
+        return { label: 'تعديل منتج', className: 'bg-purple-500/10 text-purple-400 border-purple-500/20' };
+      case 'print':
+        return { label: 'طباعة بوليصة', className: 'bg-indigo-500/10 text-indigo-400 border-indigo-500/20' };
+      case 'general_edit':
+        return { label: 'تعديل بيانات', className: 'bg-slate-800 text-slate-300 border-slate-700' };
+      default:
+        return { label: 'نشاط عام', className: 'bg-slate-800 text-slate-400 border-slate-700' };
+    }
+  };
+
   return (
     <div className="p-6 space-y-6 max-w-7xl mx-auto font-['Cairo',sans-serif]" dir="rtl">
       {/* Header */}
@@ -142,17 +228,27 @@ export const LogsView: React.FC<LogsViewProps> = ({ onSelectOrder, selectedDate 
           <div className="flex items-center gap-2">
             <FileText className="w-5 h-5 text-amber-400" />
             <h2 className="text-xl font-bold text-slate-100">
-              سجل العمليات والأنشطة المصدري (System & Audit Logs)
+              سجل العمليات والأنشطة المصدري (Vendoor System & Audit Logs)
             </h2>
           </div>
           <p className="text-xs text-slate-400 mt-1">
-            سجل دقيق وموثق لكافة الأنشطة المنفذة من قبل موظفي التشغيل والنظام مستخرج مباشرة من سجلات فيندور ومحفوظ محلياً
+            مراقبة شاملة ومفصلة لجميع الحركات وتعديلات العناوين وتغييرات الحالات والملاحظات المأخوذة مباشرة من Vendoor
           </p>
         </div>
 
         {/* Action Buttons */}
         <div className="flex flex-wrap items-center gap-2.5">
-          {/* Stage 6: جلب وحفظ لوجز الفترة */}
+          {/* CSV Export Button */}
+          <button
+            onClick={handleExportCsv}
+            className="px-3 py-1.5 bg-slate-900 border border-slate-700 hover:bg-slate-800 text-slate-200 text-xs rounded-xl flex items-center gap-1.5 transition-colors cursor-pointer"
+            title="تصدير السجلات الحالية كملف Excel / CSV"
+          >
+            <Download className="w-3.5 h-3.5 text-emerald-400" />
+            <span>تصدير CSV</span>
+          </button>
+
+          {/* Period Fetch Button */}
           <button
             onClick={handleFetchPeriodLogs}
             disabled={isFetchingPeriod}
@@ -174,11 +270,56 @@ export const LogsView: React.FC<LogsViewProps> = ({ onSelectOrder, selectedDate 
         </div>
       </div>
 
-      {/* Date Range Selector & Period Controls (Stage 4) */}
+      {/* Quick KPI Statistics Cards */}
+      {stats && (
+        <div className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-6 gap-3">
+          <div className="p-3.5 rounded-2xl bg-slate-900/90 border border-slate-800 space-y-1">
+            <span className="text-[11px] text-slate-400 block">إجمالي السجلات</span>
+            <div className="text-lg font-bold font-mono text-slate-100">{stats.total}</div>
+            <span className="text-[10px] text-slate-500 block">في النطاق والمخزن</span>
+          </div>
+
+          <div className="p-3.5 rounded-2xl bg-slate-900/90 border border-slate-800 space-y-1">
+            <span className="text-[11px] text-slate-400 block">حركات اليوم (Cairo)</span>
+            <div className="text-lg font-bold font-mono text-amber-400">{stats.todayLogs}</div>
+            <span className="text-[10px] text-amber-500/80 block">منذ منتصف الليل</span>
+          </div>
+
+          <div className="p-3.5 rounded-2xl bg-slate-900/90 border border-slate-800 space-y-1">
+            <span className="text-[11px] text-slate-400 block">الموظفون النشطون</span>
+            <div className="text-lg font-bold font-mono text-sky-400">{stats.activeEmployees}</div>
+            <span className="text-[10px] text-slate-500 block">فريق التشغيل والمتابعة</span>
+          </div>
+
+          <div className="p-3.5 rounded-2xl bg-slate-900/90 border border-slate-800 space-y-1">
+            <span className="text-[11px] text-slate-400 block">مرتبط بطلبات مؤكدة</span>
+            <div className="text-lg font-bold font-mono text-emerald-400">{stats.matchedWithOrders}</div>
+            <span className="text-[10px] text-emerald-500/80 block">
+              {stats.total > 0 ? `${Math.round((stats.matchedWithOrders / stats.total) * 100)}% ربط كامل` : '0%'}
+            </span>
+          </div>
+
+          <div className="p-3.5 rounded-2xl bg-slate-900/90 border border-slate-800 space-y-1">
+            <span className="text-[11px] text-slate-400 block">تغييرات الحالات</span>
+            <div className="text-lg font-bold font-mono text-amber-300">{stats.statusChangesCount}</div>
+            <span className="text-[10px] text-slate-500 block">تحولات دورة الطلب</span>
+          </div>
+
+          <div className="p-3.5 rounded-2xl bg-slate-900/90 border border-slate-800 space-y-1">
+            <span className="text-[11px] text-slate-400 block">ملاحظات وعناوين</span>
+            <div className="text-lg font-bold font-mono text-teal-400">
+              {stats.notesCount + stats.addressEditsCount + stats.phoneEditsCount}
+            </div>
+            <span className="text-[10px] text-slate-500 block">تدخلات خدمة العملاء</span>
+          </div>
+        </div>
+      )}
+
+      {/* Date Range Selector & Period Controls */}
       <div className="p-4 rounded-2xl bg-slate-900/90 border border-slate-800 flex flex-wrap items-center justify-between gap-4 shadow-lg">
         <div className="flex items-center gap-3">
           <Calendar className="w-4 h-4 text-amber-400" />
-          <span className="text-xs font-semibold text-slate-200">فترة السجلات:</span>
+          <span className="text-xs font-semibold text-slate-200">نطاق تاريخ السجلات:</span>
           <DateCalendarPicker
             mode="range"
             startDate={startDate}
@@ -193,7 +334,7 @@ export const LogsView: React.FC<LogsViewProps> = ({ onSelectOrder, selectedDate 
         </div>
 
         <div className="text-xs text-slate-400 font-mono">
-          إجمالي الحركات في النطاق: <span className="text-amber-400 font-bold">{totalCount}</span>
+          إجمالي نتائج التصفية: <span className="text-amber-400 font-bold">{totalCount}</span>
         </div>
       </div>
 
@@ -258,16 +399,16 @@ export const LogsView: React.FC<LogsViewProps> = ({ onSelectOrder, selectedDate 
         </div>
       )}
 
-      {/* Filters Bar */}
-      <div className="p-4 rounded-2xl bg-slate-900/80 border border-slate-800 flex flex-wrap items-center justify-between gap-4">
-        <form onSubmit={handleSearchSubmit} className="flex items-center gap-2 flex-1 min-w-[260px]">
+      {/* Rich Filters Bar */}
+      <div className="p-4 rounded-2xl bg-slate-900/80 border border-slate-800 flex flex-wrap items-center justify-between gap-3 shadow">
+        <form onSubmit={handleSearchSubmit} className="flex items-center gap-2 flex-1 min-w-[280px]">
           <div className="relative flex-1">
             <Search className="w-4 h-4 text-slate-400 absolute right-3 top-2.5" />
             <input
               type="text"
               value={search}
               onChange={(e) => setSearch(e.target.value)}
-              placeholder="بحث بكود الطلب أو اسم الموظف أو نص الإجراء..."
+              placeholder="بحث برقم أو كود الطلب، اسم العميل، الهاتف، الموظف، أو نص الحركة..."
               className="w-full bg-slate-950 border border-slate-800 rounded-xl pr-9 pl-3 py-1.5 text-xs text-slate-200 placeholder:text-slate-500 focus:outline-none focus:border-amber-500"
             />
           </div>
@@ -279,27 +420,43 @@ export const LogsView: React.FC<LogsViewProps> = ({ onSelectOrder, selectedDate 
           </button>
         </form>
 
-        <div className="flex items-center gap-3">
-          <div>
-            <select
-              value={actionType}
-              onChange={(e) => {
-                setActionType(e.target.value);
-                setPage(1);
-              }}
-              className="bg-slate-950 border border-slate-800 rounded-xl px-3 py-1.5 text-xs text-slate-200 focus:outline-none focus:border-amber-500"
-            >
-              <option value="all">كافة أنواع الإجراءات</option>
-              <option value="status_change">تغيير حالة (Status Change)</option>
-              <option value="print">طباعة البوليصة (Print)</option>
-              <option value="confirm">تأكيد الطلب (Confirm)</option>
-              <option value="cancel">إلغاء الطلب (Cancel)</option>
-              <option value="edit">تعديل بيانات (Edit)</option>
-              <option value="phone_edit">تعديل هاتف</option>
-              <option value="address_edit">تعديل عنوان</option>
-              <option value="order_created">إنشاء طلب جديد</option>
-            </select>
-          </div>
+        <div className="flex flex-wrap items-center gap-2">
+          {/* Action Type Select */}
+          <select
+            value={actionType}
+            onChange={(e) => {
+              setActionType(e.target.value);
+              setPage(1);
+            }}
+            className="bg-slate-950 border border-slate-800 rounded-xl px-3 py-1.5 text-xs text-slate-200 focus:outline-none focus:border-amber-500"
+          >
+            <option value="all">كافة أنواع الإجراءات</option>
+            <option value="status_change">تغيير حالة (Status Change)</option>
+            <option value="note_added">إضافة ملاحظة (Note)</option>
+            <option value="address_edit">تعديل عنوان (Address)</option>
+            <option value="phone_edit">تعديل هاتف (Phone)</option>
+            <option value="customer_edit">تعديل اسم عميل (Customer)</option>
+            <option value="order_created">إنشاء طلب جديد (Created)</option>
+            <option value="print">طباعة البوليصة (Printed)</option>
+            <option value="financial_edit">تعديل مالي / شحن (Financial)</option>
+            <option value="product_edit">تعديل منتج / مقاس (Product)</option>
+            <option value="general_edit">تعديل بيانات عامة (General)</option>
+          </select>
+
+          {/* Match Status Select */}
+          <select
+            value={matchStatus}
+            onChange={(e) => {
+              setMatchStatus(e.target.value);
+              setPage(1);
+            }}
+            className="bg-slate-950 border border-slate-800 rounded-xl px-3 py-1.5 text-xs text-slate-200 focus:outline-none focus:border-amber-500"
+          >
+            <option value="all">كافة حالات الربط بالطلبات</option>
+            <option value="MATCHED">مرتبط بطلب في قاعدة البيانات</option>
+            <option value="UNRESOLVED">كود طلب غير مؤكد في البيانات النشطة</option>
+            <option value="GENERAL_LOG">حركة عامة / غير مرتبطة بطلب</option>
+          </select>
         </div>
       </div>
 
@@ -312,75 +469,184 @@ export const LogsView: React.FC<LogsViewProps> = ({ onSelectOrder, selectedDate 
                 <th className="py-3 px-4">توقيت الحدث (Cairo)</th>
                 <th className="py-3 px-4">الموظف / المنفذ</th>
                 <th className="py-3 px-4">نوع الإجراء</th>
-                <th className="py-3 px-4">كود الطلب</th>
-                <th className="py-3 px-4">تفاصيل الإجراء المصدري</th>
-                <th className="py-3 px-4 text-center">عرض</th>
+                <th className="py-3 px-4">الطلب المرتبط</th>
+                <th className="py-3 px-4">نص الإجراء والمقارنة</th>
+                <th className="py-3 px-4 text-center">حالة الربط</th>
+                <th className="py-3 px-4 text-center">إجراءات</th>
               </tr>
             </thead>
             <tbody className="divide-y divide-slate-800/60 text-slate-200">
               {loading && logs.length === 0 ? (
                 <tr>
-                  <td colSpan={6} className="py-12 text-center text-slate-400">
+                  <td colSpan={7} className="py-14 text-center text-slate-400">
                     <RefreshCw className="w-5 h-5 animate-spin mx-auto mb-2 text-slate-500" />
-                    <span>جاري تحميل سجل العمليات...</span>
+                    <span>جاري تحميل سجل العمليات والمطابقة...</span>
                   </td>
                 </tr>
               ) : logs.length === 0 ? (
                 <tr>
-                  <td colSpan={6} className="py-12 text-center text-slate-500">
-                    لا توجد سجلات مطابقة للفترة أو الفلاتر المحددة. يمكنك الضغط على «جلب وحفظ لوجز الفترة» لجلبها من Vendoor.
+                  <td colSpan={7} className="py-14 text-center text-slate-500">
+                    لا توجد سجلات مطابقة للفترة أو الفلاتر المحددة. يمكنك تعديل الفلاتر أو الضغط على «جلب وحفظ لوجز الفترة» لجلبها من Vendoor.
                   </td>
                 </tr>
               ) : (
-                logs.map((l: any) => (
-                  <tr key={l.id} className="hover:bg-slate-800/40 transition-colors">
-                    <td className="py-3 px-4 font-mono text-[11px] text-slate-300">
-                      {l.event_timestamp
-                        ? new Date(l.event_timestamp).toLocaleString('ar-EG', {
-                            year: 'numeric',
-                            month: '2-digit',
-                            day: '2-digit',
-                            hour: '2-digit',
-                            minute: '2-digit',
-                            second: '2-digit',
-                          })
-                        : 'غير محدد'}
-                    </td>
-                    <td className="py-3 px-4 font-semibold text-slate-100">
-                      <div className="flex items-center gap-1.5">
-                        <User className="w-3.5 h-3.5 text-slate-400" />
-                        <span>{l.actor_name || 'النظام'}</span>
-                        {l.actor_name && (l.actor_name.includes('CS') || l.actor_name.includes('خدمة العملاء')) && (
-                          <span className="text-[10px] px-1.5 py-0.2 rounded bg-sky-500/20 text-sky-300 font-mono">
-                            CS
+                logs.map((l: SystemLogEvent) => {
+                  const badge = getActionBadge(l.action_type);
+                  const isExpanded = expandedLogIds.has(l.id);
+                  const isLongText = (l.raw_action_text || '').length > 60;
+
+                  return (
+                    <tr key={l.id} className="hover:bg-slate-800/40 transition-colors">
+                      {/* Timestamp */}
+                      <td className="py-3 px-4 font-mono text-[11px] text-slate-300 whitespace-nowrap">
+                        {l.event_timestamp
+                          ? new Date(l.event_timestamp).toLocaleString('ar-EG', {
+                              month: '2-digit',
+                              day: '2-digit',
+                              hour: '2-digit',
+                              minute: '2-digit',
+                              second: '2-digit',
+                            })
+                          : 'غير محدد'}
+                      </td>
+
+                      {/* Actor */}
+                      <td className="py-3 px-4 font-semibold text-slate-100 whitespace-nowrap">
+                        <div className="flex items-center gap-1.5">
+                          <User className="w-3.5 h-3.5 text-slate-400" />
+                          <span>{l.actor_name || 'النظام'}</span>
+                          {l.actor_name && (l.actor_name.includes('CS') || l.actor_name.includes('خدمة العملاء')) && (
+                            <span className="text-[10px] px-1.5 py-0.2 rounded bg-sky-500/20 text-sky-300 font-mono">
+                              CS
+                            </span>
+                          )}
+                        </div>
+                      </td>
+
+                      {/* Action Type Badge */}
+                      <td className="py-3 px-4 whitespace-nowrap">
+                        <span className={`px-2 py-0.5 rounded text-[11px] border font-medium ${badge.className}`}>
+                          {badge.label}
+                        </span>
+                      </td>
+
+                      {/* Order Info */}
+                      <td className="py-3 px-4 whitespace-nowrap">
+                        {l.order_code ? (
+                          <div className="flex flex-col gap-0.5">
+                            <div className="flex items-center gap-1.5 font-mono font-bold text-amber-400">
+                              <span>#{l.order_code}</span>
+                              {l.order_no && (
+                                <span className="text-[10px] font-normal text-slate-400">
+                                  ({l.order_no})
+                                </span>
+                              )}
+                            </div>
+                            {l.customer_name && (
+                              <span className="text-[10px] text-slate-300 truncate max-w-[130px]">
+                                {l.customer_name}
+                              </span>
+                            )}
+                          </div>
+                        ) : (
+                          <span className="text-slate-500 text-[11px]">حركة عامة</span>
+                        )}
+                      </td>
+
+                      {/* Raw text & Old -> New Diff */}
+                      <td className="py-3 px-4 max-w-lg">
+                        <div className="space-y-1">
+                          <div className="text-slate-200">
+                            {isLongText && !isExpanded ? (
+                              <span>
+                                {l.raw_action_text.slice(0, 60)}...
+                                <button
+                                  onClick={() => toggleExpandLog(l.id)}
+                                  className="text-amber-400 hover:underline mr-1 text-[11px] cursor-pointer"
+                                >
+                                  عرض المزيد
+                                </button>
+                              </span>
+                            ) : (
+                              <span>
+                                {l.raw_action_text || '-'}
+                                {isLongText && (
+                                  <button
+                                    onClick={() => toggleExpandLog(l.id)}
+                                    className="text-slate-400 hover:text-slate-300 hover:underline mr-1 text-[11px] cursor-pointer"
+                                  >
+                                    إخفاء
+                                  </button>
+                                )}
+                              </span>
+                            )}
+                          </div>
+
+                          {/* Quick Diff Pill if values exist */}
+                          {(l.old_value || l.new_value) && (
+                            <div className="flex items-center gap-1 text-[10px] font-mono text-slate-400 flex-wrap">
+                              {l.field_name && <span className="text-slate-500">[{l.field_name}]:</span>}
+                              {l.old_value && (
+                                <span className="bg-rose-500/10 text-rose-300 px-1.5 py-0.2 rounded border border-rose-500/20 line-through">
+                                  {l.old_value}
+                                </span>
+                              )}
+                              {l.old_value && l.new_value && <span>←</span>}
+                              {l.new_value && (
+                                <span className="bg-emerald-500/10 text-emerald-300 px-1.5 py-0.2 rounded border border-emerald-500/20 font-bold">
+                                  {l.new_value}
+                                </span>
+                              )}
+                            </div>
+                          )}
+                        </div>
+                      </td>
+
+                      {/* Match Status */}
+                      <td className="py-3 px-4 text-center whitespace-nowrap">
+                        {l.order_match_status === 'MATCHED' ? (
+                          <span className="inline-flex items-center gap-1 text-[10px] px-2 py-0.5 rounded-full bg-emerald-500/10 text-emerald-400 border border-emerald-500/20">
+                            <CheckCircle2 className="w-2.5 h-2.5" />
+                            <span>مرتبط</span>
+                          </span>
+                        ) : l.order_match_status === 'GENERAL_LOG' ? (
+                          <span className="inline-flex items-center gap-1 text-[10px] px-2 py-0.5 rounded-full bg-slate-800 text-slate-400 border border-slate-700">
+                            <span>عام</span>
+                          </span>
+                        ) : (
+                          <span className="inline-flex items-center gap-1 text-[10px] px-2 py-0.5 rounded-full bg-amber-500/10 text-amber-400 border border-amber-500/20">
+                            <span>غير مسجل</span>
                           </span>
                         )}
-                      </div>
-                    </td>
-                    <td className="py-3 px-4">
-                      <span className="px-2 py-0.5 rounded text-[11px] font-mono bg-slate-800 text-slate-300">
-                        {l.action_type || 'نشاط'}
-                      </span>
-                    </td>
-                    <td className="py-3 px-4 font-mono font-bold text-amber-400">
-                      {l.order_code || 'عام'}
-                    </td>
-                    <td className="py-3 px-4 text-slate-300 max-w-md truncate">
-                      {l.raw_action_text || '-'}
-                    </td>
-                    <td className="py-3 px-4 text-center">
-                      {l.order_code && onSelectOrder && (
-                        <button
-                          onClick={() => onSelectOrder(l.order_code)}
-                          className="p-1 hover:bg-slate-800 rounded text-slate-400 hover:text-amber-400 transition-colors cursor-pointer"
-                          title="عرض تفاصيل الطلب"
-                        >
-                          <ArrowUpRight className="w-4 h-4" />
-                        </button>
-                      )}
-                    </td>
-                  </tr>
-                ))
+                      </td>
+
+                      {/* Actions */}
+                      <td className="py-3 px-4 text-center whitespace-nowrap">
+                        <div className="flex items-center justify-center gap-1.5">
+                          {/* Inspect Modal Button */}
+                          <button
+                            onClick={() => setSelectedLog(l)}
+                            className="p-1.5 hover:bg-slate-800 rounded-lg text-slate-400 hover:text-amber-400 transition-colors cursor-pointer"
+                            title="عرض كافة تفاصيل الحركة الأصلية"
+                          >
+                            <Eye className="w-4 h-4" />
+                          </button>
+
+                          {/* Open Order Button */}
+                          {l.order_code && onSelectOrder && (
+                            <button
+                              onClick={() => onSelectOrder(l.order_code!)}
+                              className="p-1.5 hover:bg-slate-800 rounded-lg text-slate-400 hover:text-emerald-400 transition-colors cursor-pointer"
+                              title="فتح تفاصيل الطلب الكاملة"
+                            >
+                              <ArrowUpRight className="w-4 h-4" />
+                            </button>
+                          )}
+                        </div>
+                      </td>
+                    </tr>
+                  );
+                })
               )}
             </tbody>
           </table>
@@ -389,7 +655,7 @@ export const LogsView: React.FC<LogsViewProps> = ({ onSelectOrder, selectedDate 
         {/* Pagination */}
         <div className="p-3 bg-slate-950/60 border-t border-slate-800 flex items-center justify-between text-xs text-slate-400">
           <span>
-            صفحة {page} من {Math.max(1, Math.ceil(totalCount / 50))}
+            صفحة {page} من {Math.max(1, Math.ceil(totalCount / 50))} (عرض {logs.length} من {totalCount} حركة)
           </span>
           <div className="flex items-center gap-1">
             <button
@@ -409,6 +675,15 @@ export const LogsView: React.FC<LogsViewProps> = ({ onSelectOrder, selectedDate 
           </div>
         </div>
       </div>
+
+      {/* Full Log Details Modal */}
+      {selectedLog && (
+        <LogDetailsModal
+          log={selectedLog}
+          onClose={() => setSelectedLog(null)}
+          onOpenOrder={onSelectOrder}
+        />
+      )}
     </div>
   );
 };

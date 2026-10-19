@@ -207,15 +207,15 @@ export const AlertsView: React.FC<AlertsViewProps> = ({ onSelectOrder }) => {
                         </div>
                         <div className="grid grid-cols-1 sm:grid-cols-2 gap-2 text-xs">
                           {details.products.map((p: any, idx: number) => {
-                            const mCode = details.merchantCodes?.[idx] || 'مخزن';
+                            const whName = details.warehouses?.[idx] || details.warehouseNames?.[idx] || details.merchantCodes?.[idx] || 'مخزن';
                             return (
                               <div
                                 key={idx}
                                 className="p-2 rounded bg-slate-900 border border-slate-800 flex items-center justify-between"
                               >
                                 <span className="text-slate-200 truncate">{p.name}</span>
-                                <span className="text-rose-400 font-mono font-bold shrink-0 ml-2">
-                                  {mCode}
+                                <span className="text-sky-400 font-mono font-bold shrink-0 ml-2 text-xs">
+                                  {whName}
                                 </span>
                               </div>
                             );

@@ -1,6 +1,7 @@
 import { DatabaseSync } from 'node:sqlite';
 import fs from 'node:fs';
 import path from 'node:path';
+import { parseLogActionDetails } from './logDetailsParser.js';
 
 const DB_DIR = path.resolve(process.cwd(), 'data');
 if (!fs.existsSync(DB_DIR)) {
@@ -142,7 +143,11 @@ export function initDatabase() {
       vendoor_item_id INTEGER,
       product_id INTEGER,
       product_name TEXT NOT NULL,
-      merchant_code TEXT NOT NULL,
+      merchant_code TEXT,
+      merchant_name TEXT,
+      warehouse_name TEXT,
+      warehouse_code TEXT,
+      code_source TEXT DEFAULT 'VENDOOR_SOURCE',
       merchant_id TEXT,
       sku TEXT,
       size TEXT,
@@ -181,18 +186,31 @@ export function initDatabase() {
       storage_tier TEXT DEFAULT 'HOT',
       observed_at TEXT NOT NULL,
       page_source TEXT DEFAULT 'log/system',
-      is_duplicate INTEGER DEFAULT 0
+      is_duplicate INTEGER DEFAULT 0,
+      vendoor_order_id INTEGER,
+      raw_html TEXT,
+      details_json TEXT,
+      field_name TEXT,
+      old_value TEXT,
+      new_value TEXT
     );
 
     -- Canonical events for employee metrics & deduplicated audit
     CREATE TABLE IF NOT EXISTS canonical_activity_events (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       raw_event_id INTEGER REFERENCES raw_activity_events(id) ON DELETE SET NULL,
+      order_id INTEGER REFERENCES orders(id) ON DELETE SET NULL,
       order_code TEXT,
       actor_name TEXT NOT NULL,
       action_type TEXT NOT NULL,
       from_status TEXT,
       to_status TEXT,
+      field_name TEXT,
+      old_value TEXT,
+      new_value TEXT,
+      details_json TEXT,
+      order_match_status TEXT DEFAULT 'UNRESOLVED',
+      is_administrative INTEGER DEFAULT 0,
       event_timestamp TEXT NOT NULL,
       storage_tier TEXT DEFAULT 'HOT',
       is_system_actor INTEGER DEFAULT 0,
@@ -359,9 +377,24 @@ export function initDatabase() {
   tryRunMigration("ALTER TABLE orders ADD COLUMN last_enrichment_status TEXT");
   tryRunMigration("ALTER TABLE order_items ADD COLUMN merchant_name TEXT");
   tryRunMigration("ALTER TABLE order_items ADD COLUMN warehouse_name TEXT");
+  tryRunMigration("ALTER TABLE order_items ADD COLUMN warehouse_code TEXT");
+  tryRunMigration("ALTER TABLE order_items ADD COLUMN code_source TEXT DEFAULT 'VENDOOR_SOURCE'");
   tryRunMigration("ALTER TABLE order_status_events ADD COLUMN storage_tier TEXT DEFAULT 'HOT'");
   tryRunMigration("ALTER TABLE raw_activity_events ADD COLUMN storage_tier TEXT DEFAULT 'HOT'");
+  tryRunMigration("ALTER TABLE raw_activity_events ADD COLUMN vendoor_order_id INTEGER");
+  tryRunMigration("ALTER TABLE raw_activity_events ADD COLUMN raw_html TEXT");
+  tryRunMigration("ALTER TABLE raw_activity_events ADD COLUMN details_json TEXT");
+  tryRunMigration("ALTER TABLE raw_activity_events ADD COLUMN field_name TEXT");
+  tryRunMigration("ALTER TABLE raw_activity_events ADD COLUMN old_value TEXT");
+  tryRunMigration("ALTER TABLE raw_activity_events ADD COLUMN new_value TEXT");
   tryRunMigration("ALTER TABLE canonical_activity_events ADD COLUMN storage_tier TEXT DEFAULT 'HOT'");
+  tryRunMigration("ALTER TABLE canonical_activity_events ADD COLUMN order_id INTEGER REFERENCES orders(id) ON DELETE SET NULL");
+  tryRunMigration("ALTER TABLE canonical_activity_events ADD COLUMN order_match_status TEXT DEFAULT 'UNRESOLVED'");
+  tryRunMigration("ALTER TABLE canonical_activity_events ADD COLUMN is_administrative INTEGER DEFAULT 0");
+  tryRunMigration("ALTER TABLE canonical_activity_events ADD COLUMN details_json TEXT");
+  tryRunMigration("ALTER TABLE canonical_activity_events ADD COLUMN field_name TEXT");
+  tryRunMigration("ALTER TABLE canonical_activity_events ADD COLUMN old_value TEXT");
+  tryRunMigration("ALTER TABLE canonical_activity_events ADD COLUMN new_value TEXT");
   tryRunMigration("ALTER TABLE customer_history_observations ADD COLUMN storage_tier TEXT DEFAULT 'HOT'");
   tryRunMigration("ALTER TABLE confirmation_age_observations ADD COLUMN storage_tier TEXT DEFAULT 'HOT'");
   tryRunMigration("ALTER TABLE sync_runs ADD COLUMN raw_rows_received INTEGER DEFAULT 0");
@@ -403,6 +436,10 @@ export function initDatabase() {
     CREATE INDEX IF NOT EXISTS idx_raw_activity_timestamp ON raw_activity_events(event_timestamp);
     CREATE INDEX IF NOT EXISTS idx_raw_activity_tier ON raw_activity_events(storage_tier);
 
+    CREATE INDEX IF NOT EXISTS idx_canonical_order_id ON canonical_activity_events(order_id);
+    CREATE INDEX IF NOT EXISTS idx_canonical_order_code ON canonical_activity_events(order_code);
+    CREATE INDEX IF NOT EXISTS idx_canonical_match_status ON canonical_activity_events(order_match_status);
+    CREATE INDEX IF NOT EXISTS idx_canonical_is_admin ON canonical_activity_events(is_administrative);
     CREATE INDEX IF NOT EXISTS idx_canonical_actor ON canonical_activity_events(actor_name);
     CREATE INDEX IF NOT EXISTS idx_canonical_timestamp ON canonical_activity_events(event_timestamp);
     CREATE INDEX IF NOT EXISTS idx_canonical_action_type ON canonical_activity_events(action_type);
@@ -430,6 +467,236 @@ export function initDatabase() {
     populateInitialCoverageFromExistingData();
   } catch (err: any) {
     console.warn('[DB] Warning populating initial coverage:', err.message);
+  }
+
+  // Backfill order links and administrative flags for existing log events
+  try {
+    backfillOrderLinksForEvents();
+  } catch (err: any) {
+    console.warn('[DB] Warning backfilling log order links:', err.message);
+  }
+
+  // Segregate warehouse names and clean merchant codes in order_items
+  try {
+    repairMerchantAndWarehouseData();
+  } catch (err: any) {
+    console.warn('[DB] Warning repairing merchant/warehouse data:', err.message);
+  }
+}
+
+/**
+ * Automatically resolves order_id, order_match_status, and parses rich details for log events
+ * by looking up random_number, order_no, or vendoor_id in orders.
+ */
+export function backfillOrderLinksForEvents() {
+  try {
+    const orderRows: any[] = db.prepare('SELECT id, random_number, order_no, vendoor_id FROM orders').all();
+    const orderMap = new Map<string, number>();
+    for (const o of orderRows) {
+      if (o.random_number) orderMap.set(o.random_number.toLowerCase(), o.id);
+      if (o.order_no) orderMap.set(String(o.order_no).toLowerCase(), o.id);
+      if (o.vendoor_id) orderMap.set(String(o.vendoor_id).toLowerCase(), o.id);
+    }
+
+    const events: any[] = db.prepare(`
+      SELECT c.id, c.order_code, c.actor_name, c.action_type, r.raw_action_text
+      FROM canonical_activity_events c
+      LEFT JOIN raw_activity_events r ON c.raw_event_id = r.id
+      WHERE c.order_match_status IS NULL OR c.order_match_status = 'UNRESOLVED' OR c.field_name IS NULL
+    `).all();
+
+    if (events.length === 0) return;
+
+
+    const updateStmt = db.prepare(`
+      UPDATE canonical_activity_events
+      SET 
+        order_id = ?,
+        order_match_status = ?,
+        is_administrative = ?,
+        action_type = ?,
+        from_status = COALESCE(?, from_status),
+        to_status = COALESCE(?, to_status),
+        field_name = ?,
+        old_value = ?,
+        new_value = ?,
+        details_json = ?
+      WHERE id = ?
+    `);
+
+    db.exec('BEGIN TRANSACTION;');
+    for (const ev of events) {
+      const code = (ev.order_code || '').trim().toLowerCase();
+      let orderId: number | null = null;
+      let matchStatus = 'UNRESOLVED';
+      if (!code) {
+        matchStatus = 'GENERAL_LOG';
+      } else if (orderMap.has(code)) {
+        orderId = orderMap.get(code)!;
+        matchStatus = 'MATCHED';
+      }
+
+      const parsed = parseLogActionDetails(ev.raw_action_text || '', ev.actor_name || '', ev.order_code || '');
+      const detailsJson = JSON.stringify(parsed);
+
+      updateStmt.run(
+        orderId,
+        matchStatus,
+        parsed.isAdministrative ? 1 : 0,
+        parsed.actionType !== 'other' ? parsed.actionType : ev.action_type,
+        parsed.fromStatus,
+        parsed.toStatus,
+        parsed.fieldName,
+        parsed.oldValue,
+        parsed.newValue,
+        detailsJson,
+        ev.id
+      );
+    }
+    db.exec('COMMIT;');
+  } catch (err: any) {
+    try { db.exec('ROLLBACK;'); } catch {}
+    console.warn('[DB] Warning backfilling log order links:', err.message);
+  }
+}
+
+/**
+ * Segregates warehouse names from merchant codes in order_items.
+ * - Extracts and populates warehouse_name (e.g. "مخزن Y 21") and warehouse_code ("Y 21").
+ * - Clears merchant_code to NULL if it was mistakenly set to warehouse names ("مخزن %", "كود %", "غير محدد").
+ * - Preserves authentic merchant codes (from Excel imports or vendor mappings).
+ * - Never invents merchant codes or treats SKU/warehouse as merchant code.
+ */
+export function repairMerchantAndWarehouseData() {
+  try {
+    // 0. Drop NOT NULL constraint on merchant_code if present in SQLite schema
+    const pragma: any[] = db.prepare('PRAGMA table_info(order_items)').all();
+    const mcCol = pragma.find(c => c.name === 'merchant_code');
+    if (mcCol && mcCol.notnull === 1) {
+      db.exec('PRAGMA foreign_keys = OFF;');
+      db.exec(`
+        CREATE TABLE IF NOT EXISTS order_items_v2 (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          order_id INTEGER NOT NULL REFERENCES orders(id) ON DELETE CASCADE,
+          vendoor_item_id INTEGER,
+          product_id INTEGER,
+          product_name TEXT NOT NULL,
+          merchant_code TEXT,
+          merchant_name TEXT,
+          warehouse_name TEXT,
+          warehouse_code TEXT,
+          code_source TEXT DEFAULT 'VENDOOR_SOURCE',
+          merchant_id TEXT,
+          sku TEXT,
+          size TEXT,
+          color TEXT,
+          quantity INTEGER DEFAULT 1,
+          unit_price REAL DEFAULT 0,
+          pay_vendor REAL DEFAULT 0,
+          image_path TEXT,
+          raw_json TEXT,
+          created_at TEXT NOT NULL
+        );
+
+        INSERT INTO order_items_v2 (
+          id, order_id, vendoor_item_id, product_id, product_name,
+          merchant_code, merchant_name, warehouse_name, warehouse_code,
+          code_source, merchant_id, sku, size, color, quantity, unit_price,
+          pay_vendor, image_path, raw_json, created_at
+        )
+        SELECT
+          id, order_id, vendoor_item_id, product_id, product_name,
+          merchant_code, merchant_name, warehouse_name, warehouse_code,
+          code_source, merchant_id, sku, size, color, quantity, unit_price,
+          pay_vendor, image_path, raw_json, created_at
+        FROM order_items;
+
+        DROP TABLE order_items;
+        ALTER TABLE order_items_v2 RENAME TO order_items;
+
+        CREATE INDEX IF NOT EXISTS idx_order_items_order_id ON order_items(order_id);
+        CREATE INDEX IF NOT EXISTS idx_order_items_merchant_code ON order_items(merchant_code);
+        CREATE INDEX IF NOT EXISTS idx_order_items_warehouse_name ON order_items(warehouse_name);
+      `);
+      db.exec('PRAGMA foreign_keys = ON;');
+    }
+
+    // 1. If warehouse_name is NULL or empty, but merchant_code holds a warehouse name
+    db.prepare(`
+      UPDATE order_items
+      SET warehouse_name = merchant_code,
+          warehouse_code = TRIM(REPLACE(REPLACE(merchant_code, 'مخزن', ''), 'كود', ''))
+      WHERE (warehouse_name IS NULL OR warehouse_name = '')
+        AND (merchant_code LIKE 'مخزن %' OR merchant_code LIKE 'كود %')
+    `).run();
+
+    // 2. Also extract warehouse_name from product_name for any items still lacking warehouse_name
+    const itemsWithoutWh: any[] = db.prepare(`
+      SELECT id, product_name FROM order_items
+      WHERE warehouse_name IS NULL OR warehouse_name = '' OR warehouse_name = 'غير محدد'
+    `).all();
+
+    if (itemsWithoutWh.length > 0) {
+      const updateWh = db.prepare(`
+        UPDATE order_items 
+        SET warehouse_name = ?,
+            warehouse_code = ?
+        WHERE id = ?
+      `);
+      db.exec('BEGIN TRANSACTION;');
+      for (const it of itemsWithoutWh) {
+        const name = it.product_name || '';
+        const match = name.match(/\(\s*مخزن\s*([^)]+)\s*\)/i);
+        if (match && match[1]?.trim()) {
+          const whName = 'مخزن ' + match[1].trim();
+          const whCode = match[1].trim();
+          updateWh.run(whName, whCode, it.id);
+        } else {
+          const codeMatch = name.match(/\(\s*كود\s*([^)]+)\s*\)/i);
+          if (codeMatch && codeMatch[1]?.trim()) {
+            const whName = 'كود ' + codeMatch[1].trim();
+            const whCode = codeMatch[1].trim();
+            updateWh.run(whName, whCode, it.id);
+          }
+        }
+      }
+      db.exec('COMMIT;');
+    }
+
+    // 3. Clear merchant_code where it mistakenly contains warehouse strings or 'غير محدد'
+    db.prepare(`
+      UPDATE order_items
+      SET merchant_code = NULL
+      WHERE merchant_code LIKE 'مخزن %'
+         OR merchant_code LIKE 'كود %'
+         OR merchant_code = 'غير محدد'
+    `).run();
+
+    // 4. Update distinct_merchant_count and multi_merchant_flag on orders table
+    // based on actual distinct warehouse names (avoiding confusion)
+    const distinctWarehousesPerOrder: any[] = db.prepare(`
+      SELECT order_id, COUNT(DISTINCT warehouse_name) as wh_count
+      FROM order_items
+      WHERE warehouse_name IS NOT NULL AND warehouse_name != ''
+      GROUP BY order_id
+    `).all();
+
+    const updateOrderWhCount = db.prepare(`
+      UPDATE orders
+      SET distinct_merchant_count = ?,
+          multi_merchant_flag = ?
+      WHERE id = ?
+    `);
+
+    db.exec('BEGIN TRANSACTION;');
+    for (const row of distinctWarehousesPerOrder) {
+      const cnt = Math.max(1, row.wh_count || 1);
+      updateOrderWhCount.run(cnt, cnt > 1 ? 1 : 0, row.order_id);
+    }
+    db.exec('COMMIT;');
+  } catch (err: any) {
+    try { db.exec('ROLLBACK;'); } catch {}
+    console.warn('[DB] Warning in repairMerchantAndWarehouseData:', err.message);
   }
 }
 

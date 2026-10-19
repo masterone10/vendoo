@@ -3,11 +3,17 @@ import { db } from './db.js';
 export interface MerchantCodeImportRow {
   orderCode?: string | null;
   vendorId?: number | null;
+  itemId?: number | null;
+  productId?: number | null;
+  sku?: string | null;
   productName?: string | null;
   merchantCode: string;
   merchantName?: string | null;
+  warehouseCode?: string | null;
+  warehouseName?: string | null;
   sourceSheetName?: string | null;
   excelRowIndex?: number | null;
+  notes?: string | null;
 }
 
 export interface MerchantCodeImportReport {
@@ -21,34 +27,67 @@ export interface MerchantCodeImportReport {
   warnings: string[];
 }
 
-// Recognized dedicated Excel headers for merchant code (never parsed from product title)
+// Recognized dedicated Excel headers for merchant/vendor codes
+// Strictly excludes warehouse codes or warehouse names
 export const DEDICATED_MERCHANT_CODE_HEADERS = [
-  'كود المخزن',
-  'المخزن',
   'كود التاجر',
   'كود التاجر في الاكسيل',
   'كود المورد',
-  'warehouse_code',
-  'Warehouse Code',
   'merchant_code',
   'Merchant Code',
   'MerchantCode',
   'merchantCode',
   'vendor_code',
   'Vendor Code',
+  'vendorCode',
+  'merchant_id',
+  'vendor_id',
+];
+
+// Dedicated warehouse code headers (separate from merchant codes)
+export const DEDICATED_WAREHOUSE_CODE_HEADERS = [
+  'كود المخزن',
+  'كود المستودع',
+  'warehouse_code',
+  'Warehouse Code',
+  'warehouseCode',
+];
+
+// Dedicated warehouse name headers
+export const DEDICATED_WAREHOUSE_HEADERS = [
+  'اسم المخزن',
+  'اسم المستودع',
+  'المخزن',
+  'المستودع',
+  'warehouse_name',
+  'Warehouse Name',
+  'warehouseName',
+];
+
+// Dedicated merchant name headers
+export const DEDICATED_MERCHANT_NAME_HEADERS = [
+  'اسم التاجر',
+  'اسم المورد',
+  'التاجر',
+  'المورد',
+  'merchant_name',
+  'Merchant Name',
+  'vendor_name',
+  'Vendor Name',
 ];
 
 /**
  * Extracts the dedicated merchant code from an Excel row object.
  * Strictly preserves leading zeros and text format.
- * Never extracts an 8-digit sequence from product names!
+ * Never extracts warehouse names like 'مخزن Y 21' or 8-digit sequence from product names!
  */
 export function extractMerchantCodeFromRow(row: Record<string, any>): { code: string | null; matchedHeader: string | null } {
   for (const header of DEDICATED_MERCHANT_CODE_HEADERS) {
     if (header in row && row[header] !== undefined && row[header] !== null) {
       const rawVal = row[header];
       const strVal = typeof rawVal === 'string' ? rawVal.trim() : String(rawVal).trim();
-      if (strVal.length > 0) {
+      // Ensure it is not a warehouse name (e.g. 'مخزن Y 21') mistakenly passed
+      if (strVal.length > 0 && !strVal.startsWith('مخزن ') && !strVal.startsWith('مخزن') && strVal !== 'غير محدد') {
         return { code: strVal, matchedHeader: header };
       }
     }
@@ -57,10 +96,10 @@ export function extractMerchantCodeFromRow(row: Record<string, any>): { code: st
   // Also check normalized lowercase keys
   for (const key of Object.keys(row)) {
     const normKey = key.trim().toLowerCase();
-    if (normKey === 'merchant_code' || normKey === 'merchant code' || normKey === 'vendor_code' || normKey === 'كود التاجر') {
+    if (normKey === 'merchant_code' || normKey === 'merchant code' || normKey === 'vendor_code' || normKey === 'vendor code' || normKey === 'كود التاجر' || normKey === 'كود المورد' || normKey === 'merchant_id' || normKey === 'vendor_id') {
       const rawVal = row[key];
       const strVal = typeof rawVal === 'string' ? rawVal.trim() : String(rawVal).trim();
-      if (strVal.length > 0) {
+      if (strVal.length > 0 && !strVal.startsWith('مخزن ') && !strVal.startsWith('مخزن') && strVal !== 'غير محدد') {
         return { code: strVal, matchedHeader: key };
       }
     }
@@ -69,8 +108,53 @@ export function extractMerchantCodeFromRow(row: Record<string, any>): { code: st
   return { code: null, matchedHeader: null };
 }
 
+export function extractWarehouseCodeFromRow(row: Record<string, any>): { code: string | null; matchedHeader: string | null } {
+  for (const header of DEDICATED_WAREHOUSE_CODE_HEADERS) {
+    if (header in row && row[header] !== undefined && row[header] !== null) {
+      const rawVal = row[header];
+      const strVal = typeof rawVal === 'string' ? rawVal.trim() : String(rawVal).trim();
+      if (strVal.length > 0) {
+        return { code: strVal, matchedHeader: header };
+      }
+    }
+  }
+  return { code: null, matchedHeader: null };
+}
+
+export function extractWarehouseNameFromRow(row: Record<string, any>): { name: string | null; matchedHeader: string | null } {
+  for (const header of DEDICATED_WAREHOUSE_HEADERS) {
+    if (header in row && row[header] !== undefined && row[header] !== null) {
+      const rawVal = row[header];
+      const strVal = typeof rawVal === 'string' ? rawVal.trim() : String(rawVal).trim();
+      if (strVal.length > 0) {
+        return { name: strVal, matchedHeader: header };
+      }
+    }
+  }
+  return { name: null, matchedHeader: null };
+}
+
+export function extractMerchantNameFromRow(row: Record<string, any>): { name: string | null; matchedHeader: string | null } {
+  for (const header of DEDICATED_MERCHANT_NAME_HEADERS) {
+    if (header in row && row[header] !== undefined && row[header] !== null) {
+      const rawVal = row[header];
+      const strVal = typeof rawVal === 'string' ? rawVal.trim() : String(rawVal).trim();
+      if (strVal.length > 0) {
+        return { name: strVal, matchedHeader: header };
+      }
+    }
+  }
+  return { name: null, matchedHeader: null };
+}
+
 /**
  * Applies merchant code mappings idempotently to database order_items.
+ * Strictly follows line-level item reconciliation priority:
+ * 1. Line Item ID (vendoor_item_id or id) if specified.
+ * 2. Order ID/Code + SKU (or Product ID) for multi-line orders.
+ * 3. Order ID/Code for single-line orders or order-wide merchant assignments.
+ * Never mixes warehouse names into merchant codes.
+ * Detects and flags conflicting mappings.
  */
 export function applyMerchantCodeMappings(rows: MerchantCodeImportRow[]): MerchantCodeImportReport {
   let validCodesProcessed = 0;
@@ -79,20 +163,66 @@ export function applyMerchantCodeMappings(rows: MerchantCodeImportRow[]): Mercha
   let conflictingMappings = 0;
   const warnings: string[] = [];
 
+  // Update statements by priority
+  const updateByItemId = db.prepare(`
+    UPDATE order_items
+    SET merchant_code = ?,
+        merchant_name = COALESCE(?, merchant_name),
+        warehouse_name = COALESCE(?, warehouse_name),
+        warehouse_code = COALESCE(?, warehouse_code)
+    WHERE (vendoor_item_id = ? OR id = ?)
+  `);
+
+  const updateByOrderAndSku = db.prepare(`
+    UPDATE order_items
+    SET merchant_code = ?,
+        merchant_name = COALESCE(?, merchant_name),
+        warehouse_name = COALESCE(?, warehouse_name),
+        warehouse_code = COALESCE(?, warehouse_code)
+    WHERE order_id IN (
+      SELECT id FROM orders WHERE random_number = ? OR order_no = ? OR vendoor_id = ?
+    ) AND (sku = ? OR sku LIKE ?)
+  `);
+
+  const updateByOrderAndProduct = db.prepare(`
+    UPDATE order_items
+    SET merchant_code = ?,
+        merchant_name = COALESCE(?, merchant_name),
+        warehouse_name = COALESCE(?, warehouse_name),
+        warehouse_code = COALESCE(?, warehouse_code)
+    WHERE order_id IN (
+      SELECT id FROM orders WHERE random_number = ? OR order_no = ? OR vendoor_id = ?
+    ) AND (product_id = ? OR product_name LIKE ?)
+  `);
+
   const updateItemByOrderCode = db.prepare(`
     UPDATE order_items
-    SET merchant_code = ?
+    SET merchant_code = ?,
+        merchant_name = COALESCE(?, merchant_name),
+        warehouse_name = COALESCE(?, warehouse_name),
+        warehouse_code = COALESCE(?, warehouse_code)
     WHERE order_id IN (
       SELECT id FROM orders WHERE random_number = ? OR order_no = ?
-    ) AND (merchant_code != ? OR merchant_code IS NULL)
+    )
   `);
 
   const updateItemByVendoorId = db.prepare(`
     UPDATE order_items
-    SET merchant_code = ?
+    SET merchant_code = ?,
+        merchant_name = COALESCE(?, merchant_name),
+        warehouse_name = COALESCE(?, warehouse_name),
+        warehouse_code = COALESCE(?, warehouse_code)
     WHERE order_id IN (
       SELECT id FROM orders WHERE vendoor_id = ?
-    ) AND (merchant_code != ? OR merchant_code IS NULL)
+    )
+  `);
+
+  const checkConflict = db.prepare(`
+    SELECT merchant_code FROM order_items
+    WHERE order_id IN (
+      SELECT id FROM orders WHERE random_number = ? OR order_no = ? OR vendoor_id = ?
+    ) AND merchant_code IS NOT NULL AND merchant_code != '' AND merchant_code != ?
+    LIMIT 1
   `);
 
   const insertMapping = db.prepare(`
@@ -116,8 +246,15 @@ export function applyMerchantCodeMappings(rows: MerchantCodeImportRow[]): Mercha
       }
 
       // Check if someone accidentally passed an 8-digit product title extraction
-      if (/^\d{8}$/.test(rawCode) && r.productName && r.productName.includes(rawCode) && !r.orderCode && !r.vendorId) {
+      if (/^\d{8}$/.test(rawCode) && r.productName && r.productName.includes(rawCode) && !r.orderCode && !r.vendorId && !r.itemId) {
         warnings.push(`Row ${i + 1}: Rejected potential extracted 8-digit sequence from product title: ${rawCode}`);
+        conflictingMappings++;
+        continue;
+      }
+
+      // Check if code looks like a warehouse name
+      if (rawCode.startsWith('مخزن ') || rawCode === 'غير محدد') {
+        warnings.push(`Row ${i + 1}: Rejected warehouse name passed as merchant code: ${rawCode}`);
         conflictingMappings++;
         continue;
       }
@@ -125,20 +262,46 @@ export function applyMerchantCodeMappings(rows: MerchantCodeImportRow[]): Mercha
       validCodesProcessed++;
 
       // Save mapping record
-      insertMapping.run(rawCode, r.merchantName || null, r.sourceSheetName || 'Excel', r.excelRowIndex || i + 1, null);
+      const noteStr = r.orderCode ? `Order: ${r.orderCode}` : (r.vendorId ? `VendoorID: ${r.vendorId}` : (r.notes || null));
+      insertMapping.run(rawCode, r.merchantName || null, r.sourceSheetName || 'Excel', r.excelRowIndex || i + 1, noteStr);
+
+      // Check for conflict on existing order items
+      if (r.orderCode || r.vendorId) {
+        const conflictRow: any = checkConflict.get(r.orderCode || '', r.orderCode || '', r.vendorId || 0, rawCode);
+        if (conflictRow) {
+          conflictingMappings++;
+          warnings.push(`Row ${i + 1}: Conflicting merchant code ${rawCode} vs existing ${conflictRow.merchant_code} on order ${r.orderCode || r.vendorId}`);
+        }
+      }
 
       let updated = 0;
-      if (r.orderCode) {
-        const res = updateItemByOrderCode.run(rawCode, r.orderCode, r.orderCode, rawCode);
+      // Priority 1: Direct line item ID
+      if (r.itemId) {
+        const res = updateByItemId.run(rawCode, r.merchantName || null, r.warehouseName || null, r.warehouseCode || null, r.itemId, r.itemId);
+        updated += Number(res.changes);
+      }
+      // Priority 2: Order + SKU
+      else if ((r.orderCode || r.vendorId) && r.sku) {
+        const res = updateByOrderAndSku.run(rawCode, r.merchantName || null, r.warehouseName || null, r.warehouseCode || null, r.orderCode || '', r.orderCode || '', r.vendorId || 0, r.sku, `%${r.sku}%`);
+        updated += Number(res.changes);
+      }
+      // Priority 3: Order + Product ID / Name
+      else if ((r.orderCode || r.vendorId) && (r.productId || r.productName)) {
+        const res = updateByOrderAndProduct.run(rawCode, r.merchantName || null, r.warehouseName || null, r.warehouseCode || null, r.orderCode || '', r.orderCode || '', r.vendorId || 0, r.productId || 0, `%${r.productName || ''}%`);
+        updated += Number(res.changes);
+      }
+      // Priority 4: Order level
+      else if (r.orderCode) {
+        const res = updateItemByOrderCode.run(rawCode, r.merchantName || null, r.warehouseName || null, r.warehouseCode || null, r.orderCode, r.orderCode);
         updated += Number(res.changes);
       } else if (r.vendorId) {
-        const res = updateItemByVendoorId.run(rawCode, r.vendorId, rawCode);
+        const res = updateItemByVendoorId.run(rawCode, r.merchantName || null, r.warehouseName || null, r.warehouseCode || null, r.vendorId);
         updated += Number(res.changes);
       }
 
       if (updated > 0) {
         orderItemsEnriched += updated;
-      } else if (r.orderCode || r.vendorId) {
+      } else if (r.orderCode || r.vendorId || r.itemId) {
         unmatchedRecords++;
       }
     }

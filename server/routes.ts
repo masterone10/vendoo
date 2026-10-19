@@ -264,6 +264,8 @@ apiRouter.get('/orders', (req: Request, res: Response) => {
       page = '1',
       limit = '50',
       date,
+      startDate,
+      endDate,
       multiMerchant,
       lowDelivery,
       noExtraPhone,
@@ -277,11 +279,22 @@ apiRouter.get('/orders', (req: Request, res: Response) => {
     const params: any[] = [];
 
     if (status && status !== 'all') {
-      conditions.push('current_status = ?');
-      params.push(status);
+      if (typeof status === 'string' && status.includes(',')) {
+        const statuses = status.split(',').map(s => s.trim()).filter(Boolean);
+        conditions.push(`current_status IN (${statuses.map(() => '?').join(',')})`);
+        params.push(...statuses);
+      } else {
+        conditions.push('current_status = ?');
+        params.push(status);
+      }
     }
 
-    if (date) {
+    if (startDate && endDate) {
+      const sInterval = getCairoDateInterval(startDate as string);
+      const eInterval = getCairoDateInterval(endDate as string);
+      conditions.push('created_at_source >= ? AND created_at_source < ?');
+      params.push(sInterval.startCairo, eInterval.endCairo);
+    } else if (date) {
       const interval = getCairoDateInterval(date as string);
       conditions.push('created_at_source >= ? AND created_at_source < ?');
       params.push(interval.startCairo, interval.endCairo);
@@ -325,8 +338,41 @@ apiRouter.get('/orders', (req: Request, res: Response) => {
       LIMIT ? OFFSET ?
     `).all(...params, pageSize, offset);
 
+    // Enrich with associated warehouse names and merchant codes
+    const orderIds = orders.map(o => o.id);
+    const warehouseMap: Record<number, string[]> = {};
+    const merchantMap: Record<number, string[]> = {};
+    if (orderIds.length > 0) {
+      try {
+        const placeholders = orderIds.map(() => '?').join(',');
+        const itemRows: any[] = db.prepare(`
+          SELECT order_id, merchant_code, warehouse_name, warehouse_code
+          FROM order_items
+          WHERE order_id IN (${placeholders})
+        `).all(...orderIds);
+        for (const row of itemRows) {
+          if (!warehouseMap[row.order_id]) warehouseMap[row.order_id] = [];
+          if (!merchantMap[row.order_id]) merchantMap[row.order_id] = [];
+          const wh = row.warehouse_name || (row.warehouse_code ? `مخزن ${row.warehouse_code}` : null);
+          if (wh && !warehouseMap[row.order_id].includes(wh)) {
+            warehouseMap[row.order_id].push(wh);
+          }
+          if (row.merchant_code && !row.merchant_code.startsWith('مخزن ') && row.merchant_code !== 'غير محدد' && !merchantMap[row.order_id].includes(row.merchant_code)) {
+            merchantMap[row.order_id].push(row.merchant_code);
+          }
+        }
+      } catch {}
+    }
+
+    const enrichedOrders = orders.map(o => ({
+      ...o,
+      warehouseCodes: warehouseMap[o.id] || [],
+      warehouseNames: warehouseMap[o.id] || [],
+      merchantCodes: merchantMap[o.id] || [],
+    }));
+
     res.json({
-      orders,
+      orders: enrichedOrders,
       total,
       page: pageNum,
       limit: pageSize,
@@ -366,11 +412,22 @@ apiRouter.get('/orders/:code', (req: Request, res: Response) => {
     `).all(order.id, order.customer_phone);
 
     const sourceLogs: any[] = db.prepare(`
-      SELECT * FROM canonical_activity_events
-      WHERE order_code = ? OR order_code = ?
-      ORDER BY id DESC
-      LIMIT 50
-    `).all(order.random_number, String(order.vendoor_id));
+      SELECT 
+        c.id, c.order_code, c.actor_name, c.action_type, c.from_status, c.to_status,
+        c.event_timestamp, c.storage_tier, c.is_system_actor, c.created_at,
+        c.order_id, c.order_match_status, c.is_administrative, c.field_name, c.old_value, c.new_value,
+        c.details_json,
+        COALESCE(r.raw_action_text, '') as raw_action_text,
+        r.observed_at as imported_at,
+        r.source_hash,
+        r.page_source,
+        r.vendoor_order_id
+      FROM canonical_activity_events c
+      LEFT JOIN raw_activity_events r ON c.raw_event_id = r.id
+      WHERE c.order_id = ? OR c.order_code = ? OR c.order_code = ?
+      ORDER BY c.event_timestamp DESC, c.id DESC
+      LIMIT 100
+    `).all(order.id, order.random_number, String(order.vendoor_id));
 
     res.json({
       order,
@@ -666,12 +723,24 @@ apiRouter.get('/team/:actorName/events', (req: Request, res: Response) => {
     }
 
     const events: any[] = db.prepare(`
-      SELECT c.*, r.raw_action_text
+      SELECT 
+        c.*, 
+        COALESCE(r.raw_action_text, '') as raw_action_text,
+        r.observed_at as imported_at,
+        r.source_hash,
+        o.order_no,
+        o.current_status as order_current_status,
+        o.customer_name,
+        o.customer_phone,
+        o.governorate,
+        o.total_order,
+        o.distinct_merchant_count
       FROM canonical_activity_events c
       LEFT JOIN raw_activity_events r ON c.raw_event_id = r.id
+      LEFT JOIN orders o ON c.order_id = o.id
       WHERE ${conditions.join(' AND ')}
-      ORDER BY c.id DESC
-      LIMIT 200
+      ORDER BY c.event_timestamp DESC, c.id DESC
+      LIMIT 250
     `).all(...params);
 
     res.json({ actorName, events });
@@ -918,14 +987,15 @@ apiRouter.get('/reports', (req: Request, res: Response) => {
     // Warehouses breakdown in period
     let warehouses: any[] = db.prepare(`
       SELECT 
-        COALESCE(oi.merchant_code, 'غير محدد') as warehouse_code,
+        COALESCE(oi.warehouse_name, 'غير محدد') as warehouse_code,
+        COALESCE(oi.warehouse_name, 'غير محدد') as warehouse_name,
         COUNT(DISTINCT oi.order_id) as orders_count,
         SUM(oi.quantity) as items_quantity,
         COALESCE(SUM(o.total_order), 0) as associated_revenue
       FROM order_items oi
       JOIN orders o ON oi.order_id = o.id
       WHERE o.created_at_source >= ? AND o.created_at_source < ?
-      GROUP BY oi.merchant_code
+      GROUP BY COALESCE(oi.warehouse_name, 'غير محدد')
       ORDER BY items_quantity DESC
       LIMIT 50
     `).all(startTime, endTime);
@@ -933,13 +1003,14 @@ apiRouter.get('/reports', (req: Request, res: Response) => {
     if (warehouses.length === 0) {
       warehouses = db.prepare(`
         SELECT 
-          COALESCE(oi.merchant_code, 'غير محدد') as warehouse_code,
+          COALESCE(oi.warehouse_name, 'غير محدد') as warehouse_code,
+          COALESCE(oi.warehouse_name, 'غير محدد') as warehouse_name,
           COUNT(DISTINCT oi.order_id) as orders_count,
           SUM(oi.quantity) as items_quantity,
           COALESCE(SUM(o.total_order), 0) as associated_revenue
         FROM order_items oi
         JOIN orders o ON oi.order_id = o.id
-        GROUP BY oi.merchant_code
+        GROUP BY COALESCE(oi.warehouse_name, 'غير محدد')
         ORDER BY items_quantity DESC
         LIMIT 50
       `).all();
@@ -1091,7 +1162,7 @@ apiRouter.get('/comparison', (req: Request, res: Response) => {
   }
 });
 
-// 13. System Activity Logs Filter
+// 13. System Activity Logs Filter & Comprehensive Audit Intelligence
 apiRouter.get('/logs', (req: Request, res: Response) => {
   try {
     const {
@@ -1101,7 +1172,10 @@ apiRouter.get('/logs', (req: Request, res: Response) => {
       actor,
       actionType,
       orderCode,
+      matchStatus,
+      isAdministrative,
       search,
+      format,
       limit = '50',
       offset = '0',
     } = req.query;
@@ -1132,42 +1206,213 @@ apiRouter.get('/logs', (req: Request, res: Response) => {
       conditions.push('c.order_code = ?');
       params.push(orderCode);
     }
+    if (matchStatus && matchStatus !== 'all') {
+      conditions.push('c.order_match_status = ?');
+      params.push(matchStatus);
+    }
+    if (isAdministrative && isAdministrative !== 'all') {
+      conditions.push('c.is_administrative = ?');
+      params.push(isAdministrative === '1' ? 1 : 0);
+    }
     if (search && typeof search === 'string' && search.trim()) {
       const term = `%${search.trim()}%`;
-      conditions.push('(c.order_code LIKE ? OR r.raw_action_text LIKE ? OR c.actor_name LIKE ?)');
-      params.push(term, term, term);
+      conditions.push('(c.order_code LIKE ? OR r.raw_action_text LIKE ? OR c.actor_name LIKE ? OR o.customer_name LIKE ? OR o.customer_phone LIKE ? OR o.order_no LIKE ? OR c.field_name LIKE ? OR c.new_value LIKE ?)');
+      params.push(term, term, term, term, term, term, term, term);
     }
 
     const whereClause = conditions.length > 0 ? `WHERE ${conditions.join(' AND ')}` : '';
-    const limitNum = Math.min(200, Math.max(1, parseInt(limit as string, 10)));
+    const limitNum = Math.min(500, Math.max(1, parseInt(limit as string, 10)));
     const offsetNum = Math.max(0, parseInt(offset as string, 10));
+
+    // Support CSV Export
+    if (format === 'csv') {
+      const allRows: any[] = db.prepare(`
+        SELECT 
+          c.id, c.event_timestamp, c.actor_name, c.action_type, c.order_code,
+          c.field_name, c.old_value, c.new_value, c.from_status, c.to_status,
+          c.order_match_status, c.is_administrative,
+          COALESCE(r.raw_action_text, '') as raw_action_text,
+          r.observed_at as imported_at,
+          r.source_hash,
+          o.order_no, o.current_status as order_status, o.customer_name, o.customer_phone,
+          o.governorate, o.total_order
+        FROM canonical_activity_events c
+        LEFT JOIN raw_activity_events r ON c.raw_event_id = r.id
+        LEFT JOIN orders o ON c.order_id = o.id
+        ${whereClause}
+        ORDER BY c.event_timestamp DESC, c.id DESC
+        LIMIT 5000
+      `).all(...params);
+
+      const header = ['المعرف', 'توقيت الحدث', 'اسم المنفذ', 'نوع الإجراء', 'كود الطلب', 'رقم الطلب', 'اسم العميل', 'رقم الهاتف', 'حالة الطلب', 'الحقل المعدل', 'القيمة السابقة', 'القيمة الجديدة', 'نص الحركة الأصلي الكامل', 'حالة الربط', 'توقيت الاستيراد'];
+      const escapeCsv = (str: any) => {
+        if (str === null || str === undefined) return '""';
+        const s = String(str).replace(/"/g, '""');
+        return `"${s}"`;
+      };
+
+      const csvLines = [
+        header.map(escapeCsv).join(','),
+        ...allRows.map(row => [
+          row.id,
+          row.event_timestamp,
+          row.actor_name,
+          row.action_type,
+          row.order_code || 'عام',
+          row.order_no || 'غير متوفر',
+          row.customer_name || 'غير متوفر',
+          row.customer_phone || 'غير متوفر',
+          row.order_status || 'غير متوفر',
+          row.field_name || 'غير متوفر',
+          row.old_value || 'غير متوفر',
+          row.new_value || 'غير متوفر',
+          row.raw_action_text,
+          row.order_match_status === 'MATCHED' ? 'مرتبط بطلب' : row.order_match_status === 'GENERAL_LOG' ? 'حركة عامة' : 'غير مرتبط',
+          row.imported_at || 'غير متوفر',
+        ].map(escapeCsv).join(',')),
+      ];
+
+      res.setHeader('Content-Type', 'text/csv; charset=utf-8');
+      res.setHeader('Content-Disposition', `attachment; filename="vendoor_logs_${Date.now()}.csv"`);
+      res.send('\uFEFF' + csvLines.join('\r\n'));
+      return;
+    }
 
     const total = (
       db.prepare(`
         SELECT COUNT(*) as c
         FROM canonical_activity_events c
         LEFT JOIN raw_activity_events r ON c.raw_event_id = r.id
+        LEFT JOIN orders o ON c.order_id = o.id
         ${whereClause}
       `).get(...params) as any
     )?.c || 0;
 
     const logs: any[] = db.prepare(`
       SELECT 
-        c.id, c.order_code, c.actor_name, c.action_type, c.from_status, c.to_status,
+        c.id, c.raw_event_id, c.order_code, c.actor_name, c.action_type, c.from_status, c.to_status,
         c.event_timestamp, c.storage_tier, c.is_system_actor, c.created_at,
-        COALESCE(r.raw_action_text, '') as raw_action_text
+        c.order_id, c.order_match_status, c.is_administrative, c.field_name, c.old_value, c.new_value,
+        c.details_json,
+        COALESCE(r.raw_action_text, '') as raw_action_text,
+        r.observed_at as imported_at,
+        r.source_hash,
+        r.page_source,
+        r.vendoor_order_id,
+        o.order_no,
+        o.current_status as order_current_status,
+        o.customer_name,
+        o.customer_phone,
+        o.customer_phone_extra,
+        o.governorate,
+        o.address as order_address,
+        o.total_order,
+        o.affiliate_name,
+        o.affiliate_code,
+        o.distinct_merchant_count,
+        o.delivery_rate
       FROM canonical_activity_events c
       LEFT JOIN raw_activity_events r ON c.raw_event_id = r.id
+      LEFT JOIN orders o ON c.order_id = o.id
       ${whereClause}
       ORDER BY c.event_timestamp DESC, c.id DESC
       LIMIT ? OFFSET ?
     `).all(...params, limitNum, offsetNum);
 
-    res.json({ logs, total, limit: limitNum, offset: offsetNum });
+    // Compute high-level KPI stats for logs
+    const todayCairo = getCairoDateString();
+    const todayInterval = getCairoDateInterval(todayCairo);
+
+    const statsRow = db.prepare(`
+      SELECT 
+        COUNT(*) as total,
+        COUNT(CASE WHEN event_timestamp >= ? AND event_timestamp < ? THEN 1 END) as todayLogs,
+        COUNT(DISTINCT actor_name) as activeEmployees,
+        COUNT(CASE WHEN order_id IS NOT NULL THEN 1 END) as matchedWithOrders,
+        COUNT(CASE WHEN is_administrative = 1 THEN 1 END) as administrativeLogs,
+        COUNT(CASE WHEN order_match_status = 'UNRESOLVED' THEN 1 END) as unresolvedLogs,
+        COUNT(CASE WHEN action_type = 'status_change' THEN 1 END) as statusChangesCount,
+        COUNT(CASE WHEN action_type = 'note_added' THEN 1 END) as notesCount,
+        COUNT(CASE WHEN action_type = 'address_edit' THEN 1 END) as addressEditsCount,
+        COUNT(CASE WHEN action_type = 'phone_edit' THEN 1 END) as phoneEditsCount
+      FROM canonical_activity_events
+    `).get(todayInterval.startCairo, todayInterval.endCairo) as any;
+
+    const stats = {
+      total: statsRow?.total || 0,
+      todayLogs: statsRow?.todayLogs || 0,
+      activeEmployees: statsRow?.activeEmployees || 0,
+      matchedWithOrders: statsRow?.matchedWithOrders || 0,
+      administrativeLogs: statsRow?.administrativeLogs || 0,
+      unresolvedLogs: statsRow?.unresolvedLogs || 0,
+      statusChangesCount: statsRow?.statusChangesCount || 0,
+      notesCount: statsRow?.notesCount || 0,
+      addressEditsCount: statsRow?.addressEditsCount || 0,
+      phoneEditsCount: statsRow?.phoneEditsCount || 0,
+    };
+
+    res.json({ logs, total, limit: limitNum, offset: offsetNum, stats });
   } catch (err: any) {
     res.status(500).json({ error: err.message });
   }
 });
+
+// Single Log Detail Inspector (returns full raw and linked data)
+apiRouter.get('/logs/:id', (req: Request, res: Response) => {
+  try {
+    const logId = parseInt(req.params.id, 10);
+    const log: any = db.prepare(`
+      SELECT 
+        c.*,
+        COALESCE(r.raw_action_text, '') as raw_action_text,
+        r.observed_at as imported_at,
+        r.source_hash,
+        r.page_source,
+        r.vendoor_order_id,
+        r.raw_html,
+        o.id as linked_order_id,
+        o.random_number,
+        o.order_no,
+        o.current_status as order_current_status,
+        o.customer_name,
+        o.customer_phone,
+        o.customer_phone_extra,
+        o.extra_phone_valid,
+        o.governorate,
+        o.address as order_address,
+        o.total_order,
+        o.total_price,
+        o.shipping_cost,
+        o.affiliate_name,
+        o.affiliate_code,
+        o.distinct_merchant_count,
+        o.delivery_rate,
+        o.delivery_rate_num,
+        o.delivery_rate_denom,
+        o.created_at_source as order_created_at
+      FROM canonical_activity_events c
+      LEFT JOIN raw_activity_events r ON c.raw_event_id = r.id
+      LEFT JOIN orders o ON c.order_id = o.id
+      WHERE c.id = ?
+    `).get(logId);
+
+    if (!log) {
+      res.status(404).json({ error: 'Log entry not found' });
+      return;
+    }
+
+    let items: any[] = [];
+    if (log.linked_order_id) {
+      items = db.prepare('SELECT * FROM order_items WHERE order_id = ?').all(log.linked_order_id);
+    }
+
+    res.json({ log, items });
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+
 
 // Explicit Period Logs Fetch & Save Action: «جلب وحفظ لوجز الفترة»
 apiRouter.post('/logs/fetch-period', async (req: Request, res: Response) => {
@@ -1402,7 +1647,7 @@ apiRouter.get('/reports/export', (req: Request, res: Response) => {
         o.vendoor_id, o.random_number, o.order_no, o.current_status,
         o.customer_name, o.customer_phone, o.customer_phone_extra,
         o.governorate, o.address, o.total_order, o.delivery_rate, o.created_at_source,
-        i.product_name, i.merchant_code, i.quantity
+        i.product_name, i.warehouse_name, i.merchant_code, i.sku, i.quantity
       FROM orders o
       LEFT JOIN order_items i ON o.id = i.order_id
       WHERE ${conditions.join(' AND ')}
@@ -1414,7 +1659,7 @@ apiRouter.get('/reports/export', (req: Request, res: Response) => {
       'Vendoor ID', 'Random Code', 'Order No', 'Status',
       'Customer Name', 'Phone', 'Extra Phone', 'Governorate',
       'Address', 'Total Order', 'Delivery Rate', 'Created At',
-      'Product Name', 'Merchant Code (Text)', 'Quantity'
+      'Product Name', 'Warehouse Name', 'Merchant Code (Text)', 'SKU', 'Quantity'
     ];
 
     const escapeCsv = (val: any) => {
@@ -1439,7 +1684,9 @@ apiRouter.get('/reports/export', (req: Request, res: Response) => {
         escapeCsv(r.delivery_rate !== null ? `${r.delivery_rate}%` : 'N/A'),
         escapeCsv(r.created_at_source),
         escapeCsv(r.product_name),
+        escapeCsv(r.warehouse_name || ''),
         escapeCsv(r.merchant_code || ''),
+        escapeCsv(r.sku || ''),
         escapeCsv(r.quantity || 1)
       ].join(','));
     }

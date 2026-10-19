@@ -15,6 +15,7 @@ import {
   ConfirmationRow,
   LogEntry,
 } from './vendoorClient.js';
+import { parseLogActionDetails } from './logDetailsParser.js';
 
 export interface ConfirmationAgeSyncStatus {
   state: 'SUCCESS' | 'PARTIAL' | 'STALE' | 'NOT_AVAILABLE';
@@ -480,15 +481,16 @@ export class SyncEngine {
     const insertItemStmt = db.prepare(`
       INSERT INTO order_items (
         order_id, vendoor_item_id, product_id, product_name, merchant_code,
-        sku, size, color, quantity, unit_price, pay_vendor, image_path, raw_json, created_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        warehouse_name, warehouse_code, sku, size, color, quantity, unit_price, pay_vendor, image_path, raw_json, created_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `);
 
     const updateItemStmt = db.prepare(`
       UPDATE order_items SET
         product_name = ?,
-        merchant_code = ?,
+        merchant_code = COALESCE(?, merchant_code),
         warehouse_name = ?,
+        warehouse_code = ?,
         sku = ?,
         size = ?,
         color = ?,
@@ -502,6 +504,20 @@ export class SyncEngine {
     for (const p of products) {
       const warehouse = extractWarehouseFromProduct(p);
       if (warehouse) warehouseSet.add(warehouse);
+      const warehouseCode = warehouse ? warehouse.replace(/^مخزن\s*/, '').trim() : null;
+
+      // Extract genuine merchant code ONLY if explicitly provided in source as merchant/vendor code
+      // Never guess, never extract from product name, SKU, or warehouse name!
+      let genuineMerchantCode: string | null = null;
+      if (p.merchant_code && typeof p.merchant_code === 'string' && !p.merchant_code.startsWith('مخزن ') && p.merchant_code !== 'غير محدد') {
+        genuineMerchantCode = p.merchant_code.trim();
+      } else if (p.vendor_code && typeof p.vendor_code === 'string' && !p.vendor_code.startsWith('مخزن ') && p.vendor_code !== 'غير محدد') {
+        genuineMerchantCode = p.vendor_code.trim();
+      } else if (p.pivot?.merchant_code && typeof p.pivot.merchant_code === 'string' && !p.pivot.merchant_code.startsWith('مخزن ') && p.pivot.merchant_code !== 'غير محدد') {
+        genuineMerchantCode = p.pivot.merchant_code.trim();
+      } else if (p.pivot?.vendor_id && String(p.pivot.vendor_id).trim()) {
+        genuineMerchantCode = String(p.pivot.vendor_id).trim();
+      }
 
       const itemId = p.pivot?.id || null;
       const unitPrice = parseFloat(p.pivot?.price || '0') || 0;
@@ -511,13 +527,14 @@ export class SyncEngine {
       const sku = p.pivot?.code || null;
       const size = p.pivot?.size || null;
       const color = p.pivot?.color || null;
-      const warehouseDisplay = warehouse || 'غير محدد';
 
       if (itemId && existingMap.has(itemId)) {
         seenIds.add(itemId);
         const curr = existingMap.get(itemId);
-        if (curr.quantity !== qty || curr.unit_price !== unitPrice || curr.product_name !== productName || curr.merchant_code !== warehouseDisplay) {
-          updateItemStmt.run(productName, warehouseDisplay, warehouse, sku, size, color, qty, unitPrice, payVendor, p.image_path || null, curr.id);
+        const existingMerchantCode = curr.merchant_code && !curr.merchant_code.startsWith('مخزن ') && curr.merchant_code !== 'غير محدد' ? curr.merchant_code : null;
+        const finalMerchantCode = genuineMerchantCode || existingMerchantCode;
+        if (curr.quantity !== qty || curr.unit_price !== unitPrice || curr.product_name !== productName || curr.warehouse_name !== warehouse || curr.merchant_code !== finalMerchantCode) {
+          updateItemStmt.run(productName, finalMerchantCode, warehouse, warehouseCode, sku, size, color, qty, unitPrice, payVendor, p.image_path || null, curr.id);
         }
       } else {
         insertItemStmt.run(
@@ -525,7 +542,9 @@ export class SyncEngine {
           itemId,
           p.id || null,
           productName,
-          warehouseDisplay,
+          genuineMerchantCode,
+          warehouse,
+          warehouseCode,
           sku,
           size,
           color,
@@ -1476,15 +1495,23 @@ export class SyncEngine {
       const insertRawStmt = db.prepare(`
         INSERT OR IGNORE INTO raw_activity_events (
           source_hash, order_code, actor_name, raw_action_text,
-          event_timestamp, storage_tier, observed_at, page_source
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+          event_timestamp, storage_tier, observed_at, page_source,
+          vendoor_order_id, raw_html, details_json
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       `);
 
       const insertCanonicalStmt = db.prepare(`
         INSERT INTO canonical_activity_events (
           raw_event_id, order_code, actor_name, action_type,
-          from_status, to_status, event_timestamp, storage_tier, is_system_actor, created_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+          from_status, to_status, event_timestamp, storage_tier, is_system_actor, created_at,
+          order_id, order_match_status, is_administrative, field_name, old_value, new_value, details_json
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `);
+
+      const findOrderStmt = db.prepare(`
+        SELECT id FROM orders 
+        WHERE random_number = ? OR order_no = ? OR CAST(vendoor_id AS TEXT) = ?
+        LIMIT 1
       `);
 
       let totalLogs = 0;
@@ -1501,6 +1528,9 @@ export class SyncEngine {
             const sourceHash = crypto.createHash('sha256').update(hashInput).digest('hex');
             const logTier = isDateInHot(entry.eventTimestamp) ? 'HOT' : 'COLD';
 
+            const parsed = parseLogActionDetails(rawText, entry.actorName || '', entry.orderCode || '');
+            const detailsJson = JSON.stringify(parsed);
+
             const rawResult = insertRawStmt.run(
               sourceHash,
               entry.orderCode || null,
@@ -1509,26 +1539,48 @@ export class SyncEngine {
               entry.eventTimestamp,
               logTier,
               nowIso,
-              'log/system'
+              'log/system',
+              entry.vendoorOrderId || null,
+              entry.rawHtml || null,
+              detailsJson
             );
 
             if (rawResult.changes > 0) {
               newOnPage++;
               const rawId = Number(rawResult.lastInsertRowid);
-              const { actionType, fromStatus, toStatus } = this.classifyAction(rawText);
               const isSystem = (entry.actorName || '').toLowerCase().includes('system') || (entry.actorName || '').includes('تلقائي') || (entry.actorName || '').includes('النظام') ? 1 : 0;
+
+              // Check if matches an order
+              let matchedOrderId: number | null = null;
+              let matchStatus = 'UNRESOLVED';
+              if (!entry.orderCode) {
+                matchStatus = 'GENERAL_LOG';
+              } else {
+                const ordRow: any = findOrderStmt.get(entry.orderCode, entry.orderCode, entry.orderCode);
+                if (ordRow) {
+                  matchedOrderId = ordRow.id;
+                  matchStatus = 'MATCHED';
+                }
+              }
 
               insertCanonicalStmt.run(
                 rawId,
                 entry.orderCode || null,
                 entry.actorName || 'غير معروف',
-                actionType,
-                fromStatus,
-                toStatus,
+                parsed.actionType,
+                parsed.fromStatus,
+                parsed.toStatus,
                 entry.eventTimestamp,
                 logTier,
                 isSystem,
-                nowIso
+                nowIso,
+                matchedOrderId,
+                matchStatus,
+                parsed.isAdministrative ? 1 : 0,
+                parsed.fieldName,
+                parsed.oldValue,
+                parsed.newValue,
+                detailsJson
               );
               newCanonicalCount++;
             }
@@ -2129,11 +2181,15 @@ export class SyncEngine {
           const hashInput = `${entry.orderCode}_${entry.actorName}_${rawText}_${entry.eventTimestamp}`;
           const sourceHash = crypto.createHash('sha256').update(hashInput).digest('hex');
 
+          const parsed = parseLogActionDetails(rawText, entry.actorName || '', entry.orderCode || '');
+          const detailsJson = JSON.stringify(parsed);
+
           const rawResult = db.prepare(`
             INSERT OR IGNORE INTO raw_activity_events (
               source_hash, order_code, actor_name, raw_action_text,
-              event_timestamp, storage_tier, observed_at, page_source
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+              event_timestamp, storage_tier, observed_at, page_source,
+              vendoor_order_id, raw_html, details_json
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
           `).run(
             sourceHash,
             entry.orderCode || null,
@@ -2142,30 +2198,52 @@ export class SyncEngine {
             entry.eventTimestamp,
             storageTier,
             nowIso,
-            'log/historical'
+            'log/historical',
+            entry.vendoorOrderId || null,
+            entry.rawHtml || null,
+            detailsJson
           );
 
           if (rawResult.changes > 0) {
             const rawId = Number(rawResult.lastInsertRowid);
-            const { actionType, fromStatus, toStatus } = this.classifyAction(rawText);
             const isSystem = (entry.actorName || '').toLowerCase().includes('system') || (entry.actorName || '').includes('تلقائي') || (entry.actorName || '').includes('النظام') ? 1 : 0;
+
+            let matchedOrderId: number | null = null;
+            let matchStatus = 'UNRESOLVED';
+            if (!entry.orderCode) {
+              matchStatus = 'GENERAL_LOG';
+            } else {
+              const ordRow: any = db.prepare('SELECT id FROM orders WHERE random_number = ? OR order_no = ? OR CAST(vendoor_id AS TEXT) = ? LIMIT 1').get(entry.orderCode, entry.orderCode, entry.orderCode);
+              if (ordRow) {
+                matchedOrderId = ordRow.id;
+                matchStatus = 'MATCHED';
+              }
+            }
 
             db.prepare(`
               INSERT INTO canonical_activity_events (
                 raw_event_id, order_code, actor_name, action_type,
-                from_status, to_status, event_timestamp, storage_tier, is_system_actor, created_at
-              ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                from_status, to_status, event_timestamp, storage_tier, is_system_actor, created_at,
+                order_id, order_match_status, is_administrative, field_name, old_value, new_value, details_json
+              ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             `).run(
               rawId,
               entry.orderCode || null,
               entry.actorName || 'غير معروف',
-              actionType,
-              fromStatus,
-              toStatus,
+              parsed.actionType,
+              parsed.fromStatus,
+              parsed.toStatus,
               entry.eventTimestamp,
               storageTier,
               isSystem,
-              nowIso
+              nowIso,
+              matchedOrderId,
+              matchStatus,
+              parsed.isAdministrative ? 1 : 0,
+              parsed.fieldName,
+              parsed.oldValue,
+              parsed.newValue,
+              detailsJson
             );
             recordsSaved++;
           }
@@ -2221,7 +2299,7 @@ export class SyncEngine {
       const items: any[] = db.prepare('SELECT product_name, merchant_code, warehouse_name FROM order_items WHERE order_id = ?').all(ord.id);
       const warehouses = new Set<string>();
       for (const it of items) {
-        const w = extractWarehouseFromProduct({ name: it.product_name, warehouse_name: it.warehouse_name || it.merchant_code } as any);
+        const w = it.warehouse_name || extractWarehouseFromProduct({ name: it.product_name } as any);
         if (w) warehouses.add(w);
       }
       const distinctList = Array.from(warehouses);

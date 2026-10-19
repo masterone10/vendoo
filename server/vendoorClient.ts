@@ -82,6 +82,9 @@ export interface LogEntry {
   actorName: string;
   rawActionText: string;
   eventTimestamp: string;
+  vendoorOrderId?: number | null;
+  orderHref?: string | null;
+  rawHtml?: string | null;
 }
 
 class VendoorClient {
@@ -553,17 +556,24 @@ class VendoorClient {
         continue;
       }
 
-      const tds = [...content.matchAll(/<td[^>]*>([\s\S]*?)<\/td>/gi)].map(m =>
-        m[1].replace(/<[^>]+>/g, '').trim()
-      );
+      const rawTds = [...content.matchAll(/<td[^>]*>([\s\S]*?)<\/td>/gi)];
+      const tds = rawTds.map(m => m[1].replace(/<[^>]+>/g, '').trim());
 
       if (tds.length >= 5) {
+        const orderTdHtml = rawTds[1]?.[1] || '';
+        const orderHrefMatch = orderTdHtml.match(/href=["']([^"']+)["']/i);
+        const orderIdMatch = orderTdHtml.match(/orders\/(\d+)/i);
+        const extractedOrderId = orderIdMatch ? parseInt(orderIdMatch[1], 10) : null;
+
         entries.push({
           index: parseInt(tds[0], 10) || 0,
           orderCode: tds[1],
           actorName: tds[2],
           rawActionText: tds[3],
           eventTimestamp: tds[4],
+          vendoorOrderId: extractedOrderId,
+          orderHref: orderHrefMatch ? orderHrefMatch[1] : null,
+          rawHtml: match[0],
         });
       }
     }

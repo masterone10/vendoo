@@ -2,6 +2,7 @@ import crypto from 'node:crypto';
 import { db, getCairoDateInterval, isDateInHot } from './db.js';
 import { vendoorClient } from './vendoorClient.js';
 import { syncEngine } from './syncEngine.js';
+import { parseLogActionDetails } from './logDetailsParser.js';
 
 export interface LogBackfillState {
   date: string;
@@ -51,22 +52,27 @@ export function persistLogEntries(
   const nowIso = new Date().toISOString();
 
   const insertRawStmt = db.prepare(`
-    INSERT INTO raw_activity_events (source_hash, order_code, actor_name, raw_action_text, event_timestamp, storage_tier, observed_at, page_source)
-    VALUES (?, ?, ?, ?, ?, ?, ?, 'log/system')
+    INSERT INTO raw_activity_events (
+      source_hash, order_code, actor_name, raw_action_text,
+      event_timestamp, storage_tier, observed_at, page_source,
+      vendoor_order_id, raw_html, details_json
+    )
+    VALUES (?, ?, ?, ?, ?, ?, ?, 'log/system', ?, ?, ?)
     ON CONFLICT(source_hash) DO NOTHING
   `);
 
   const insertCanonStmt = db.prepare(`
     INSERT INTO canonical_activity_events (
       raw_event_id, order_code, actor_name, action_type, from_status, to_status,
-      event_timestamp, storage_tier, is_system_actor, created_at
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      event_timestamp, storage_tier, is_system_actor, created_at,
+      order_id, order_match_status, is_administrative, field_name, old_value, new_value, details_json
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
   `);
 
   const findOrderStmt = db.prepare(`
     SELECT id, random_number, current_status
     FROM orders
-    WHERE random_number = ? OR order_no = ?
+    WHERE random_number = ? OR order_no = ? OR CAST(vendoor_id AS TEXT) = ?
     LIMIT 1
   `);
 
@@ -88,10 +94,24 @@ export function persistLogEntries(
 
     const logTier = isDateInHot(eventTime) ? 'HOT' : 'COLD';
 
+    const parsed = parseLogActionDetails(rawActionText, actorName, orderCode || '');
+    const detailsJson = JSON.stringify(parsed);
+
     // 1. Insert into raw_activity_events
     let rawEventId: number | null = null;
     try {
-      const res = insertRawStmt.run(sourceHash, orderCode, actorName, rawActionText, eventTime, logTier, nowIso);
+      const res = insertRawStmt.run(
+        sourceHash,
+        orderCode,
+        actorName,
+        rawActionText,
+        eventTime,
+        logTier,
+        nowIso,
+        entry.vendoorOrderId || null,
+        entry.rawHtml || null,
+        detailsJson
+      );
       if (res.changes > 0) {
         rawEventId = Number(res.lastInsertRowid);
       } else {
@@ -104,8 +124,6 @@ export function persistLogEntries(
       duplicates++;
     }
 
-    // 2. Parse canonical details via syncEngine classifier
-    const parsed = syncEngine.classifyAction(rawActionText);
     const isSystem = (
       actorName === 'النظام' ||
       actorName.toLowerCase() === 'system' ||
@@ -121,6 +139,19 @@ export function persistLogEntries(
 
     if (!existingCanon) {
       try {
+        let matchedOrderId: number | null = null;
+        let matchStatus = 'UNRESOLVED';
+        let ord: any = null;
+        if (!orderCode) {
+          matchStatus = 'GENERAL_LOG';
+        } else {
+          ord = findOrderStmt.get(orderCode, orderCode, orderCode);
+          if (ord) {
+            matchedOrderId = ord.id;
+            matchStatus = 'MATCHED';
+          }
+        }
+
         const insRes = insertCanonStmt.run(
           rawEventId,
           orderCode,
@@ -131,16 +162,21 @@ export function persistLogEntries(
           eventTime,
           logTier,
           isSystem,
-          nowIso
+          nowIso,
+          matchedOrderId,
+          matchStatus,
+          parsed.isAdministrative ? 1 : 0,
+          parsed.fieldName,
+          parsed.oldValue,
+          parsed.newValue,
+          detailsJson
         );
 
         if (insRes.changes > 0) {
           saved++;
 
           // 3. If event provides verified status change and matches an existing order, link timeline
-          if (orderCode && parsed.actionType === 'status_change' && parsed.toStatus) {
-            const ord: any = findOrderStmt.get(orderCode, orderCode);
-            if (ord) {
+          if (orderCode && parsed.actionType === 'status_change' && parsed.toStatus && ord) {
               db.prepare(`
                 INSERT INTO order_status_events (
                   order_id, random_number, from_status, to_status, actor_name,
@@ -167,7 +203,6 @@ export function persistLogEntries(
               `).run(parsed.toStatus, nowIso, ord.id, eventTime);
             }
           }
-        }
       } catch (err: any) {
         // Safe duplicate or constraint handling
       }

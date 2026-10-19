@@ -11,9 +11,14 @@ import {
   ShieldAlert,
   RotateCw,
   ExternalLink,
+  Tag,
+  CheckCircle2,
+  Eye,
+  MessageSquare,
 } from 'lucide-react';
-import { Order, OrderItem, Alert } from '../types';
+import { Order, OrderItem, Alert, SystemLogEvent } from '../types';
 import { isLowDeliveryRate } from '../utils/delivery';
+import { LogDetailsModal } from './LogDetailsModal';
 
 interface OrderDetailsModalProps {
   orderCode: string | null;
@@ -256,14 +261,14 @@ export const OrderDetailsModal: React.FC<OrderDetailsModalProps> = ({ orderCode,
                 </div>
               </div>
 
-              {/* Products Table with Merchant Codes */}
+              {/* Products Table with Dedicated Merchant Codes and Warehouse Names */}
               <div className="space-y-3">
                 <div className="flex items-center justify-between">
                   <h4 className="font-bold text-slate-200 flex items-center gap-2">
                     <ShoppingBag className="w-4 h-4 text-amber-400" />
-                    <span>أصناف الطلب وتوزيع المخازن ({items.length} صنف)</span>
+                    <span>أصناف الطلب وتوزيع المخازن والتجار ({items.length} صنف)</span>
                   </h4>
-                  <span className="text-slate-400">
+                  <span className="text-slate-400 text-xs">
                     عدد المخازن المميزة: <strong className="text-amber-400 font-mono">{order.distinct_merchant_count}</strong>
                   </span>
                 </div>
@@ -274,8 +279,10 @@ export const OrderDetailsModal: React.FC<OrderDetailsModalProps> = ({ orderCode,
                       <tr className="border-b border-slate-800 bg-slate-950/80 text-slate-400">
                         <th className="py-2.5 px-3">م</th>
                         <th className="py-2.5 px-3">اسم الصنف</th>
-                        <th className="py-2.5 px-3">كود المخزن</th>
-                        <th className="py-2.5 px-3">الكود / SKU</th>
+                        <th className="py-2.5 px-3">كود الصنف / SKU</th>
+                        <th className="py-2.5 px-3">كود التاجر (Merchant Code)</th>
+                        <th className="py-2.5 px-3">كود المستودع</th>
+                        <th className="py-2.5 px-3">اسم المستودع</th>
                         <th className="py-2.5 px-3">اللون</th>
                         <th className="py-2.5 px-3">المقاس</th>
                         <th className="py-2.5 px-3">الكمية</th>
@@ -290,10 +297,40 @@ export const OrderDetailsModal: React.FC<OrderDetailsModalProps> = ({ orderCode,
                           <td className="py-2.5 px-3 font-sans font-medium text-slate-200">
                             {item.product_name}
                           </td>
-                          <td className="py-2.5 px-3 font-sans font-bold text-rose-400">
-                            {item.merchant_code}
+                          <td className="py-2.5 px-3 text-slate-300 font-mono text-[11px]">{item.sku || '—'}</td>
+                          <td className="py-2.5 px-3 font-mono font-bold">
+                            {item.merchant_code && item.merchant_code.trim().length > 0 && !item.merchant_code.startsWith('مخزن ') && item.merchant_code !== 'غير محدد' ? (
+                              <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded bg-amber-950/70 border border-amber-500/60 text-amber-300 text-xs shadow-xs">
+                                {item.merchant_code}
+                              </span>
+                            ) : (
+                              <span
+                                className="inline-flex items-center gap-1 px-2 py-0.5 rounded bg-slate-900 border border-slate-700/60 text-slate-400 font-sans text-[11px]"
+                                title="كود التاجر غير متوفر في مصدر الطلب الأصلي - بانتظار استيراد ملف أكواد التجار المعتمد"
+                              >
+                                <span className="w-1.5 h-1.5 rounded-full bg-slate-500"></span>
+                                غير متوفر
+                              </span>
+                            )}
                           </td>
-                          <td className="py-2.5 px-3 text-slate-400">{item.sku || '—'}</td>
+                          <td className="py-2.5 px-3 font-mono">
+                            {item.warehouse_code ? (
+                              <span className="px-2 py-0.5 rounded bg-slate-900 border border-slate-700/60 text-sky-300 font-bold text-xs">
+                                {item.warehouse_code}
+                              </span>
+                            ) : (
+                              <span className="text-slate-500">—</span>
+                            )}
+                          </td>
+                          <td className="py-2.5 px-3 font-sans">
+                            {item.warehouse_name ? (
+                              <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded bg-sky-950/60 border border-sky-800/70 text-sky-300 font-semibold text-[11px]">
+                                {item.warehouse_name}
+                              </span>
+                            ) : (
+                              <span className="text-slate-500 font-normal">غير محدد</span>
+                            )}
+                          </td>
                           <td className="py-2.5 px-3 font-sans text-slate-300">{item.color || '—'}</td>
                           <td className="py-2.5 px-3 font-sans text-slate-300">{item.size || '—'}</td>
                           <td className="py-2.5 px-3 text-slate-200">{item.quantity}</td>
@@ -305,6 +342,20 @@ export const OrderDetailsModal: React.FC<OrderDetailsModalProps> = ({ orderCode,
                       ))}
                     </tbody>
                   </table>
+                </div>
+
+                <div className="flex flex-wrap items-center justify-between gap-2 text-[11px] text-slate-400 px-1 border-b border-slate-800/60 pb-2">
+                  <div className="flex items-center gap-3">
+                    <span className="inline-flex items-center gap-1 text-sky-400">
+                      <span className="w-1.5 h-1.5 rounded-full bg-sky-400"></span>
+                      <strong>اسم وكود المستودع:</strong> موثقان من بيانات الأصناف الأصلية
+                    </span>
+                    <span>·</span>
+                    <span className="inline-flex items-center gap-1 text-amber-400">
+                      <span className="w-1.5 h-1.5 rounded-full bg-amber-400"></span>
+                      <strong>كود التاجر (Merchant Code):</strong> خاص بالتاجر المعتمد (لا يُشتق من اسم المخزن أو الصنف)
+                    </span>
+                  </div>
                 </div>
 
                 <div className="flex justify-end gap-6 text-xs text-slate-300 pt-1 font-mono">

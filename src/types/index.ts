@@ -4,7 +4,11 @@ export interface OrderItem {
   vendoor_item_id: number | null;
   product_id: number | null;
   product_name: string;
-  merchant_code: string;
+  merchant_code: string | null;
+  merchant_name?: string | null;
+  warehouse_name?: string | null;
+  warehouse_code?: string | null;
+  code_source?: string | null;
   merchant_id: string | null;
   sku: string | null;
   size: string | null;
@@ -52,6 +56,9 @@ export interface Order {
   state_entry_at: string | null;
   created_at_source: string;
   last_observed_at: string;
+  warehouseCodes?: string[];
+  warehouseNames?: string[];
+  merchantCodes?: string[];
 }
 
 export interface Alert {
@@ -177,3 +184,70 @@ export interface TeamMember {
   cancelPercent?: number;
   otherPercent?: number;
 }
+
+export interface SystemLogEvent {
+  id: number;
+  raw_event_id: number | null;
+  order_code: string | null;
+  actor_name: string;
+  action_type: string;
+  action_label_ar?: string;
+  field_name: string | null;
+  old_value: string | null;
+  new_value: string | null;
+  note_text?: string | null;
+  from_status: string | null;
+  to_status: string | null;
+  event_timestamp: string;
+  storage_tier: 'HOT' | 'COLD';
+  is_system_actor: number;
+  created_at: string;
+  imported_at?: string;
+  raw_action_text: string;
+  source_hash?: string;
+  page_source?: string;
+  vendoor_order_id?: number | null;
+  order_id?: number | null;
+  order_match_status?: 'MATCHED' | 'UNRESOLVED' | 'GENERAL_LOG';
+  is_administrative?: number;
+  details_json?: string | null;
+  // Enriched order data if matched
+  order_no?: string | null;
+  order_current_status?: string | null;
+  customer_name?: string | null;
+  customer_phone?: string | null;
+  customer_phone_extra?: string | null;
+  governorate?: string | null;
+  order_address?: string | null;
+  total_order?: number | null;
+  affiliate_name?: string | null;
+  affiliate_code?: string | null;
+  distinct_merchant_count?: number | null;
+  delivery_rate?: number | null;
+  warehouseCodes?: string[];
+}
+
+export interface LogStats {
+  total: number;
+  todayLogs: number;
+  activeEmployees: number;
+  matchedWithOrders: number;
+  administrativeLogs: number;
+  unresolvedLogs: number;
+  statusChangesCount: number;
+  notesCount: number;
+  addressEditsCount: number;
+  phoneEditsCount: number;
+}
+
+export interface MerchantCodeImportReport {
+  totalRows: number;
+  validCodesProcessed: number;
+  orderItemsEnriched: number;
+  unmatchedRecords: number;
+  conflictingMappings: number;
+  unresolvedCount: number;
+  verifiedHeader: string;
+  warnings: string[];
+}
+

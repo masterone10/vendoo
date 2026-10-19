@@ -23,8 +23,10 @@ import {
   Boxes,
   CheckCircle2,
   Filter,
+  ChevronLeft,
 } from 'lucide-react';
 import { DateCalendarPicker } from './common/DateCalendarPicker';
+import { ReportKpiDrilldownModal, DrilldownPillar } from './ReportKpiDrilldownModal';
 
 interface ReportsViewProps {
   onSelectOrder?: (orderCode: string) => void;
@@ -128,6 +130,7 @@ export const ReportsView: React.FC<ReportsViewProps> = ({ onSelectOrder }) => {
   const [warehouseSort, setWarehouseSort] = useState<'items' | 'orders' | 'revenue'>('items');
   const [employeeSearch, setEmployeeSearch] = useState('');
   const [transitionSearch, setTransitionSearch] = useState('');
+  const [drilldownPillar, setDrilldownPillar] = useState<DrilldownPillar | null>(null);
 
   useEffect(() => {
     fetchReport();
@@ -518,8 +521,11 @@ export const ReportsView: React.FC<ReportsViewProps> = ({ onSelectOrder }) => {
           {/* 1. PRIMARY EXECUTIVE KPI HERO CARDS (4 Main Pillars) */}
           <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
             {/* Pillar 1: Total Created Orders */}
-            <div className="p-5 rounded-2xl bg-gradient-to-b from-slate-900/90 to-slate-950/80 border border-slate-800/80 relative overflow-hidden shadow-lg group hover:border-slate-700 transition-all">
-              <div className="absolute top-0 right-0 w-24 h-24 bg-blue-500/5 rounded-full blur-2xl pointer-events-none" />
+            <div
+              onClick={() => setDrilldownPillar('created')}
+              className="p-5 rounded-2xl bg-gradient-to-b from-slate-900/90 to-slate-950/80 border border-slate-800/80 relative overflow-hidden shadow-lg group hover:border-blue-500/50 hover:shadow-blue-500/10 transition-all cursor-pointer"
+            >
+              <div className="absolute top-0 right-0 w-24 h-24 bg-blue-500/5 rounded-full blur-2xl pointer-events-none group-hover:bg-blue-500/10 transition-colors" />
               <div className="flex items-center justify-between text-slate-400 text-xs font-medium">
                 <span className="flex items-center gap-1.5 text-slate-300">
                   <PackageCheck className="w-4 h-4 text-blue-400" />
@@ -528,7 +534,7 @@ export const ReportsView: React.FC<ReportsViewProps> = ({ onSelectOrder }) => {
                 <span className="text-[11px] font-mono text-slate-500">حجم الإنشاء</span>
               </div>
               <div className="mt-3 flex items-baseline gap-2">
-                <div className="text-3xl font-extrabold font-mono text-slate-100 tracking-tight">
+                <div className="text-3xl font-extrabold font-mono text-slate-100 group-hover:text-blue-400 transition-colors tracking-tight">
                   {data.createdCount.toLocaleString()}
                 </div>
                 <span className="text-xs text-slate-400 font-normal">طلب</span>
@@ -543,11 +549,18 @@ export const ReportsView: React.FC<ReportsViewProps> = ({ onSelectOrder }) => {
                 <span>متوسط الطلب (AOV):</span>
                 <span>{(data.averageOrderValue || 0).toLocaleString()} ج.م</span>
               </div>
+              <div className="mt-3 pt-2.5 border-t border-slate-800/80 flex items-center justify-between text-xs text-blue-400 font-medium group-hover:text-blue-300">
+                <span>عرض الطلبات والتفاصيل</span>
+                <ChevronLeft className="w-3.5 h-3.5 group-hover:-translate-x-1 transition-transform" />
+              </div>
             </div>
 
             {/* Pillar 2: Confirmed / Printed */}
-            <div className="p-5 rounded-2xl bg-gradient-to-b from-slate-900/90 to-slate-950/80 border border-slate-800/80 relative overflow-hidden shadow-lg group hover:border-emerald-500/30 transition-all">
-              <div className="absolute top-0 right-0 w-24 h-24 bg-emerald-500/5 rounded-full blur-2xl pointer-events-none" />
+            <div
+              onClick={() => setDrilldownPillar('printed')}
+              className="p-5 rounded-2xl bg-gradient-to-b from-slate-900/90 to-slate-950/80 border border-slate-800/80 relative overflow-hidden shadow-lg group hover:border-emerald-500/50 hover:shadow-emerald-500/10 transition-all cursor-pointer"
+            >
+              <div className="absolute top-0 right-0 w-24 h-24 bg-emerald-500/5 rounded-full blur-2xl pointer-events-none group-hover:bg-emerald-500/10 transition-colors" />
               <div className="flex items-center justify-between text-slate-400 text-xs font-medium">
                 <span className="flex items-center gap-1.5 text-emerald-400 font-semibold">
                   <TrendingUp className="w-4 h-4 text-emerald-400" />
@@ -558,7 +571,7 @@ export const ReportsView: React.FC<ReportsViewProps> = ({ onSelectOrder }) => {
                 </span>
               </div>
               <div className="mt-3 flex items-baseline gap-2">
-                <div className="text-3xl font-extrabold font-mono text-emerald-400 tracking-tight">
+                <div className="text-3xl font-extrabold font-mono text-emerald-400 group-hover:text-emerald-300 transition-colors tracking-tight">
                   {printedOrdersCount.toLocaleString()}
                 </div>
                 <span className="text-xs text-emerald-400/70 font-normal">طلب جاهز</span>
@@ -573,11 +586,18 @@ export const ReportsView: React.FC<ReportsViewProps> = ({ onSelectOrder }) => {
                 <span>نسبة الإنجاز:</span>
                 <span>{printedOrdersCount} من {data.createdCount}</span>
               </div>
+              <div className="mt-3 pt-2.5 border-t border-slate-800/80 flex items-center justify-between text-xs text-emerald-400 font-medium group-hover:text-emerald-300">
+                <span>عرض الطلبات والتفاصيل</span>
+                <ChevronLeft className="w-3.5 h-3.5 group-hover:-translate-x-1 transition-transform" />
+              </div>
             </div>
 
             {/* Pillar 3: Active Pipeline (Pending + Processing) */}
-            <div className="p-5 rounded-2xl bg-gradient-to-b from-slate-900/90 to-slate-950/80 border border-slate-800/80 relative overflow-hidden shadow-lg group hover:border-sky-500/30 transition-all">
-              <div className="absolute top-0 right-0 w-24 h-24 bg-sky-500/5 rounded-full blur-2xl pointer-events-none" />
+            <div
+              onClick={() => setDrilldownPillar('pipeline')}
+              className="p-5 rounded-2xl bg-gradient-to-b from-slate-900/90 to-slate-950/80 border border-slate-800/80 relative overflow-hidden shadow-lg group hover:border-sky-500/50 hover:shadow-sky-500/10 transition-all cursor-pointer"
+            >
+              <div className="absolute top-0 right-0 w-24 h-24 bg-sky-500/5 rounded-full blur-2xl pointer-events-none group-hover:bg-sky-500/10 transition-colors" />
               <div className="flex items-center justify-between text-slate-400 text-xs font-medium">
                 <span className="flex items-center gap-1.5 text-sky-400 font-semibold">
                   <Clock className="w-4 h-4 text-sky-400" />
@@ -586,7 +606,7 @@ export const ReportsView: React.FC<ReportsViewProps> = ({ onSelectOrder }) => {
                 <span className="text-[11px] font-mono text-slate-400">الطلبات الحية</span>
               </div>
               <div className="mt-3 flex items-baseline gap-2">
-                <div className="text-3xl font-extrabold font-mono text-sky-400 tracking-tight">
+                <div className="text-3xl font-extrabold font-mono text-sky-400 group-hover:text-sky-300 transition-colors tracking-tight">
                   {((data.statusCounts?.pending || 0) + (data.statusCounts?.processing || 0)).toLocaleString()}
                 </div>
                 <span className="text-xs text-sky-400/70 font-normal">طلب</span>
@@ -603,11 +623,18 @@ export const ReportsView: React.FC<ReportsViewProps> = ({ onSelectOrder }) => {
                   {data.statusCounts?.processing || 0} طلب
                 </span>
               </div>
+              <div className="mt-3 pt-2.5 border-t border-slate-800/80 flex items-center justify-between text-xs text-sky-400 font-medium group-hover:text-sky-300">
+                <span>عرض الطلبات والتفاصيل</span>
+                <ChevronLeft className="w-3.5 h-3.5 group-hover:-translate-x-1 transition-transform" />
+              </div>
             </div>
 
             {/* Pillar 4: Multi-Warehouse (المخازن) */}
-            <div className="p-5 rounded-2xl bg-gradient-to-b from-slate-900/90 to-slate-950/80 border border-slate-800/80 relative overflow-hidden shadow-lg group hover:border-rose-500/30 transition-all">
-              <div className="absolute top-0 right-0 w-24 h-24 bg-rose-500/5 rounded-full blur-2xl pointer-events-none" />
+            <div
+              onClick={() => setDrilldownPillar('multi_warehouse')}
+              className="p-5 rounded-2xl bg-gradient-to-b from-slate-900/90 to-slate-950/80 border border-slate-800/80 relative overflow-hidden shadow-lg group hover:border-rose-500/50 hover:shadow-rose-500/10 transition-all cursor-pointer"
+            >
+              <div className="absolute top-0 right-0 w-24 h-24 bg-rose-500/5 rounded-full blur-2xl pointer-events-none group-hover:bg-rose-500/10 transition-colors" />
               <div className="flex items-center justify-between text-slate-400 text-xs font-medium">
                 <span className="flex items-center gap-1.5 text-rose-400 font-semibold">
                   <ShieldAlert className="w-4 h-4 text-rose-400" />
@@ -618,7 +645,7 @@ export const ReportsView: React.FC<ReportsViewProps> = ({ onSelectOrder }) => {
                 </span>
               </div>
               <div className="mt-3 flex items-baseline gap-2">
-                <div className="text-3xl font-extrabold font-mono text-rose-400 tracking-tight">
+                <div className="text-3xl font-extrabold font-mono text-rose-400 group-hover:text-rose-300 transition-colors tracking-tight">
                   {(data.multiWarehouseCount || 0).toLocaleString()}
                 </div>
                 <span className="text-xs text-rose-400/70 font-normal">طلب متعدد</span>
@@ -632,6 +659,10 @@ export const ReportsView: React.FC<ReportsViewProps> = ({ onSelectOrder }) => {
               <div className="mt-1 flex items-center justify-between text-[11px] text-rose-400/80">
                 <span>تتطلب تنسيق وتجزئة بوالص</span>
                 <span className="font-mono">{(data.multiWarehouseStats?.multiValue || 0).toLocaleString()} ج.م</span>
+              </div>
+              <div className="mt-3 pt-2.5 border-t border-slate-800/80 flex items-center justify-between text-xs text-rose-400 font-medium group-hover:text-rose-300">
+                <span>عرض الطلبات والتفاصيل</span>
+                <ChevronLeft className="w-3.5 h-3.5 group-hover:-translate-x-1 transition-transform" />
               </div>
             </div>
           </div>
@@ -1407,6 +1438,28 @@ export const ReportsView: React.FC<ReportsViewProps> = ({ onSelectOrder }) => {
           )}
         </div>
       ) : null}
+
+      {/* KPI Drilldown Modal for Detailed Orders and Data */}
+      <ReportKpiDrilldownModal
+        isOpen={Boolean(drilldownPillar)}
+        onClose={() => setDrilldownPillar(null)}
+        pillar={drilldownPillar}
+        startDate={data?.startDate || ''}
+        endDate={data?.endDate || ''}
+        periodLabel={
+          period === 'today'
+            ? 'اليوم'
+            : period === 'yesterday'
+            ? 'أمس'
+            : period === 'last_7_days'
+            ? 'آخر 7 أيام'
+            : period === 'last_30_days'
+            ? 'آخر 30 يوماً'
+            : 'مخصص'
+        }
+        reportData={data}
+        onSelectOrder={onSelectOrder}
+      />
     </div>
   );
 };
