@@ -96,7 +96,7 @@ export const ReportsView: React.FC<ReportsViewProps> = ({ onSelectOrder }) => {
         res = await fetch(url, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ startDate: s, endDate: e }),
+          body: JSON.stringify({ startDate: s, endDate: e, force: true }),
         });
       } else {
         res = await fetch(url);

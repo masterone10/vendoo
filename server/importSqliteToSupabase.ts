@@ -1,7 +1,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
-import { checkSupabaseConnection, getSupabasePool, pgQuery } from './supabaseClient.js';
+import { checkSupabaseConnection, getSupabasePool, pgQuery } from './supabaseClient.ts';
 import dotenv from 'dotenv';
 
 dotenv.config({ override: true });

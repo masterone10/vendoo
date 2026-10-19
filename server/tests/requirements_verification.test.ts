@@ -5,7 +5,7 @@ import {
   getHotThresholdDate,
   isDateInHot,
   runHotColdArchival,
-} from '../db.js';
+} from '../db.ts';
 
 console.log('===============================================================');
 console.log('   VENDOOR INTELLIGENCE: 10 REQUIREMENTS VERIFICATION SUITE    ');

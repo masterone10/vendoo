@@ -276,14 +276,34 @@ export function parseLogActionDetails(rawText: string, actorName = '', orderCode
     return result;
   }
 
-  // 10. PRINTING / INVOICING / CONFIRMATION (Rule: Printed = تأكيد الأوردر):
-  if (t.includes('طباعة') || t.includes('بوليصة') || t.toLowerCase().includes('print') || t.includes('مطبوع')) {
-    result.actionType = 'print';
-    result.actionLabelAr = 'طباعة وتأكيد الأوردر';
+  // 10. SHIPPING WAYBILL (رقم البوليصة):
+  if (t.includes('رقم البوليصة') || t.includes('البوليصة')) {
+    result.actionType = 'waybill_edit';
+    result.actionLabelAr = 'تعديل / إضافة رقم البوليصة';
+    result.fieldName = 'رقم البوليصة';
+    result.toStatus = null;
+    result.fromStatus = null;
+    result.summaryAr = t;
+    result.isAdministrative = true;
+    return result;
+  }
+
+  // 11. PRINTING / CONFIRMATION (Rule: Printed = تأكيد الأوردر):
+  if (
+    t.includes('طبع الاوردر') ||
+    t.includes('طباعة الاوردر') ||
+    t.includes('طبع الفاتورة') ||
+    t.includes('طباعة الفاتورة') ||
+    t.includes('تأكيد الطلب') ||
+    t.toLowerCase() === 'printed' ||
+    t === 'مطبوع'
+  ) {
+    result.actionType = 'status_change';
+    result.actionLabelAr = 'تغيير حالة الطلب إلى Printed';
     result.fieldName = 'حالة الطلب';
     result.newValue = 'Printed';
     result.toStatus = 'Printed';
-    result.summaryAr = 'طباعة بوليصة الشحن وتأكيد الأوردر (Printed)';
+    result.summaryAr = 'تأكيد الأوردر (Printed)';
     result.isAdministrative = false;
     return result;
   }

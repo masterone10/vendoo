@@ -1,10 +1,10 @@
 import assert from 'node:assert';
 import { DatabaseSync } from 'node:sqlite';
 import crypto from 'node:crypto';
-import { getCairoDateString, getCairoDateInterval, isDateInHot } from '../db.js';
-import { isCSEmployee } from '../routes.js';
-import { isLowDeliveryRate, evaluateCustomerDelivery } from '../../src/utils/delivery.js';
-import { extractMerchantCodeFromRow, applyMerchantCodeMappings } from '../excelMerchantCodes.js';
+import { getCairoDateString, getCairoDateInterval, isDateInHot } from '../db.ts';
+import { isCSEmployee } from '../routes.ts';
+import { isLowDeliveryRate, evaluateCustomerDelivery } from '../../src/utils/delivery.ts';
+import { extractMerchantCodeFromRow, applyMerchantCodeMappings } from '../excelMerchantCodes.ts';
 
 console.log('===================================================================');
 console.log('   VENDOOR INTELLIGENCE: MASTER SYSTEM VERIFICATION TEST SUITE     ');

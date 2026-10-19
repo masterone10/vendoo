@@ -1,4 +1,4 @@
-import { Router, Request, Response } from 'express';
+import { Router, type Request, type Response } from 'express';
 import {
   db,
   DB_PATH,
@@ -8,32 +8,32 @@ import {
   saveDailySnapshot,
   getCoverageRecord,
   isDateInHot,
-} from './db.js';
+} from './db.ts';
 import {
   syncEngine,
   calculateAgeBucket,
   getProcessingTransitionTime,
-} from './syncEngine.js';
+} from './syncEngine.ts';
 import {
   checkSupabaseConnection,
   applySupabaseMigration,
   getDatabaseUrl,
   isSupabaseConfigured,
-} from './supabaseClient.js';
-import { runSqliteToSupabaseImport } from './importSqliteToSupabase.js';
+} from './supabaseClient.ts';
+import { runSqliteToSupabaseImport } from './importSqliteToSupabase.ts';
 import {
   getOrFetchHistoricalLogs,
   fetchAndPersistLogsForPeriod,
   getActiveJobStatus,
-} from './historicalLogsService.js';
+} from './historicalLogsService.ts';
 import {
   ensureCoverageForRange,
   generateLogsIntelligenceReport,
   getRangeJobStatus,
   getDrilldownLogs,
-} from './logsIntelligenceService.js';
-import { applyMerchantCodeMappings } from './excelMerchantCodes.js';
-import { getArchiveWorkerStatus, triggerArchivePass } from './supabaseArchiveWorker.js';
+} from './logsIntelligenceService.ts';
+import { applyMerchantCodeMappings } from './excelMerchantCodes.ts';
+import { getArchiveWorkerStatus, triggerArchivePass } from './supabaseArchiveWorker.ts';
 
 export function isCSEmployee(actorName: string): boolean {
   if (!actorName) return false;
@@ -924,10 +924,10 @@ apiRouter.get('/reports/logs-status', (req: Request, res: Response) => {
 // Manual trigger for fetching missing logs for a period
 apiRouter.post('/reports/logs-fetch', async (req: Request, res: Response) => {
   try {
-    const { startDate, endDate } = req.body;
+    const { startDate, endDate, force } = req.body;
     const sDate = ((startDate as string) || getCairoDateString()).slice(0, 10);
     const eDate = ((endDate as string) || sDate).slice(0, 10);
-    const job = await ensureCoverageForRange(sDate, eDate);
+    const job = await ensureCoverageForRange(sDate, eDate, undefined, Boolean(force ?? true));
     const report = generateLogsIntelligenceReport(sDate, eDate);
     res.json({ success: true, job, report });
   } catch (err: any) {

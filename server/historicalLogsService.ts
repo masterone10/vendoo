@@ -1,8 +1,8 @@
 import crypto from 'node:crypto';
-import { db, getCairoDateInterval, isDateInHot } from './db.js';
-import { vendoorClient } from './vendoorClient.js';
-import { syncEngine } from './syncEngine.js';
-import { parseLogActionDetails } from './logDetailsParser.js';
+import { db, getCairoDateInterval, isDateInHot } from './db.ts';
+import { vendoorClient } from './vendoorClient.ts';
+import { syncEngine } from './syncEngine.ts';
+import { parseLogActionDetails } from './logDetailsParser.ts';
 
 export interface LogBackfillState {
   date: string;

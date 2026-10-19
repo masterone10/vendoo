@@ -2,8 +2,8 @@ import assert from 'node:assert';
 import fs from 'node:fs';
 import path from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
-import { getCairoDateInterval, getCairoDateString } from '../db.js';
-import { SyncEngine } from '../syncEngine.js';
+import { getCairoDateInterval, getCairoDateString } from '../db.ts';
+import { SyncEngine } from '../syncEngine.ts';
 
 console.log('===================================================================');
 console.log('  VENDOOR INTELLIGENCE: MASTER PRODUCTION REPAIR VERIFICATION      ');

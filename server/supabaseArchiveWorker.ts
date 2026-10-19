@@ -1,5 +1,5 @@
-import { isSupabaseConfigured, pgQuery } from './supabaseClient.js';
-import { db } from './db.js';
+import { isSupabaseConfigured, pgQuery } from './supabaseClient.ts';
+import { db } from './db.ts';
 
 export interface ArchiveWorkerStatus {
   isEnabled: boolean;

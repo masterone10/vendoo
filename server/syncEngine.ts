@@ -4,18 +4,18 @@ import {
   isDateInHot,
   getCoverageRecord,
   saveCoverageRecord,
-  HistoricalCoverageRecord,
+  type HistoricalCoverageRecord,
   getCairoDateString,
   getCairoDateInterval,
-} from './db.js';
+} from './db.ts';
 import {
   vendoorClient,
-  VendoorRawOrder,
-  VendoorRawProduct,
-  ConfirmationRow,
-  LogEntry,
-} from './vendoorClient.js';
-import { parseLogActionDetails } from './logDetailsParser.js';
+  type VendoorRawOrder,
+  type VendoorRawProduct,
+  type ConfirmationRow,
+  type LogEntry,
+} from './vendoorClient.ts';
+import { parseLogActionDetails } from './logDetailsParser.ts';
 
 export interface ConfirmationAgeSyncStatus {
   state: 'SUCCESS' | 'PARTIAL' | 'STALE' | 'NOT_AVAILABLE';

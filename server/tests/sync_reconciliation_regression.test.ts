@@ -1,11 +1,11 @@
 import assert from 'node:assert';
-import { db } from '../db.js';
+import { db } from '../db.ts';
 import {
   SyncEngine,
   detectOrderBusinessChanges,
   ReconciliationReport,
-} from '../syncEngine.js';
-import { VendoorRawOrder } from '../vendoorClient.js';
+} from '../syncEngine.ts';
+import { VendoorRawOrder } from '../vendoorClient.ts';
 
 console.log('=== VENDOOR INTELLIGENCE: 18 REGRESSION & RECONCILIATION TESTS ===\n');
 

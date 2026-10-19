@@ -1,7 +1,7 @@
 import { DatabaseSync } from 'node:sqlite';
 import fs from 'node:fs';
 import path from 'node:path';
-import { parseLogActionDetails } from './logDetailsParser.js';
+import { parseLogActionDetails } from './logDetailsParser.ts';
 
 const DB_DIR = path.resolve(process.cwd(), 'data');
 if (!fs.existsSync(DB_DIR)) {
@@ -491,6 +491,19 @@ export function initDatabase() {
     repairMerchantAndWarehouseData();
   } catch (err: any) {
     console.warn('[DB] Warning repairing merchant/warehouse data:', err.message);
+  }
+
+  // Ensure shipping waybill events (رقم البوليصة) are strictly classified as waybill_edit and not Printed confirmation
+  try {
+    db.exec(`
+      UPDATE canonical_activity_events
+      SET action_type = 'waybill_edit', to_status = NULL, is_administrative = 1, field_name = 'رقم البوليصة'
+      WHERE raw_event_id IN (
+        SELECT id FROM raw_activity_events WHERE raw_action_text LIKE '%البوليصة%'
+      );
+    `);
+  } catch (err: any) {
+    console.warn('[DB] Warning repairing waybill records:', err.message);
   }
 }
 

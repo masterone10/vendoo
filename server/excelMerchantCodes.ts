@@ -1,4 +1,4 @@
-import { db } from './db.js';
+import { db } from './db.ts';
 
 export interface MerchantCodeImportRow {
   orderCode?: string | null;

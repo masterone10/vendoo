@@ -1,8 +1,8 @@
 import crypto from 'node:crypto';
-import { db, getCairoDateInterval, getCairoDateString, isDateInHot } from './db.js';
-import { vendoorClient } from './vendoorClient.js';
-import { parseLogActionDetails } from './logDetailsParser.js';
-import { persistLogEntries } from './historicalLogsService.js';
+import { db, getCairoDateInterval, getCairoDateString, isDateInHot } from './db.ts';
+import { vendoorClient } from './vendoorClient.ts';
+import { parseLogActionDetails } from './logDetailsParser.ts';
+import { persistLogEntries } from './historicalLogsService.ts';
 
 export type FetchStage =
   | 'IDLE'
@@ -60,7 +60,8 @@ const ARABIC_DAYS: Record<number, string> = {
 export async function ensureCoverageForRange(
   startDateStr: string,
   endDateStr: string,
-  onProgress?: (state: RangeJobState) => void
+  onProgress?: (state: RangeJobState) => void,
+  forceRefetch: boolean = false
 ): Promise<RangeJobState> {
   const start = startDateStr.slice(0, 10);
   const end = endDateStr.slice(0, 10);
@@ -69,6 +70,7 @@ export async function ensureCoverageForRange(
   // Check if an existing job is currently RUNNING to prevent concurrent overlapping executions
   const existingJob = rangeJobs.get(key);
   if (
+    !forceRefetch &&
     existingJob &&
     (existingJob.stage === 'CHECKING_STORAGE' ||
       existingJob.stage === 'FETCHING_VENDOOR' ||
@@ -108,6 +110,11 @@ export async function ensureCoverageForRange(
   // Step 1: Check coverage for all dates
   const missingDates: string[] = [];
   for (const date of dates) {
+    if (forceRefetch) {
+      missingDates.push(date);
+      continue;
+    }
+
     const cov: any = db.prepare(`
       SELECT completion_status FROM historical_coverage
       WHERE period_date = ? AND source_domain = 'logs'
@@ -135,6 +142,7 @@ export async function ensureCoverageForRange(
   let totalSaved = 0;
   let totalPagesDiscovered = 0;
   let totalPagesRead = 0;
+  let lastError: string | null = null;
 
   for (const date of missingDates) {
     const interval = getCairoDateInterval(date);
@@ -459,7 +467,7 @@ export function generateLogsIntelligenceReport(startDateStr: string, endDateStr:
     FROM canonical_activity_events
     WHERE event_timestamp >= ? AND event_timestamp < ?
       AND order_code IS NOT NULL AND order_code != ''
-      AND (to_status = 'Printed' OR action_type = 'print')
+      AND to_status = 'Printed'
   `).get(startTime, endTime);
 
   const confirmedOrdersCount = confirmedData?.unique_orders || 0;
@@ -598,7 +606,7 @@ export function generateLogsIntelligenceReport(startDateStr: string, endDateStr:
       SELECT COUNT(DISTINCT order_code) as c FROM canonical_activity_events
       WHERE event_timestamp >= ? AND event_timestamp < ?
         AND order_code IS NOT NULL AND order_code != ''
-        AND (to_status = 'Printed' OR action_type = 'print')
+        AND to_status = 'Printed'
     `).get(dayInterval.startCairo, dayInterval.endCairo) as any)?.c || 0;
 
     const dCanceledOrders = (db.prepare(`
@@ -653,7 +661,7 @@ export function generateLogsIntelligenceReport(startDateStr: string, endDateStr:
       is_system_actor,
       COUNT(*) as action_count,
       COUNT(DISTINCT order_code) as unique_orders,
-      COUNT(DISTINCT CASE WHEN to_status = 'Printed' OR action_type = 'print' THEN order_code END) as confirmed_orders_count,
+      COUNT(DISTINCT CASE WHEN to_status = 'Printed' THEN order_code END) as confirmed_orders_count,
       COUNT(DISTINCT CASE WHEN to_status = 'Canceled' THEN order_code END) as canceled_orders_count,
       COUNT(DISTINCT CASE 
         WHEN action_type = 'extra_phone_added' 
@@ -862,7 +870,7 @@ export function getDrilldownLogs(params: {
 
   // Pillar filtering
   if (pillar === 'confirmed' || pillar === 'printed') {
-    conditions.push("(c.to_status = 'Printed' OR c.action_type = 'print')");
+    conditions.push("c.to_status = 'Printed'");
   } else if (pillar === 'canceled') {
     conditions.push("c.to_status = 'Canceled'");
   } else if (pillar === 'canceling') {

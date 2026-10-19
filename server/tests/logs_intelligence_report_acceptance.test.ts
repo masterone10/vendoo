@@ -1,13 +1,13 @@
 import assert from 'node:assert';
 import { DatabaseSync } from 'node:sqlite';
-import { getCairoDateInterval, getCairoDateString } from '../db.js';
-import { parseLogActionDetails } from '../logDetailsParser.js';
+import { getCairoDateInterval, getCairoDateString } from '../db.ts';
+import { parseLogActionDetails } from '../logDetailsParser.ts';
 import {
   generateLogsIntelligenceReport,
   getDrilldownLogs,
   ensureCoverageForRange,
   getRangeJobKey,
-} from '../logsIntelligenceService.js';
+} from '../logsIntelligenceService.ts';
 
 console.log('================================================================================');
 console.log('  VENDOOR INTELLIGENCE: 20 LOGS-ONLY DAILY & WEEKLY ACCEPTANCE TESTS           ');
@@ -145,6 +145,10 @@ runTest('Test 7: Confirmed order is derived strictly from Printed events, New ->
   const parsedNote = parseLogActionDetails('أضاف ملاحظة: تم التأكيد مع العميل هاتفياً', 'موظف 3', 'ord_103');
   assert.strictEqual(parsedNote.actionType, 'note_added');
   assert.strictEqual(parsedNote.toStatus, null, 'Note text must never be inferred as Printed confirmation');
+
+  const parsedWaybill = parseLogActionDetails('اضاف Sara Samir رقم البوليصة 23320954', 'Sara Samir', 'ord_104');
+  assert.strictEqual(parsedWaybill.actionType, 'waybill_edit');
+  assert.strictEqual(parsedWaybill.toStatus, null, 'Waybill addition must never be inferred as Printed confirmation');
 });
 
 // -----------------------------------------------------------------------------

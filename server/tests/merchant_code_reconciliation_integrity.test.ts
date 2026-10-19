@@ -1,8 +1,8 @@
 import assert from 'node:assert';
 import { DatabaseSync } from 'node:sqlite';
-import { extractMerchantCodeFromRow, applyMerchantCodeMappings, extractWarehouseCodeFromRow, extractWarehouseNameFromRow, reconcileItemsWithMappings } from '../excelMerchantCodes.js';
-import { extractWarehouseFromProduct, SyncEngine } from '../syncEngine.js';
-import { parseLogActionDetails } from '../logDetailsParser.js';
+import { extractMerchantCodeFromRow, applyMerchantCodeMappings, extractWarehouseCodeFromRow, extractWarehouseNameFromRow, reconcileItemsWithMappings } from '../excelMerchantCodes.ts';
+import { extractWarehouseFromProduct, SyncEngine } from '../syncEngine.ts';
+import { parseLogActionDetails } from '../logDetailsParser.ts';
 
 console.log('================================================================================');
 console.log('  VENDOOR INTELLIGENCE: 20 MERCHANT CODE & ORDER RECONCILIATION INTEGRITY TESTS ');
