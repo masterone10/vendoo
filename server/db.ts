@@ -408,12 +408,22 @@ export function initDatabase() {
   tryRunMigration("ALTER TABLE sync_runs ADD COLUMN unresolved_status_count INTEGER DEFAULT 0");
   tryRunMigration("ALTER TABLE sync_runs ADD COLUMN invalid_records_count INTEGER DEFAULT 0");
   tryRunMigration("ALTER TABLE sync_runs ADD COLUMN failed_pages_count INTEGER DEFAULT 0");
-  tryRunMigration("ALTER TABLE sync_runs ADD COLUMN failed_enrichment_count INTEGER DEFAULT 0");
   tryRunMigration("ALTER TABLE sync_runs ADD COLUMN duration_ms INTEGER DEFAULT 0");
   tryRunMigration("ALTER TABLE sync_runs ADD COLUMN phase_timings_json TEXT");
+  tryRunMigration("ALTER TABLE merchant_code_mappings ADD COLUMN sku TEXT");
+  tryRunMigration("ALTER TABLE merchant_code_mappings ADD COLUMN product_id INTEGER");
+  tryRunMigration("ALTER TABLE merchant_code_mappings ADD COLUMN product_name TEXT");
+  tryRunMigration("ALTER TABLE merchant_code_mappings ADD COLUMN order_code TEXT");
+  tryRunMigration("ALTER TABLE merchant_code_mappings ADD COLUMN vendoor_id INTEGER");
+  tryRunMigration("ALTER TABLE merchant_code_mappings ADD COLUMN warehouse_code TEXT");
+  tryRunMigration("ALTER TABLE merchant_code_mappings ADD COLUMN warehouse_name TEXT");
+  tryRunMigration("ALTER TABLE merchant_code_mappings ADD COLUMN updated_at TEXT");
 
   // 3. Create all indexes safely
   db.exec(`
+    CREATE INDEX IF NOT EXISTS idx_mcm_sku ON merchant_code_mappings(sku);
+    CREATE INDEX IF NOT EXISTS idx_mcm_order_code ON merchant_code_mappings(order_code);
+    CREATE INDEX IF NOT EXISTS idx_mcm_product_id ON merchant_code_mappings(product_id);
     CREATE INDEX IF NOT EXISTS idx_orders_random_number ON orders(random_number);
     CREATE INDEX IF NOT EXISTS idx_orders_current_status ON orders(current_status);
     CREATE INDEX IF NOT EXISTS idx_orders_state_entry_at ON orders(state_entry_at);
@@ -663,14 +673,38 @@ export function repairMerchantAndWarehouseData() {
       db.exec('COMMIT;');
     }
 
-    // 3. Clear merchant_code where it mistakenly contains warehouse strings or 'غير محدد'
+    // 3. Clear merchant_code where it mistakenly contains warehouse strings or matches warehouse name/code
     db.prepare(`
       UPDATE order_items
       SET merchant_code = NULL
-      WHERE merchant_code LIKE 'مخزن %'
+      WHERE merchant_code LIKE 'مخزن%'
          OR merchant_code LIKE 'كود %'
          OR merchant_code = 'غير محدد'
+         OR (warehouse_name IS NOT NULL AND merchant_code = warehouse_name)
+         OR (warehouse_code IS NOT NULL AND merchant_code = warehouse_code)
     `).run();
+
+    // 3b. Reconcile unmapped items against verified persistent merchant_code_mappings
+    try {
+      db.prepare(`
+        UPDATE order_items
+        SET merchant_code = (
+          SELECT m.merchant_code FROM merchant_code_mappings m
+          WHERE (m.sku IS NOT NULL AND m.sku != '' AND m.sku = order_items.sku)
+             OR (m.product_id IS NOT NULL AND m.product_id = order_items.product_id)
+          LIMIT 1
+        ),
+        code_source = 'EXCEL_MAPPING'
+        WHERE (order_items.merchant_code IS NULL OR order_items.merchant_code = '')
+          AND EXISTS (
+            SELECT 1 FROM merchant_code_mappings m
+            WHERE (m.sku IS NOT NULL AND m.sku != '' AND m.sku = order_items.sku)
+               OR (m.product_id IS NOT NULL AND m.product_id = order_items.product_id)
+          )
+      `).run();
+    } catch (mErr: any) {
+      console.warn('[DB] Warning reconciling order_items with merchant_code_mappings:', mErr.message);
+    }
 
     // 4. Update distinct_merchant_count and multi_merchant_flag on orders table
     // based on actual distinct warehouse names (avoiding confusion)

@@ -251,3 +251,130 @@ export interface MerchantCodeImportReport {
   warnings: string[];
 }
 
+export type FetchStage =
+  | 'IDLE'
+  | 'CHECKING_STORAGE'
+  | 'FETCHING_VENDOOR'
+  | 'SAVING_RECORDS'
+  | 'ANALYZING_ACTIONS'
+  | 'COMPUTING_METRICS'
+  | 'PREPARING_REPORT'
+  | 'COMPLETE'
+  | 'PARTIAL'
+  | 'FAILED';
+
+export interface RangeJobState {
+  startDate: string;
+  endDate: string;
+  stage: FetchStage;
+  stageLabelAr: string;
+  pagesFetched: number;
+  pagesTotal: number;
+  eventsSaved: number;
+  errorMessage: string | null;
+  startedAt: string;
+  completedAt: string | null;
+  loadedFromCache: boolean;
+}
+
+export interface LogsIntelligenceReport {
+  startDate: string;
+  endDate: string;
+  periodType: 'day' | 'week' | 'custom';
+  periodLabel: string;
+  cairoInterval: {
+    startCairo: string;
+    endExclusiveCairo: string;
+  };
+  status: 'COMPLETE' | 'PARTIAL' | 'FAILED' | 'FETCHING';
+  loadedFromCache: boolean;
+  lastVerifiedAt: string | null;
+  coverage: {
+    totalDays: number;
+    completeDays: number;
+    partialDays: number;
+    failedDays: number;
+    missingDays: number;
+    pagesRead: number;
+    recordsSaved: number;
+    isFullyComplete: boolean;
+  };
+  metrics: {
+    totalLogs: number;
+    uniqueOrdersTouched: number;
+    confirmedOrdersCount: number;
+    printedEventsCount: number;
+    canceledOrdersCount: number;
+    canceledEventsCount: number;
+    cancelingEventsCount: number;
+    createdOrdersCount: number;
+    createdEventsCount: number;
+    extraPhonesAddedUniqueOrders: number;
+    extraPhonesAddedEvents: number;
+    extraPhonesReplacedCount: number;
+    extraPhonesDeletedCount: number;
+    statusChangeEventsCount: number;
+    adminEditsCount: number;
+    unresolvedCount: number;
+  };
+  days: Array<{
+    date: string;
+    dayNameAr: string;
+    totalLogs: number;
+    uniqueOrdersTouched: number;
+    createdOrdersCount: number;
+    confirmedOrdersCount: number;
+    canceledOrdersCount: number;
+    extraPhonesAddedCount: number;
+    activeEmployeesCount: number;
+    coverageStatus: string;
+  }>;
+  employees: Array<{
+    actor_name: string;
+    is_system: number;
+    actor_type: 'STAFF' | 'SYSTEM' | 'UNKNOWN';
+    action_count: number;
+    unique_orders: number;
+    confirmed_orders_count: number;
+    canceled_orders_count: number;
+    extra_phones_added_count: number;
+    status_changes_count: number;
+    actions_breakdown: Record<string, number>;
+  }>;
+  transitions: Array<{
+    from_status: string;
+    to_status: string;
+    events_count: number;
+    unique_orders: number;
+  }>;
+  administrativeEdits: Array<{
+    action_type: string;
+    action_label_ar: string;
+    field_name: string;
+    events_count: number;
+    unique_orders: number;
+  }>;
+  unresolvedActions: Array<{
+    id: number;
+    order_code: string | null;
+    actor_name: string;
+    raw_action_text: string;
+    event_timestamp: string;
+    action_type: string;
+  }>;
+  recentEvents: Array<{
+    id: number;
+    order_code: string | null;
+    actor_name: string;
+    action_type: string;
+    from_status: string | null;
+    to_status: string | null;
+    raw_action_text: string;
+    event_timestamp: string;
+    field_name: string | null;
+    old_value: string | null;
+    new_value: string | null;
+    is_system_actor: number;
+  }>;
+}
+

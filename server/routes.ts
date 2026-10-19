@@ -26,6 +26,12 @@ import {
   fetchAndPersistLogsForPeriod,
   getActiveJobStatus,
 } from './historicalLogsService.js';
+import {
+  ensureCoverageForRange,
+  generateLogsIntelligenceReport,
+  getRangeJobStatus,
+  getDrilldownLogs,
+} from './logsIntelligenceService.js';
 import { applyMerchantCodeMappings } from './excelMerchantCodes.js';
 import { getArchiveWorkerStatus, triggerArchivePass } from './supabaseArchiveWorker.js';
 
@@ -338,9 +344,10 @@ apiRouter.get('/orders', (req: Request, res: Response) => {
       LIMIT ? OFFSET ?
     `).all(...params, pageSize, offset);
 
-    // Enrich with associated warehouse names and merchant codes
+    // Enrich with associated warehouse names, warehouse codes, and genuine merchant codes
     const orderIds = orders.map(o => o.id);
-    const warehouseMap: Record<number, string[]> = {};
+    const warehouseCodeMap: Record<number, string[]> = {};
+    const warehouseNameMap: Record<number, string[]> = {};
     const merchantMap: Record<number, string[]> = {};
     if (orderIds.length > 0) {
       try {
@@ -351,14 +358,30 @@ apiRouter.get('/orders', (req: Request, res: Response) => {
           WHERE order_id IN (${placeholders})
         `).all(...orderIds);
         for (const row of itemRows) {
-          if (!warehouseMap[row.order_id]) warehouseMap[row.order_id] = [];
+          if (!warehouseCodeMap[row.order_id]) warehouseCodeMap[row.order_id] = [];
+          if (!warehouseNameMap[row.order_id]) warehouseNameMap[row.order_id] = [];
           if (!merchantMap[row.order_id]) merchantMap[row.order_id] = [];
-          const wh = row.warehouse_name || (row.warehouse_code ? `مخزن ${row.warehouse_code}` : null);
-          if (wh && !warehouseMap[row.order_id].includes(wh)) {
-            warehouseMap[row.order_id].push(wh);
+
+          const whName = row.warehouse_name;
+          const whCode = row.warehouse_code || (whName ? whName.replace(/^مخزن\s*/, '').trim() : null);
+
+          if (whCode && !warehouseCodeMap[row.order_id].includes(whCode)) {
+            warehouseCodeMap[row.order_id].push(whCode);
           }
-          if (row.merchant_code && !row.merchant_code.startsWith('مخزن ') && row.merchant_code !== 'غير محدد' && !merchantMap[row.order_id].includes(row.merchant_code)) {
-            merchantMap[row.order_id].push(row.merchant_code);
+          if (whName && !warehouseNameMap[row.order_id].includes(whName)) {
+            warehouseNameMap[row.order_id].push(whName);
+          }
+          if (
+            row.merchant_code &&
+            typeof row.merchant_code === 'string' &&
+            row.merchant_code.trim().length > 0 &&
+            !row.merchant_code.startsWith('مخزن') &&
+            row.merchant_code !== 'غير محدد' &&
+            row.merchant_code !== whName &&
+            row.merchant_code !== whCode &&
+            !merchantMap[row.order_id].includes(row.merchant_code.trim())
+          ) {
+            merchantMap[row.order_id].push(row.merchant_code.trim());
           }
         }
       } catch {}
@@ -366,8 +389,8 @@ apiRouter.get('/orders', (req: Request, res: Response) => {
 
     const enrichedOrders = orders.map(o => ({
       ...o,
-      warehouseCodes: warehouseMap[o.id] || [],
-      warehouseNames: warehouseMap[o.id] || [],
+      warehouseCodes: warehouseCodeMap[o.id] || [],
+      warehouseNames: warehouseNameMap[o.id] || [],
       merchantCodes: merchantMap[o.id] || [],
     }));
 
@@ -824,6 +847,189 @@ apiRouter.post('/alerts/:id/resolve', (req: Request, res: Response) => {
   }
 });
 
+// 10b. Logs-Only Intelligence Report (Single Day, Week, or Custom Period)
+apiRouter.get('/reports/logs-intelligence', async (req: Request, res: Response) => {
+  try {
+    const { startDate, endDate, period, autoFetch = 'true' } = req.query;
+    let sDate = (startDate as string) || '';
+    let eDate = (endDate as string) || '';
+
+    if (period === 'today') {
+      sDate = getCairoDateString();
+      eDate = sDate;
+    } else if (period === 'yesterday') {
+      const now = new Date();
+      const y = new Date(now.getTime() - 24 * 60 * 60 * 1000);
+      sDate = getCairoDateString(y);
+      eDate = sDate;
+    } else if (period === 'last_7_days') {
+      const now = new Date();
+      const past = new Date(now.getTime() - 6 * 24 * 60 * 60 * 1000);
+      sDate = getCairoDateString(past);
+      eDate = getCairoDateString(now);
+    } else if (period === 'last_30_days') {
+      const now = new Date();
+      const past = new Date(now.getTime() - 29 * 24 * 60 * 60 * 1000);
+      sDate = getCairoDateString(past);
+      eDate = getCairoDateString(now);
+    }
+
+    if (!sDate) sDate = getCairoDateString();
+    if (!eDate) eDate = sDate;
+
+    // Check if autoFetch is requested and if coverage is missing
+    const jobKey = `${sDate}_${eDate}`;
+    let jobStatus = getRangeJobStatus(sDate, eDate);
+
+    if (autoFetch === 'true' && (!jobStatus || jobStatus.stage === 'FAILED' || jobStatus.stage === 'IDLE')) {
+      ensureCoverageForRange(sDate, eDate).catch(err => {
+        console.error(`[LogsIntelligence] Auto-fetch error for ${jobKey}:`, err.message);
+      });
+      jobStatus = getRangeJobStatus(sDate, eDate);
+    }
+
+    const report = generateLogsIntelligenceReport(sDate, eDate);
+    if (
+      jobStatus &&
+      (jobStatus.stage === 'CHECKING_STORAGE' ||
+        jobStatus.stage === 'FETCHING_VENDOOR' ||
+        jobStatus.stage === 'SAVING_RECORDS' ||
+        jobStatus.stage === 'ANALYZING_ACTIONS' ||
+        jobStatus.stage === 'COMPUTING_METRICS' ||
+        jobStatus.stage === 'PREPARING_REPORT')
+    ) {
+      report.status = 'FETCHING';
+    }
+    report.loadedFromCache = jobStatus ? jobStatus.loadedFromCache : report.coverage.isFullyComplete;
+
+    res.json({ success: true, report, jobStatus });
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Logs status polling endpoint for the animated Infinity indicator
+apiRouter.get('/reports/logs-status', (req: Request, res: Response) => {
+  try {
+    const { startDate, endDate } = req.query;
+    const sDate = ((startDate as string) || getCairoDateString()).slice(0, 10);
+    const eDate = ((endDate as string) || sDate).slice(0, 10);
+    const job = getRangeJobStatus(sDate, eDate);
+    res.json({ success: true, job });
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Manual trigger for fetching missing logs for a period
+apiRouter.post('/reports/logs-fetch', async (req: Request, res: Response) => {
+  try {
+    const { startDate, endDate } = req.body;
+    const sDate = ((startDate as string) || getCairoDateString()).slice(0, 10);
+    const eDate = ((endDate as string) || sDate).slice(0, 10);
+    const job = await ensureCoverageForRange(sDate, eDate);
+    const report = generateLogsIntelligenceReport(sDate, eDate);
+    res.json({ success: true, job, report });
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Drilldown details for logs-based KPI pillars
+apiRouter.get('/reports/logs-drilldown', (req: Request, res: Response) => {
+  try {
+    const {
+      pillar = 'all',
+      startDate,
+      endDate,
+      actor,
+      search,
+      page = '1',
+      limit = '25',
+    } = req.query;
+
+    const sDate = ((startDate as string) || getCairoDateString()).slice(0, 10);
+    const eDate = ((endDate as string) || sDate).slice(0, 10);
+
+    const result = getDrilldownLogs({
+      pillar: String(pillar),
+      startDate: sDate,
+      endDate: eDate,
+      actor: actor ? String(actor) : undefined,
+      search: search ? String(search) : undefined,
+      page: parseInt(page as string, 10) || 1,
+      limit: parseInt(limit as string, 10) || 25,
+    });
+
+    res.json({ success: true, ...result });
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// CSV Export for logs report
+apiRouter.get('/reports/logs-export', (req: Request, res: Response) => {
+  try {
+    const { startDate, endDate, pillar = 'all' } = req.query;
+    const sDate = ((startDate as string) || getCairoDateString()).slice(0, 10);
+    const eDate = ((endDate as string) || sDate).slice(0, 10);
+
+    const drilldown = getDrilldownLogs({
+      pillar: String(pillar),
+      startDate: sDate,
+      endDate: eDate,
+      limit: 5000,
+    });
+
+    const header = [
+      'المعرف',
+      'توقيت الحدث (توقيت القاهرة)',
+      'كود الطلب',
+      'اسم المنفذ',
+      'نوع الإجراء',
+      'الحالة السابقة',
+      'الحالة الناتجة',
+      'الحقل المعدل',
+      'القيمة السابقة',
+      'القيمة الجديدة',
+      'نص الحركة الأصلي الكامل',
+    ];
+
+    const escapeCsv = (str: any) => {
+      if (str === null || str === undefined) return '""';
+      const s = String(str).replace(/"/g, '""');
+      return `"${s}"`;
+    };
+
+    const csvLines = [
+      header.map(escapeCsv).join(','),
+      ...drilldown.events.map((ev: any) => [
+        ev.id,
+        ev.event_timestamp,
+        ev.order_code || 'عام',
+        ev.actor_name || 'غير محدد',
+        ev.action_type || '',
+        ev.from_status || '',
+        ev.to_status || '',
+        ev.field_name || '',
+        ev.old_value || '',
+        ev.new_value || '',
+        ev.raw_action_text || '',
+      ].map(escapeCsv).join(',')),
+    ];
+
+    const csvContent = '\uFEFF' + csvLines.join('\n');
+    res.setHeader('Content-Type', 'text/csv; charset=utf-8');
+    res.setHeader(
+      'Content-Disposition',
+      `attachment; filename="logs_report_${pillar}_${sDate}_to_${eDate}.csv"`
+    );
+    res.send(csvContent);
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // 11. Comprehensive Operational Reports
 apiRouter.get('/reports', (req: Request, res: Response) => {
   try {
@@ -987,15 +1193,15 @@ apiRouter.get('/reports', (req: Request, res: Response) => {
     // Warehouses breakdown in period
     let warehouses: any[] = db.prepare(`
       SELECT 
-        COALESCE(oi.warehouse_name, 'غير محدد') as warehouse_code,
-        COALESCE(oi.warehouse_name, 'غير محدد') as warehouse_name,
+        COALESCE(NULLIF(oi.warehouse_code, ''), TRIM(REPLACE(REPLACE(oi.warehouse_name, 'مخزن', ''), 'كود', '')), 'غير محدد') as warehouse_code,
+        COALESCE(NULLIF(oi.warehouse_name, ''), 'غير محدد') as warehouse_name,
         COUNT(DISTINCT oi.order_id) as orders_count,
         SUM(oi.quantity) as items_quantity,
         COALESCE(SUM(o.total_order), 0) as associated_revenue
       FROM order_items oi
       JOIN orders o ON oi.order_id = o.id
       WHERE o.created_at_source >= ? AND o.created_at_source < ?
-      GROUP BY COALESCE(oi.warehouse_name, 'غير محدد')
+      GROUP BY COALESCE(NULLIF(oi.warehouse_name, ''), 'غير محدد')
       ORDER BY items_quantity DESC
       LIMIT 50
     `).all(startTime, endTime);
@@ -1003,18 +1209,38 @@ apiRouter.get('/reports', (req: Request, res: Response) => {
     if (warehouses.length === 0) {
       warehouses = db.prepare(`
         SELECT 
-          COALESCE(oi.warehouse_name, 'غير محدد') as warehouse_code,
-          COALESCE(oi.warehouse_name, 'غير محدد') as warehouse_name,
+          COALESCE(NULLIF(oi.warehouse_code, ''), TRIM(REPLACE(REPLACE(oi.warehouse_name, 'مخزن', ''), 'كود', '')), 'غير محدد') as warehouse_code,
+          COALESCE(NULLIF(oi.warehouse_name, ''), 'غير محدد') as warehouse_name,
           COUNT(DISTINCT oi.order_id) as orders_count,
           SUM(oi.quantity) as items_quantity,
           COALESCE(SUM(o.total_order), 0) as associated_revenue
         FROM order_items oi
         JOIN orders o ON oi.order_id = o.id
-        GROUP BY COALESCE(oi.warehouse_name, 'غير محدد')
+        GROUP BY COALESCE(NULLIF(oi.warehouse_name, ''), 'غير محدد')
         ORDER BY items_quantity DESC
         LIMIT 50
       `).all();
     }
+
+    // Genuine Merchants breakdown in period
+    let merchants: any[] = db.prepare(`
+      SELECT 
+        oi.merchant_code,
+        COALESCE(oi.merchant_name, 'تاجر معتمد') as merchant_name,
+        COUNT(DISTINCT oi.order_id) as orders_count,
+        SUM(oi.quantity) as items_quantity,
+        COALESCE(SUM(o.total_order), 0) as associated_revenue
+      FROM order_items oi
+      JOIN orders o ON oi.order_id = o.id
+      WHERE o.created_at_source >= ? AND o.created_at_source < ?
+        AND oi.merchant_code IS NOT NULL
+        AND oi.merchant_code != ''
+        AND oi.merchant_code NOT LIKE 'مخزن%'
+        AND oi.merchant_code != 'غير محدد'
+      GROUP BY oi.merchant_code
+      ORDER BY items_quantity DESC
+      LIMIT 50
+    `).all(startTime, endTime);
 
     // Top Governorates
     let governorates: any[] = db.prepare(`
@@ -1078,6 +1304,7 @@ apiRouter.get('/reports', (req: Request, res: Response) => {
       cancellations,
       employees,
       warehouses,
+      merchants,
       governorates,
       timeline,
       coverage: {
@@ -1647,7 +1874,7 @@ apiRouter.get('/reports/export', (req: Request, res: Response) => {
         o.vendoor_id, o.random_number, o.order_no, o.current_status,
         o.customer_name, o.customer_phone, o.customer_phone_extra,
         o.governorate, o.address, o.total_order, o.delivery_rate, o.created_at_source,
-        i.product_name, i.warehouse_name, i.merchant_code, i.sku, i.quantity
+        i.product_name, i.sku, i.merchant_code, i.merchant_name, i.warehouse_code, i.warehouse_name, i.code_source, i.quantity
       FROM orders o
       LEFT JOIN order_items i ON o.id = i.order_id
       WHERE ${conditions.join(' AND ')}
@@ -1659,7 +1886,7 @@ apiRouter.get('/reports/export', (req: Request, res: Response) => {
       'Vendoor ID', 'Random Code', 'Order No', 'Status',
       'Customer Name', 'Phone', 'Extra Phone', 'Governorate',
       'Address', 'Total Order', 'Delivery Rate', 'Created At',
-      'Product Name', 'Warehouse Name', 'Merchant Code (Text)', 'SKU', 'Quantity'
+      'Product Name', 'SKU', 'Merchant Code (Text)', 'Merchant Name', 'Warehouse Code', 'Warehouse Name', 'Code Source', 'Quantity'
     ];
 
     const escapeCsv = (val: any) => {
@@ -1684,9 +1911,12 @@ apiRouter.get('/reports/export', (req: Request, res: Response) => {
         escapeCsv(r.delivery_rate !== null ? `${r.delivery_rate}%` : 'N/A'),
         escapeCsv(r.created_at_source),
         escapeCsv(r.product_name),
-        escapeCsv(r.warehouse_name || ''),
-        escapeCsv(r.merchant_code || ''),
         escapeCsv(r.sku || ''),
+        escapeCsv(r.merchant_code || ''),
+        escapeCsv(r.merchant_name || ''),
+        escapeCsv(r.warehouse_code || ''),
+        escapeCsv(r.warehouse_name || ''),
+        escapeCsv(r.code_source || ''),
         escapeCsv(r.quantity || 1)
       ].join(','));
     }

@@ -14,6 +14,7 @@ export interface ParsedLogDetails {
   toStatus: string | null;
   summaryAr: string;
   isAdministrative: boolean;
+  extraPhoneOperation?: 'ADDITION' | 'REPLACEMENT' | 'DELETION' | 'UNCLEAR';
   extraMeta?: Record<string, any>;
 }
 
@@ -41,10 +42,10 @@ export function normalizeStatus(raw: string | null): string | null {
   if (lower === 'new' || clean === 'جديد' || clean === 'أوردر جديد' || clean === 'اوردر جديد') return 'New';
   if (lower === 'pending' || clean === 'معلق' || clean === 'قيد الانتظار') return 'Pending';
   if (lower === 'processing' || clean === 'قيد التجهيز' || clean === 'جاري التجهيز') return 'Processing';
-  if (lower === 'printed' || clean === 'مطبوع' || clean === 'تمت الطباعة') return 'Printed';
+  if (lower === 'printed' || clean === 'مطبوع' || clean === 'تمت الطباعة' || clean === 'طباعة') return 'Printed';
   if (lower === 'shipped' || clean === 'تم الشحن' || clean === 'مشحون') return 'Shipped';
   if (lower === 'delivered' || clean === 'تم التسليم' || clean === 'مسلم') return 'Delivered';
-  if (lower === 'canceled' || lower === 'cancelled' || clean === 'ملغي' || clean === 'تم الإلغاء' || clean === 'تم الالغاء') return 'Canceled';
+  if (lower === 'canceled' || lower === 'cancelled' || clean === 'ملغي' || clean === 'تم الإلغاء' || clean === 'تم الالغاء' || clean === 'إلغاء') return 'Canceled';
   if (lower === 'canceling' || clean === 'قيد الإلغاء' || clean === 'قيد الالغاء') return 'Canceling';
   if (lower.includes('returned') || clean.includes('مرتجع') || clean.includes('استرجاع')) return 'Returned';
   if (lower.includes('confirmed') || clean.includes('مؤكد')) return 'Confirmed';
@@ -87,7 +88,14 @@ export function parseLogActionDetails(rawText: string, actorName = '', orderCode
   }
 
   // 2. ORDER CREATED:
-  if (t.includes('أضاف اوردر جديد') || t.includes('انشاء اوردر') || t.includes('طلب جديد') || t.includes('create order')) {
+  const isOrderCreation = 
+    ((t.includes('اوردر جديد') || t.includes('أوردر جديد') || t.includes('طلب جديد') ||
+      t.includes('انشاء اوردر') || t.includes('إنشاء اوردر') || t.includes('انشاء طلب') ||
+      t.includes('إنشاء طلب') || t.includes('أضاف اوردر') || t.includes('اضاف اوردر') ||
+      t.toLowerCase().includes('create order') || t.toLowerCase().includes('order created')) &&
+     !t.includes('عدل') && !t.includes('تعديل'));
+
+  if (isOrderCreation) {
     result.actionType = 'order_created';
     result.actionLabelAr = 'إنشاء طلب جديد';
     result.fieldName = 'حالة الطلب';
@@ -150,19 +158,68 @@ export function parseLogActionDetails(rawText: string, actorName = '', orderCode
     return result;
   }
 
-  // 5. PHONE / EXTRA PHONE EDIT: (رقم هاتف / هاتف آخر / تليفون بديل)
-  const phoneRegex = /(?:رقم\s+هاتف\s+آخر|رقم\s+التليفون\s+البديل|الهاتف\s+الإضافي|الهاتف\s+الاضافي|رقم\s+الهاتف|الموبايل|التليفون|الهاتف)\s+من\s*['"״\s]?([\s\S]+?)(?:'|"|״)?\s*(?:إلى|إلي|الى)\s*['"״\s]?([\s\S]+?)(?:'|"|״)?\s*$/i;
+  // 5. PHONE / EXTRA PHONE:
+  // Pattern 5a: Range (من X إلى Y)
+  const phoneRegex = /(?:رقم\s+هاتف\s+آخر|رقم\s+التليفون\s+البديل|الهاتف\s+الإضافي|الهاتف\s+الاضافي|هاتف\s+آخر|هاتف\s+بديل|رقم\s+الهاتف|الموبايل|التليفون|الهاتف)\s+من\s*['"״\s]?([\s\S]*?)(?:'|"|״)?\s*(?:إلى|إلي|الى)\s*['"״\s]?([\s\S]+?)(?:'|"|״)?\s*$/i;
   const phoneMatch = t.match(phoneRegex);
   if (phoneMatch) {
     const isExtra = t.includes('آخر') || t.includes('بديل') || t.includes('إضافي') || t.includes('اضافي');
     const oldVal = phoneMatch[1].trim().replace(/^['"״]|['"״]$/g, '');
     const newVal = phoneMatch[2].trim().replace(/^['"״]|['"״]$/g, '');
-    result.actionType = 'phone_edit';
+    result.actionType = isExtra ? 'extra_phone_edit' : 'phone_edit';
     result.actionLabelAr = isExtra ? 'تعديل الهاتف الإضافي' : 'تعديل رقم الهاتف';
     result.fieldName = isExtra ? 'الهاتف الإضافي' : 'رقم الهاتف';
     result.oldValue = oldVal;
     result.newValue = newVal;
+    
+    // Classify extra phone operation
+    if (isExtra) {
+      const cleanOld = oldVal.replace(/['"״]/g, '').trim();
+      const cleanNew = newVal.replace(/['"״]/g, '').trim();
+      if (!cleanOld && cleanNew) {
+        result.extraPhoneOperation = 'ADDITION';
+      } else if (cleanOld && !cleanNew) {
+        result.extraPhoneOperation = 'DELETION';
+      } else if (cleanOld && cleanNew && cleanOld !== cleanNew) {
+        result.extraPhoneOperation = 'REPLACEMENT';
+      } else {
+        result.extraPhoneOperation = 'UNCLEAR';
+      }
+    }
+
     result.summaryAr = `تعديل ${result.fieldName} من (${oldVal}) إلى (${newVal})`;
+    result.isAdministrative = false;
+    return result;
+  }
+
+  // Pattern 5b: Direct Addition of extra phone (أضاف رقم هاتف آخر : 010... أو رقم هاتف آخر إلى '010...')
+  const extraAddRegex = /(?:أضاف|اضاف)\s+(?:رقم\s+هاتف\s+آخر|رقم\s+التليفون\s+البديل|الهاتف\s+الإضافي|الهاتف\s+الاضافي|هاتف\s+آخر|هاتف\s+بديل)\s*[:：]\s*([\d\+\-\s]+)/i;
+  const extraAddMatch = t.match(extraAddRegex);
+  if (extraAddMatch) {
+    const newVal = extraAddMatch[1].trim();
+    result.actionType = 'extra_phone_added';
+    result.actionLabelAr = 'إضافة هاتف إضافي';
+    result.fieldName = 'الهاتف الإضافي';
+    result.oldValue = '';
+    result.newValue = newVal;
+    result.extraPhoneOperation = 'ADDITION';
+    result.summaryAr = `إضافة رقم هاتف إضافي: "${newVal}"`;
+    result.isAdministrative = false;
+    return result;
+  }
+
+  // Pattern 5c: Target only extra phone (رقم هاتف آخر إلى '010...')
+  const extraToRegex = /(?:رقم\s+هاتف\s+آخر|رقم\s+التليفون\s+البديل|الهاتف\s+الإضافي|الهاتف\s+الاضافي|هاتف\s+آخر|هاتف\s+بديل)\s+(?:إلى|إلي|الى)\s*['"״\s]?([\s\S]+?)(?:'|"|״)?\s*$/i;
+  const extraToMatch = t.match(extraToRegex);
+  if (extraToMatch) {
+    const newVal = extraToMatch[1].trim().replace(/^['"״]|['"״]$/g, '');
+    result.actionType = 'extra_phone_added';
+    result.actionLabelAr = 'إضافة هاتف إضافي';
+    result.fieldName = 'الهاتف الإضافي';
+    result.oldValue = '';
+    result.newValue = newVal;
+    result.extraPhoneOperation = 'ADDITION';
+    result.summaryAr = `إضافة رقم هاتف إضافي: "${newVal}"`;
     result.isAdministrative = false;
     return result;
   }
@@ -219,18 +276,20 @@ export function parseLogActionDetails(rawText: string, actorName = '', orderCode
     return result;
   }
 
-  // 10. PRINTING / INVOICING:
-  if (t.includes('طباعة') || t.includes('بوليصة') || t.includes('print')) {
+  // 10. PRINTING / INVOICING / CONFIRMATION (Rule: Printed = تأكيد الأوردر):
+  if (t.includes('طباعة') || t.includes('بوليصة') || t.toLowerCase().includes('print') || t.includes('مطبوع')) {
     result.actionType = 'print';
-    result.actionLabelAr = 'طباعة البوليصة';
-    result.fieldName = 'الطباعة';
-    result.summaryAr = 'تمت طباعة بوليصة الشحن';
+    result.actionLabelAr = 'طباعة وتأكيد الأوردر';
+    result.fieldName = 'حالة الطلب';
+    result.newValue = 'Printed';
+    result.toStatus = 'Printed';
+    result.summaryAr = 'طباعة بوليصة الشحن وتأكيد الأوردر (Printed)';
     result.isAdministrative = false;
     return result;
   }
 
   // 11. STAFF ASSIGNMENT:
-  if (t.includes('تعيين') || t.includes('مسؤول') || t.includes('assign')) {
+  if (t.includes('تعيين') || t.includes('مسؤول') || t.toLowerCase().includes('assign')) {
     result.actionType = 'assign_staff';
     result.actionLabelAr = 'تعيين موظف مسؤول';
     result.fieldName = 'المسؤول';

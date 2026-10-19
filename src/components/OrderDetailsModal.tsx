@@ -299,19 +299,48 @@ export const OrderDetailsModal: React.FC<OrderDetailsModalProps> = ({ orderCode,
                           </td>
                           <td className="py-2.5 px-3 text-slate-300 font-mono text-[11px]">{item.sku || '—'}</td>
                           <td className="py-2.5 px-3 font-mono font-bold">
-                            {item.merchant_code && item.merchant_code.trim().length > 0 && !item.merchant_code.startsWith('مخزن ') && item.merchant_code !== 'غير محدد' ? (
-                              <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded bg-amber-950/70 border border-amber-500/60 text-amber-300 text-xs shadow-xs">
-                                {item.merchant_code}
-                              </span>
-                            ) : (
-                              <span
-                                className="inline-flex items-center gap-1 px-2 py-0.5 rounded bg-slate-900 border border-slate-700/60 text-slate-400 font-sans text-[11px]"
-                                title="كود التاجر غير متوفر في مصدر الطلب الأصلي - بانتظار استيراد ملف أكواد التجار المعتمد"
-                              >
-                                <span className="w-1.5 h-1.5 rounded-full bg-slate-500"></span>
-                                غير متوفر
-                              </span>
-                            )}
+                            {(() => {
+                              const rawCode = item.merchant_code ? String(item.merchant_code).trim() : '';
+                              const isWarehouseName = rawCode.startsWith('مخزن') ||
+                                                      rawCode.startsWith('كود ') ||
+                                                      rawCode === 'غير محدد' ||
+                                                      rawCode === item.warehouse_name ||
+                                                      (item.warehouse_code && rawCode === item.warehouse_code);
+
+                              if (rawCode.length > 0 && !isWarehouseName) {
+                                const sourceLabel = item.code_source === 'EXCEL_MAPPING'
+                                  ? 'معتمد من ملف توفيق الإكسيل'
+                                  : item.code_source === 'ORDER_ENRICHMENT'
+                                  ? 'مستخرج من صفحة تفاصيل الطلب الأصلية'
+                                  : 'من المصدر الأصلي Vendoor';
+
+                                return (
+                                  <div className="flex flex-col items-start gap-0.5">
+                                    <span
+                                      className="inline-flex items-center gap-1 px-2 py-0.5 rounded bg-amber-950/70 border border-amber-500/60 text-amber-300 text-xs shadow-xs"
+                                      title={`كود تاجر حقيقي (${sourceLabel})`}
+                                    >
+                                      {rawCode}
+                                    </span>
+                                    {item.merchant_name && (
+                                      <span className="text-[10px] text-slate-400 font-sans">
+                                        {item.merchant_name}
+                                      </span>
+                                    )}
+                                  </div>
+                                );
+                              }
+
+                              return (
+                                <span
+                                  className="inline-flex items-center gap-1 px-2 py-0.5 rounded bg-slate-900 border border-slate-700/60 text-slate-400 font-sans text-[11px]"
+                                  title="كود التاجر غير متوفر في مصدر الطلب الأصلي - بانتظار استيراد ملف أكواد التجار المعتمد"
+                                >
+                                  <span className="w-1.5 h-1.5 rounded-full bg-slate-500"></span>
+                                  غير متوفر
+                                </span>
+                              );
+                            })()}
                           </td>
                           <td className="py-2.5 px-3 font-mono">
                             {item.warehouse_code ? (

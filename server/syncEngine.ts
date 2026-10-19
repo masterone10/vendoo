@@ -481,8 +481,8 @@ export class SyncEngine {
     const insertItemStmt = db.prepare(`
       INSERT INTO order_items (
         order_id, vendoor_item_id, product_id, product_name, merchant_code,
-        warehouse_name, warehouse_code, sku, size, color, quantity, unit_price, pay_vendor, image_path, raw_json, created_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        warehouse_name, warehouse_code, sku, size, color, quantity, unit_price, pay_vendor, image_path, raw_json, code_source, created_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `);
 
     const updateItemStmt = db.prepare(`
@@ -497,7 +497,8 @@ export class SyncEngine {
         quantity = ?,
         unit_price = ?,
         pay_vendor = ?,
-        image_path = COALESCE(?, image_path)
+        image_path = COALESCE(?, image_path),
+        code_source = COALESCE(?, code_source)
       WHERE id = ?
     `);
 
@@ -509,14 +510,34 @@ export class SyncEngine {
       // Extract genuine merchant code ONLY if explicitly provided in source as merchant/vendor code
       // Never guess, never extract from product name, SKU, or warehouse name!
       let genuineMerchantCode: string | null = null;
-      if (p.merchant_code && typeof p.merchant_code === 'string' && !p.merchant_code.startsWith('مخزن ') && p.merchant_code !== 'غير محدد') {
+      let codeSource: string = 'VENDOOR_SOURCE';
+      if (p.merchant_code && typeof p.merchant_code === 'string' && !p.merchant_code.startsWith('مخزن') && p.merchant_code !== 'غير محدد') {
         genuineMerchantCode = p.merchant_code.trim();
-      } else if (p.vendor_code && typeof p.vendor_code === 'string' && !p.vendor_code.startsWith('مخزن ') && p.vendor_code !== 'غير محدد') {
+      } else if (p.vendor_code && typeof p.vendor_code === 'string' && !p.vendor_code.startsWith('مخزن') && p.vendor_code !== 'غير محدد') {
         genuineMerchantCode = p.vendor_code.trim();
-      } else if (p.pivot?.merchant_code && typeof p.pivot.merchant_code === 'string' && !p.pivot.merchant_code.startsWith('مخزن ') && p.pivot.merchant_code !== 'غير محدد') {
+      } else if (p.pivot?.merchant_code && typeof p.pivot.merchant_code === 'string' && !p.pivot.merchant_code.startsWith('مخزن') && p.pivot.merchant_code !== 'غير محدد') {
         genuineMerchantCode = p.pivot.merchant_code.trim();
       } else if (p.pivot?.vendor_id && String(p.pivot.vendor_id).trim()) {
         genuineMerchantCode = String(p.pivot.vendor_id).trim();
+      }
+
+      // If genuineMerchantCode not in payload, check persistent merchant_code_mappings by SKU or Product ID
+      if (!genuineMerchantCode) {
+        const skuVal = p.pivot?.code || null;
+        const prodId = p.id || null;
+        try {
+          let mapped: any = null;
+          if (skuVal) {
+            mapped = db.prepare("SELECT merchant_code FROM merchant_code_mappings WHERE sku = ? AND merchant_code IS NOT NULL AND merchant_code != '' LIMIT 1").get(skuVal);
+          }
+          if (!mapped && prodId) {
+            mapped = db.prepare("SELECT merchant_code FROM merchant_code_mappings WHERE product_id = ? AND merchant_code IS NOT NULL AND merchant_code != '' LIMIT 1").get(prodId);
+          }
+          if (mapped && mapped.merchant_code) {
+            genuineMerchantCode = mapped.merchant_code;
+            codeSource = 'EXCEL_MAPPING';
+          }
+        } catch {}
       }
 
       const itemId = p.pivot?.id || null;
@@ -531,10 +552,11 @@ export class SyncEngine {
       if (itemId && existingMap.has(itemId)) {
         seenIds.add(itemId);
         const curr = existingMap.get(itemId);
-        const existingMerchantCode = curr.merchant_code && !curr.merchant_code.startsWith('مخزن ') && curr.merchant_code !== 'غير محدد' ? curr.merchant_code : null;
+        const existingMerchantCode = curr.merchant_code && !curr.merchant_code.startsWith('مخزن') && curr.merchant_code !== 'غير محدد' ? curr.merchant_code : null;
         const finalMerchantCode = genuineMerchantCode || existingMerchantCode;
+        const finalSource = genuineMerchantCode ? codeSource : (curr.code_source || 'VENDOOR_SOURCE');
         if (curr.quantity !== qty || curr.unit_price !== unitPrice || curr.product_name !== productName || curr.warehouse_name !== warehouse || curr.merchant_code !== finalMerchantCode) {
-          updateItemStmt.run(productName, finalMerchantCode, warehouse, warehouseCode, sku, size, color, qty, unitPrice, payVendor, p.image_path || null, curr.id);
+          updateItemStmt.run(productName, finalMerchantCode, warehouse, warehouseCode, sku, size, color, qty, unitPrice, payVendor, p.image_path || null, finalSource, curr.id);
         }
       } else {
         insertItemStmt.run(
@@ -553,6 +575,7 @@ export class SyncEngine {
           payVendor,
           p.image_path || null,
           JSON.stringify(p),
+          codeSource,
           nowIso
         );
         if (itemId) seenIds.add(itemId);
@@ -1848,6 +1871,34 @@ export class SyncEngine {
                 last_enrichment_status = 'SUCCESS'
               WHERE id = ?
             `).run(res.anotherPhone || null, res.extraPhoneValid ? 1 : 0, status, nowIso, ord.id);
+
+            // Enrich items with verified vendor ID if available
+            if (res.vendorIds && res.vendorIds.length === 1) {
+              const vId = res.vendorIds[0];
+              if (vId && !vId.startsWith('مخزن') && vId !== 'غير محدد') {
+                db.prepare(`
+                  UPDATE order_items
+                  SET merchant_code = ?,
+                      code_source = 'ORDER_ENRICHMENT'
+                  WHERE order_id = ?
+                    AND (merchant_code IS NULL OR merchant_code = '' OR merchant_code LIKE 'مخزن%' OR merchant_code = 'غير محدد')
+                `).run(vId, ord.id);
+              }
+            }
+
+            // Enrich items with warehouse names if missing
+            if (res.warehouseNames && res.warehouseNames.length > 0) {
+              for (const wh of res.warehouseNames) {
+                const cleanWhCode = wh.replace(/^مخزن\s*/, '').trim();
+                db.prepare(`
+                  UPDATE order_items
+                  SET warehouse_name = ?,
+                      warehouse_code = ?
+                  WHERE order_id = ?
+                    AND (warehouse_name IS NULL OR warehouse_name = '' OR warehouse_name = 'غير محدد')
+                `).run(wh, cleanWhCode, ord.id);
+              }
+            }
           } else {
             db.prepare(`
               UPDATE orders SET

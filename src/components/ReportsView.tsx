@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useMemo } from 'react';
+import React, { useState, useEffect, useMemo, useRef } from 'react';
 import {
   BarChart3,
   Calendar,
@@ -24,1278 +24,876 @@ import {
   CheckCircle2,
   Filter,
   ChevronLeft,
+  ChevronRight,
+  User,
+  Phone,
+  FileText,
+  Activity,
+  AlertCircle,
+  HelpCircle,
+  Info,
+  ExternalLink,
 } from 'lucide-react';
-import { DateCalendarPicker } from './common/DateCalendarPicker';
+import { DateCalendarPicker, getCairoToday, formatDateArabic } from './common/DateCalendarPicker';
 import { ReportKpiDrilldownModal, DrilldownPillar } from './ReportKpiDrilldownModal';
+import { LogsIntelligenceReport, RangeJobState } from '../types';
 
 interface ReportsViewProps {
   onSelectOrder?: (orderCode: string) => void;
 }
 
-interface WarehouseMetric {
-  warehouse_code: string;
-  orders_count: number;
-  items_quantity: number;
-  associated_revenue?: number;
-}
-
-interface EmployeeMetric {
-  actor_name: string;
-  action_count: number;
-  unique_orders: number;
-  printed_count?: number;
-  cancel_count?: number;
-}
-
-interface TransitionMetric {
-  from_status: string;
-  to_status: string;
-  count: number;
-}
-
-interface TimelineItem {
-  date: string;
-  events_count: number;
-  unique_orders: number;
-}
-
-interface DailyCreatedItem {
-  date: string;
-  created_count: number;
-  daily_revenue: number;
-}
-
-interface GovernorateMetric {
-  governorate: string;
-  count: number;
-  total_value?: number;
-}
-
-interface OrderStatusMetric {
-  status: string;
-  count: number;
-  total_value: number;
-}
-
-interface ReportData {
-  startDate: string;
-  endDate: string;
-  period: string;
-  createdCount: number;
-  totalOrderValue?: number;
-  averageOrderValue?: number;
-  multiWarehouseCount?: number;
-  multiWarehouseStats?: {
-    totalOrders: number;
-    multiOrders: number;
-    singleOrders: number;
-    multiValue: number;
-    singleValue: number;
-  };
-  touchedCount: number;
-  totalEvents: number;
-  statusCounts?: {
-    printed: number;
-    pending: number;
-    processing: number;
-    canceling: number;
-  };
-  ordersByStatus?: OrderStatusMetric[];
-  dailyCreated?: DailyCreatedItem[];
-  transitions: TransitionMetric[];
-  cancellations: { to_status: string; count: number }[];
-  employees: EmployeeMetric[];
-  warehouses?: WarehouseMetric[];
-  governorates?: GovernorateMetric[];
-  timeline?: TimelineItem[];
-  coverage?: {
-    totalDays: number;
-    completeDays: number;
-    partialDays: number;
-    isFullyComplete: boolean;
-  };
-}
-
 export const ReportsView: React.FC<ReportsViewProps> = ({ onSelectOrder }) => {
-  const [period, setPeriod] = useState<'today' | 'yesterday' | 'last_7_days' | 'last_30_days' | 'custom'>('today');
-  const [startDate, setStartDate] = useState('');
-  const [endDate, setEndDate] = useState('');
-  const [data, setData] = useState<ReportData | null>(null);
-  const [loading, setLoading] = useState(false);
-  const [activeTab, setActiveTab] = useState<'overview' | 'warehouses' | 'team' | 'regions'>('overview');
-  const [copiedSummary, setCopiedSummary] = useState(false);
+  const cairoToday = useMemo(() => getCairoToday(), []);
 
-  // Filters and sorts
-  const [warehouseSearch, setWarehouseSearch] = useState('');
-  const [warehouseSort, setWarehouseSort] = useState<'items' | 'orders' | 'revenue'>('items');
-  const [employeeSearch, setEmployeeSearch] = useState('');
-  const [transitionSearch, setTransitionSearch] = useState('');
+  // Selection mode: 'single' (day) or 'range' (week / custom)
+  const [calendarMode, setCalendarMode] = useState<'single' | 'range'>('single');
+  const [singleDate, setSingleDate] = useState<string>(cairoToday);
+  const [startDate, setStartDate] = useState<string>(cairoToday);
+  const [endDate, setEndDate] = useState<string>(cairoToday);
+
+  // Quick preset button active state
+  const [activePreset, setActivePreset] = useState<'today' | 'yesterday' | 'week' | 'custom'>('today');
+
+  // Intelligence Report state
+  const [report, setReport] = useState<LogsIntelligenceReport | null>(null);
+  const [loading, setLoading] = useState<boolean>(false);
+  const [jobStatus, setJobStatus] = useState<RangeJobState | null>(null);
+  const [copiedSummary, setCopiedSummary] = useState<boolean>(false);
+
+  // Active view tab
+  const [activeTab, setActiveTab] = useState<'overview' | 'daily_breakdown' | 'employees' | 'transitions' | 'admin_edits' | 'unresolved'>('overview');
+
+  // Filters & drilldown
   const [drilldownPillar, setDrilldownPillar] = useState<DrilldownPillar | null>(null);
+  const [drilldownActor, setDrilldownActor] = useState<string | undefined>(undefined);
+  const [employeeSearch, setEmployeeSearch] = useState<string>('');
+  const [employeeTypeFilter, setEmployeeTypeFilter] = useState<'ALL' | 'STAFF' | 'SYSTEM'>('ALL');
 
+  // Polling ref for job status
+  const pollIntervalRef = useRef<any>(null);
+
+  // Effective start & end dates
+  const effectiveStart = calendarMode === 'single' ? singleDate : startDate;
+  const effectiveEnd = calendarMode === 'single' ? singleDate : endDate;
+
+  // Load report when date selection changes
   useEffect(() => {
-    fetchReport();
-  }, [period, startDate, endDate]);
+    fetchReport(effectiveStart, effectiveEnd);
+    return () => {
+      if (pollIntervalRef.current) clearInterval(pollIntervalRef.current);
+    };
+  }, [effectiveStart, effectiveEnd]);
 
-  async function fetchReport() {
+  async function fetchReport(s: string, e: string, forceFetch = false) {
     setLoading(true);
     try {
-      let url = `/api/reports?period=${period}`;
-      if (period === 'custom' && startDate && endDate) {
-        url = `/api/reports?startDate=${startDate}&endDate=${endDate}`;
+      const url = forceFetch
+        ? `/api/reports/logs-fetch`
+        : `/api/reports/logs-intelligence?startDate=${s}&endDate=${e}&autoFetch=true`;
+
+      let res;
+      if (forceFetch) {
+        res = await fetch(url, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ startDate: s, endDate: e }),
+        });
+      } else {
+        res = await fetch(url);
       }
-      const res = await fetch(url);
+
       const json = await res.json();
-      setData(json);
+      if (json.success && json.report) {
+        setReport(json.report);
+        setJobStatus(json.jobStatus || null);
+
+        // If job is running, start polling status
+        const isRunning =
+          json.jobStatus &&
+          (json.jobStatus.stage === 'CHECKING_STORAGE' ||
+            json.jobStatus.stage === 'FETCHING_VENDOOR' ||
+            json.jobStatus.stage === 'SAVING_RECORDS' ||
+            json.jobStatus.stage === 'ANALYZING_ACTIONS' ||
+            json.jobStatus.stage === 'COMPUTING_METRICS' ||
+            json.jobStatus.stage === 'PREPARING_REPORT');
+
+        if (isRunning) {
+          startPolling(s, e);
+        } else {
+          setLoading(false);
+        }
+      } else {
+        setLoading(false);
+      }
     } catch (err) {
-      console.error('Error fetching operational report:', err);
-    } finally {
+      console.error('Error fetching logs intelligence report:', err);
       setLoading(false);
     }
   }
 
-  // Copy Executive Summary in Arabic
+  function startPolling(s: string, e: string) {
+    if (pollIntervalRef.current) clearInterval(pollIntervalRef.current);
+
+    pollIntervalRef.current = setInterval(async () => {
+      try {
+        const res = await fetch(`/api/reports/logs-status?startDate=${s}&endDate=${e}`);
+        const data = await res.json();
+        if (data.success && data.job) {
+          setJobStatus(data.job);
+          if (data.job.stage === 'COMPLETE' || data.job.stage === 'PARTIAL' || data.job.stage === 'FAILED') {
+            clearInterval(pollIntervalRef.current);
+            // Refresh final report data
+            const repRes = await fetch(`/api/reports/logs-intelligence?startDate=${s}&endDate=${e}&autoFetch=false`);
+            const repData = await repRes.json();
+            if (repData.success && repData.report) {
+              setReport(repData.report);
+            }
+            setLoading(false);
+          }
+        }
+      } catch (pollErr) {
+        console.error('Error polling logs status:', pollErr);
+      }
+    }, 1500);
+  }
+
+  // Preset handlers
+  function handlePresetToday() {
+    setActivePreset('today');
+    setCalendarMode('single');
+    setSingleDate(cairoToday);
+  }
+
+  function handlePresetYesterday() {
+    setActivePreset('yesterday');
+    setCalendarMode('single');
+    const now = new Date();
+    const y = new Date(now.getTime() - 24 * 60 * 60 * 1000);
+    const yStr = new Intl.DateTimeFormat('en-CA', { timeZone: 'Africa/Cairo' }).format(y);
+    setSingleDate(yStr);
+  }
+
+  function handlePresetWeek() {
+    setActivePreset('week');
+    setCalendarMode('range');
+    const now = new Date();
+    const past = new Date(now.getTime() - 6 * 24 * 60 * 60 * 1000);
+    const sStr = new Intl.DateTimeFormat('en-CA', { timeZone: 'Africa/Cairo' }).format(past);
+    setStartDate(sStr);
+    setEndDate(cairoToday);
+  }
+
+  // Copy Executive Arabic Summary
   function handleCopySummary() {
-    if (!data) return;
-    const periodLabel =
-      period === 'today'
-        ? 'اليوم'
-        : period === 'yesterday'
-        ? 'أمس'
-        : period === 'last_7_days'
-        ? 'آخر 7 أيام'
-        : period === 'last_30_days'
-        ? 'آخر 30 يوماً'
-        : `من ${data.startDate} إلى ${data.endDate}`;
+    if (!report) return;
+    const m = report.metrics;
+    const periodLabel = report.periodLabel;
 
-    const printedCount = data.ordersByStatus?.find((s) => s.status === 'Printed')?.count || data.statusCounts?.printed || 0;
-    const printedVal = data.ordersByStatus?.find((s) => s.status === 'Printed')?.total_value || 0;
-    const confRate = data.createdCount > 0 ? Math.round((printedCount / data.createdCount) * 100) : 0;
-    const totalCancels = data.cancellations?.reduce((acc, c) => acc + c.count, 0) || 0;
-    const cancelRate = data.createdCount > 0 ? Math.round((totalCancels / data.createdCount) * 100) : 0;
-
-    const summary = `📊 *تقرير عمليات Vendoor والمخازن التنفيذي*
-الفترة: ${periodLabel} (${data.startDate} إلى ${data.endDate})
+    const summary = `📊 *تقرير نشاط عمليات Vendoor الذكي (مبني على اللوجز المصدرية وحدها)*
+الفترة: ${periodLabel}
+توقيت البداية إلى النهاية: [${report.cairoInterval.startCairo} إلى ${report.cairoInterval.endExclusiveCairo})
 -----------------------------------------
-📦 *مؤشرات حجم الإنشاء والمبيعات:*
-• إجمالي الطلبات المنشأة: ${data.createdCount.toLocaleString()} طلب
-• القيمة الإجمالية للطلبات: ${(data.totalOrderValue || 0).toLocaleString()} ج.م
-• متوسط قيمة الطلب (AOV): ${(data.averageOrderValue || 0).toLocaleString()} ج.م
+🎯 *إجابات مؤشرات النشاط الأساسية:*
+• إجمالي حركات اللوجز المسجلة: ${m.totalLogs.toLocaleString()} حركة
+• عدد الطلبات الفريدة التي شهدت نشاطاً: ${m.uniqueOrdersTouched.toLocaleString()} طلب فريد
 
-✅ *مؤشرات التأكيد ومسار الحالات:*
-• طلبات مؤكدة (Printed): ${printedCount.toLocaleString()} طلب (${confRate}% من المنشأ)
-• قيمة الطلبات المؤكدة: ${printedVal.toLocaleString()} ج.م
-• طلبات قيد المعالجة والتجهيز: ${((data.statusCounts?.pending || 0) + (data.statusCounts?.processing || 0)).toLocaleString()} طلب
-• حركات الإلغاء المسجلة: ${totalCancels.toLocaleString()} حركة (${cancelRate}%)
+📦 *1. الأوردرات المنشأة (Created):*
+• طلبات منشأة جديدة: ${m.createdOrdersCount.toLocaleString()} طلب فريد
+• إجمالي أحداث إنشاء الطلبات: ${m.createdEventsCount.toLocaleString()} حدث
 
-🏢 *ذكاء تشغيل المخازن (Warehouses):*
-• عدد المخازن النشطة: ${data.warehouses?.length || 0} مخزن
-• طلبات تعدد المخازن (Multi-Warehouse): ${(data.multiWarehouseCount || 0).toLocaleString()} طلب
-• طلبات المخزن الواحد: ${(data.multiWarehouseStats?.singleOrders || (data.createdCount - (data.multiWarehouseCount || 0))).toLocaleString()} طلب
+✅ *2. الأوردرات المؤكدة (Printed = تأكيد الأوردر):*
+• طلبات تم تأكيدها: ${m.confirmedOrdersCount.toLocaleString()} طلب فريد وصلت لحالة Printed
+• إجمالي أحداث الطباعة والتأكيد: ${m.printedEventsCount.toLocaleString()} حدث طباعة
 
-👥 *إنتاجية الفريق والعمليات:*
-• إجمالي العمليات الموثقة: ${data.totalEvents.toLocaleString()} حركة
-• عدد الطلبات التي خضعت للنشاط: ${data.touchedCount.toLocaleString()} طلب
-• كادر العمليات الفعّال: ${data.employees?.length || 0} موظف
+❌ *3. الأوردرات الملغاة (Canceled):*
+• طلبات ألغيت نهائياً: ${m.canceledOrdersCount.toLocaleString()} طلب فريد (حالة Canceled)
+• أحداث الإلغاء النهائي: ${m.canceledEventsCount.toLocaleString()} حدث
+• أحداث قيد الإلغاء (معزولة): ${m.cancelingEventsCount.toLocaleString()} حدث Canceling
+
+📞 *4. حركات الهاتف الإضافي:*
+• طلبات أضيف لها رقم إضافي: ${m.extraPhonesAddedUniqueOrders.toLocaleString()} طلب فريد
+• إجمالي أحداث إضافة رقم إضافي: ${m.extraPhonesAddedEvents.toLocaleString()} حركة
+• استبدال أرقام هواتف: ${m.extraPhonesReplacedCount.toLocaleString()} حركة
+• حذف أرقام هواتف: ${m.extraPhonesDeletedCount.toLocaleString()} حركة
+
+👥 *5. كادر العمليات والنشاط البشري:*
+• عدد الموظفين الفاعلين: ${report.employees.filter((e) => e.is_system === 0).length} موظف
+• إجمالي التعديلات الإدارية: ${m.adminEditsCount.toLocaleString()} تعديل
+• حركات تحتاج إلى مراجعة: ${m.unresolvedCount.toLocaleString()} حركة
 -----------------------------------------
-صدر آلياً من منظومة مراقبة عمليات فيندور (Vendoor Operations Intelligence)`;
+حالة التغطية: ${report.status === 'COMPLETE' ? '✅ مكتملة وموثقة' : '⚠️ جزئية'}
+المصدر: لوجز Vendoor المصدرية المباشرة`;
 
-    navigator.clipboard.writeText(summary).then(() => {
-      setCopiedSummary(true);
-      setTimeout(() => setCopiedSummary(false), 2500);
-    });
+    navigator.clipboard.writeText(summary);
+    setCopiedSummary(true);
+    setTimeout(() => setCopiedSummary(false), 2500);
   }
 
-  // Export to CSV
-  function handleExportCSV() {
-    if (!data) return;
-
-    let csvContent = '\uFEFF'; // UTF-8 BOM for Arabic support in Excel
-
-    // Section 1: Executive Overview
-    csvContent += 'التقرير التشغيلي الشامل والمخازن - Vendoor Operations Intelligence\n';
-    csvContent += `النطاق الزمني,من ${data.startDate} إلى ${data.endDate},الفترة,${period}\n\n`;
-
-    csvContent += 'المؤشر,القيمة,ملاحظات\n';
-    csvContent += `إجمالي الطلبات المنشأة,${data.createdCount},طلب\n`;
-    csvContent += `القيمة الإجمالية للمبيعات,${data.totalOrderValue || 0},جنيه مصري\n`;
-    csvContent += `متوسط قيمة الطلب,${data.averageOrderValue || 0},جنيه مصري\n`;
-    csvContent += `الطلبات المؤكدة (Printed),${data.statusCounts?.printed || 0},طلب\n`;
-    csvContent += `طلبات تعدد المخازن,${data.multiWarehouseCount || 0},طلب\n`;
-    csvContent += `إجمالي الحركات والعمليات,${data.totalEvents},حركة موثقة\n\n`;
-
-    // Section 2: Orders by Status
-    if (data.ordersByStatus && data.ordersByStatus.length > 0) {
-      csvContent += '--- توزيع حالات الطلبات ---\n';
-      csvContent += 'الحالة,عدد الطلبات,النسبة المئوية,القيمة الإجمالية (ج.م)\n';
-      data.ordersByStatus.forEach((s) => {
-        const pct = data.createdCount > 0 ? ((s.count / data.createdCount) * 100).toFixed(1) : '0';
-        csvContent += `"${s.status}",${s.count},${pct}%,${s.total_value}\n`;
-      });
-      csvContent += '\n';
-    }
-
-    // Section 3: Warehouses Breakdown
-    if (data.warehouses && data.warehouses.length > 0) {
-      csvContent += '--- تحليل حركة المخازن والأصناف ---\n';
-      csvContent += 'م,كود المخزن,عدد الطلبات,إجمالي القطع,القيمة التقديرية (ج.م)\n';
-      data.warehouses.forEach((w, idx) => {
-        csvContent += `${idx + 1},"${w.warehouse_code}",${w.orders_count},${w.items_quantity},${w.associated_revenue || 0}\n`;
-      });
-      csvContent += '\n';
-    }
-
-    // Section 4: Employees
-    if (data.employees && data.employees.length > 0) {
-      csvContent += '--- إنتاجية فريق العمليات ---\n';
-      csvContent += 'م,اسم الموظف,إجمالي الحركات,الطلبات الفريدة,تأكيدات الطباعة,الإلغاءات\n';
-      data.employees.forEach((e, idx) => {
-        csvContent += `${idx + 1},"${e.actor_name}",${e.action_count},${e.unique_orders},${e.printed_count || 0},${e.cancel_count || 0}\n`;
-      });
-    }
-
-    const blob = new Blob([csvContent], { type: 'text/csv;charset=utf-8;' });
-    const link = document.createElement('a');
-    const filename = `vendoor_report_${data.startDate}_to_${data.endDate}.csv`;
-    link.href = URL.createObjectURL(blob);
-    link.setAttribute('download', filename);
-    document.body.appendChild(link);
-    link.click();
-    document.body.removeChild(link);
-  }
-
-  function handlePrint() {
-    window.print();
-  }
-
-  // Filtered and Sorted Warehouses
-  const processedWarehouses = useMemo(() => {
-    if (!data?.warehouses) return [];
-    let list = [...data.warehouses];
-    if (warehouseSearch.trim()) {
-      const q = warehouseSearch.toLowerCase();
-      list = list.filter((w) => w.warehouse_code.toLowerCase().includes(q));
-    }
-    list.sort((a, b) => {
-      if (warehouseSort === 'items') return b.items_quantity - a.items_quantity;
-      if (warehouseSort === 'orders') return b.orders_count - a.orders_count;
-      if (warehouseSort === 'revenue') return (b.associated_revenue || 0) - (a.associated_revenue || 0);
-      return 0;
-    });
-    return list;
-  }, [data?.warehouses, warehouseSearch, warehouseSort]);
-
+  // Filtered employees list
   const filteredEmployees = useMemo(() => {
-    if (!data?.employees) return [];
-    if (!employeeSearch.trim()) return data.employees;
-    const q = employeeSearch.toLowerCase();
-    return data.employees.filter((e) => e.actor_name.toLowerCase().includes(q));
-  }, [data?.employees, employeeSearch]);
+    if (!report?.employees) return [];
+    return report.employees.filter((emp) => {
+      const matchSearch =
+        !employeeSearch.trim() ||
+        emp.actor_name.toLowerCase().includes(employeeSearch.trim().toLowerCase());
+      const matchType =
+        employeeTypeFilter === 'ALL' ||
+        (employeeTypeFilter === 'STAFF' && emp.is_system === 0) ||
+        (employeeTypeFilter === 'SYSTEM' && emp.is_system === 1);
+      return matchSearch && matchType;
+    });
+  }, [report?.employees, employeeSearch, employeeTypeFilter]);
 
-  const filteredTransitions = useMemo(() => {
-    if (!data?.transitions) return [];
-    if (!transitionSearch.trim()) return data.transitions;
-    const q = transitionSearch.toLowerCase();
-    return data.transitions.filter(
-      (t) => (t.from_status || '').toLowerCase().includes(q) || (t.to_status || '').toLowerCase().includes(q)
-    );
-  }, [data?.transitions, transitionSearch]);
-
-  // Derived calculations for executive KPIs
-  const totalCancellations = useMemo(() => {
-    return data?.cancellations?.reduce((acc, curr) => acc + curr.count, 0) || 0;
-  }, [data?.cancellations]);
-
-  const printedOrdersCount = useMemo(() => {
-    return data?.ordersByStatus?.find((s) => s.status === 'Printed')?.count || data?.statusCounts?.printed || 0;
-  }, [data?.ordersByStatus, data?.statusCounts]);
-
-  const printedOrdersRevenue = useMemo(() => {
-    return data?.ordersByStatus?.find((s) => s.status === 'Printed')?.total_value || 0;
-  }, [data?.ordersByStatus]);
-
-  const confirmationRate = useMemo(() => {
-    if (!data || data.createdCount === 0) return 0;
-    return Math.round((printedOrdersCount / data.createdCount) * 100);
-  }, [data, printedOrdersCount]);
-
-  const cancellationRate = useMemo(() => {
-    if (!data || data.createdCount === 0) return 0;
-    return Math.round((totalCancellations / data.createdCount) * 100);
-  }, [data, totalCancellations]);
-
-  const totalWarehouseItems = useMemo(() => {
-    if (!data?.warehouses) return 0;
-    return data.warehouses.reduce((acc, w) => acc + (w.items_quantity || 0), 0);
-  }, [data?.warehouses]);
-
-  const top3WarehouseConcentration = useMemo(() => {
-    if (!data?.warehouses || data.warehouses.length === 0 || totalWarehouseItems === 0) return 0;
-    const top3Items = data.warehouses.slice(0, 3).reduce((acc, w) => acc + w.items_quantity, 0);
-    return Math.round((top3Items / totalWarehouseItems) * 100);
-  }, [data?.warehouses, totalWarehouseItems]);
-
-  const maxTimelineEvents = useMemo(() => {
-    if (!data?.timeline || data.timeline.length === 0) return 1;
-    return Math.max(...data.timeline.map((t) => t.events_count), 1);
-  }, [data?.timeline]);
+  // Is infinity loading active?
+  const isFetchingLogs = Boolean(
+    loading ||
+    (jobStatus &&
+      (jobStatus.stage === 'CHECKING_STORAGE' ||
+        jobStatus.stage === 'FETCHING_VENDOOR' ||
+        jobStatus.stage === 'SAVING_RECORDS' ||
+        jobStatus.stage === 'ANALYZING_ACTIONS' ||
+        jobStatus.stage === 'COMPUTING_METRICS' ||
+        jobStatus.stage === 'PREPARING_REPORT'))
+  );
 
   return (
-    <div className="p-4 md:p-6 space-y-6 max-w-7xl mx-auto print:p-0 print:max-w-none text-slate-100">
-      {/* Top Executive Header */}
-      <div className="flex flex-col lg:flex-row lg:items-center justify-between gap-4 border-b border-slate-800 pb-5">
-        <div>
-          <div className="flex items-center gap-3">
-            <div className="p-2.5 rounded-xl bg-gradient-to-br from-amber-500/20 to-amber-600/10 border border-amber-500/30 text-amber-400 shadow-sm">
-              <BarChart3 className="w-6 h-6" />
-            </div>
-            <div>
-              <div className="flex items-center gap-2">
-                <h2 className="text-xl font-bold text-slate-100 tracking-tight">
-                  التقرير التشغيلي الشامل وحركة المخازن
-                </h2>
-                <span className="text-[11px] font-mono font-bold px-2 py-0.5 rounded bg-amber-500/10 border border-amber-500/20 text-amber-400">
-                  دقة متناهية
-                </span>
+    <div className="space-y-6 animate-in fade-in duration-300 pb-16">
+      {/* 1. Header with Period Picker, Mode Switch, and Quick Presets */}
+      <div className="bg-slate-900 border border-slate-800 rounded-2xl p-5 shadow-xl">
+        <div className="flex flex-col lg:flex-row lg:items-center justify-between gap-4">
+          <div>
+            <div className="flex items-center gap-2.5">
+              <div className="p-2.5 rounded-xl bg-amber-500/10 text-amber-400 border border-amber-500/20">
+                <Activity className="w-6 h-6" />
               </div>
-              <div className="flex items-center gap-2 text-xs text-slate-400 mt-1">
-                <span>تحليل تدفق الحالات والمبيعات</span>
-                <span aria-hidden="true" className="text-slate-600">·</span>
-                <span className="text-amber-300 font-medium">حركة أكواد المخازن</span>
-                <span aria-hidden="true" className="text-slate-600">·</span>
-                <span>إنتاجية الكادر وتوزيع المحافظات</span>
-              </div>
-            </div>
-          </div>
-        </div>
-
-        {/* Action Controls & Date Switcher */}
-        <div className="flex flex-wrap items-center gap-2.5">
-          {/* Period Selector Tabs */}
-          <div className="flex items-center gap-1 p-1 bg-slate-900/90 border border-slate-800 rounded-xl text-xs font-medium shadow-inner">
-            <button
-              onClick={() => setPeriod('today')}
-              className={`px-3 py-1.5 rounded-lg transition-all cursor-pointer ${
-                period === 'today'
-                  ? 'bg-amber-500/20 text-amber-300 border border-amber-500/30 font-bold shadow-sm'
-                  : 'text-slate-400 hover:text-slate-200'
-              }`}
-            >
-              اليوم
-            </button>
-            <button
-              onClick={() => setPeriod('yesterday')}
-              className={`px-3 py-1.5 rounded-lg transition-all cursor-pointer ${
-                period === 'yesterday'
-                  ? 'bg-amber-500/20 text-amber-300 border border-amber-500/30 font-bold shadow-sm'
-                  : 'text-slate-400 hover:text-slate-200'
-              }`}
-            >
-              أمس
-            </button>
-            <button
-              onClick={() => setPeriod('last_7_days')}
-              className={`px-3 py-1.5 rounded-lg transition-all cursor-pointer ${
-                period === 'last_7_days'
-                  ? 'bg-amber-500/20 text-amber-300 border border-amber-500/30 font-bold shadow-sm'
-                  : 'text-slate-400 hover:text-slate-200'
-              }`}
-            >
-              آخر 7 أيام
-            </button>
-            <button
-              onClick={() => setPeriod('last_30_days')}
-              className={`px-3 py-1.5 rounded-lg transition-all cursor-pointer ${
-                period === 'last_30_days'
-                  ? 'bg-amber-500/20 text-amber-300 border border-amber-500/30 font-bold shadow-sm'
-                  : 'text-slate-400 hover:text-slate-200'
-              }`}
-            >
-              آخر 30 يوماً
-            </button>
-            <button
-              onClick={() => setPeriod('custom')}
-              className={`px-3 py-1.5 rounded-lg transition-all cursor-pointer ${
-                period === 'custom'
-                  ? 'bg-amber-500/20 text-amber-300 border border-amber-500/30 font-bold shadow-sm'
-                  : 'text-slate-400 hover:text-slate-200'
-              }`}
-            >
-              مخصص
-            </button>
-          </div>
-
-          {/* Quick Utility Actions */}
-          <div className="flex items-center gap-1.5">
-            <button
-              onClick={handleCopySummary}
-              className="px-3 py-1.5 rounded-xl bg-slate-900 border border-slate-800 hover:border-slate-700 text-xs text-slate-300 hover:text-slate-100 flex items-center gap-1.5 transition-colors cursor-pointer shadow-sm"
-              title="نسخ ملخص تنفيذي جاهز للمشاركة"
-            >
-              {copiedSummary ? <Check className="w-3.5 h-3.5 text-emerald-400" /> : <Copy className="w-3.5 h-3.5 text-amber-400" />}
-              <span>{copiedSummary ? 'تم النسخ!' : 'نسخ الملخص'}</span>
-            </button>
-
-            <button
-              onClick={handleExportCSV}
-              className="px-3 py-1.5 rounded-xl bg-slate-900 border border-slate-800 hover:border-slate-700 text-xs text-slate-300 hover:text-slate-100 flex items-center gap-1.5 transition-colors cursor-pointer shadow-sm print:hidden"
-              title="تصدير جدول البيانات CSV كامل"
-            >
-              <Download className="w-3.5 h-3.5 text-sky-400" />
-              <span>تصدير CSV</span>
-            </button>
-
-            <button
-              onClick={handlePrint}
-              className="px-3 py-1.5 rounded-xl bg-slate-900 border border-slate-800 hover:border-slate-700 text-xs text-slate-300 hover:text-slate-100 flex items-center gap-1.5 transition-colors cursor-pointer shadow-sm print:hidden"
-              title="طباعة التقرير أو حفظه بصيغة PDF"
-            >
-              <Printer className="w-3.5 h-3.5 text-slate-400" />
-              <span>طباعة</span>
-            </button>
-
-            <button
-              onClick={fetchReport}
-              disabled={loading}
-              className="p-2 rounded-xl bg-slate-900 border border-slate-800 hover:border-slate-700 text-slate-400 hover:text-amber-400 transition-colors cursor-pointer shadow-sm print:hidden"
-              title="تحديث البيانات فورياً"
-            >
-              <RefreshCw className={`w-3.5 h-3.5 ${loading ? 'animate-spin text-amber-400' : ''}`} />
-            </button>
-          </div>
-        </div>
-      </div>
-
-      {/* Custom Date Range Picker */}
-      {period === 'custom' && (
-        <div className="p-4 bg-slate-900/90 border border-slate-800 rounded-2xl flex flex-wrap items-center gap-4 text-xs shadow-lg">
-          <div className="flex items-center gap-2 text-slate-200 font-semibold">
-            <Calendar className="w-4 h-4 text-amber-400" />
-            <span>تحديد النطاق الزمني بالتقويم:</span>
-          </div>
-          <DateCalendarPicker
-            mode="range"
-            startDate={startDate}
-            endDate={endDate}
-            onRangeChange={(s, e) => {
-              setStartDate(s);
-              setEndDate(e);
-            }}
-            placeholder="اختر فترة التقرير"
-            showPresets={true}
-          />
-          <button
-            onClick={fetchReport}
-            className="px-4 py-1.5 bg-amber-500 hover:bg-amber-400 text-slate-950 font-bold rounded-lg transition-colors cursor-pointer mr-auto shadow"
-          >
-            تحديث التقرير
-          </button>
-        </div>
-      )}
-
-      {/* Coverage Status Banner (Subtle & informative) */}
-      {data?.coverage && !data.coverage.isFullyComplete && (
-        <div className="p-3.5 rounded-xl bg-amber-500/10 border border-amber-500/20 text-xs text-amber-300 flex items-center justify-between gap-3">
-          <div className="flex items-center gap-2.5">
-            <AlertTriangle className="w-4 h-4 text-amber-400 shrink-0" />
-            <span>
-              <strong>تغطية البيانات:</strong> يتضمن هذا النطاق أياماً قيد الاستكمال ({data.coverage.completeDays} من أصل {data.coverage.totalDays} يوماً مؤكدة). الأرقام المعروضة مستخرجة من السجلات الفعلية دون أي افتراضات تخمينية.
-            </span>
-          </div>
-          <span className="text-[11px] font-mono font-bold text-amber-400 px-2 py-0.5 rounded bg-amber-500/20 border border-amber-500/30 shrink-0">
-            تغطية جزئية
-          </span>
-        </div>
-      )}
-
-      {loading && !data ? (
-        <div className="py-24 text-center space-y-4">
-          <div className="relative inline-flex">
-            <div className="w-12 h-12 rounded-full border-2 border-amber-500/20 border-t-amber-400 animate-spin" />
-            <BarChart3 className="w-5 h-5 text-amber-400 absolute inset-0 m-auto" />
-          </div>
-          <div className="text-sm font-semibold text-slate-200">جاري تجميع التقرير التشغيلي الموثق...</div>
-          <div className="text-xs text-slate-500">استخراج حركات المخازن، مصفوفة الحالات، وتدفق الإنتاجية</div>
-        </div>
-      ) : data ? (
-        <div className="space-y-6">
-          {/* 1. PRIMARY EXECUTIVE KPI HERO CARDS (4 Main Pillars) */}
-          <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
-            {/* Pillar 1: Total Created Orders */}
-            <div
-              onClick={() => setDrilldownPillar('created')}
-              className="p-5 rounded-2xl bg-gradient-to-b from-slate-900/90 to-slate-950/80 border border-slate-800/80 relative overflow-hidden shadow-lg group hover:border-blue-500/50 hover:shadow-blue-500/10 transition-all cursor-pointer"
-            >
-              <div className="absolute top-0 right-0 w-24 h-24 bg-blue-500/5 rounded-full blur-2xl pointer-events-none group-hover:bg-blue-500/10 transition-colors" />
-              <div className="flex items-center justify-between text-slate-400 text-xs font-medium">
-                <span className="flex items-center gap-1.5 text-slate-300">
-                  <PackageCheck className="w-4 h-4 text-blue-400" />
-                  <span>الطلبات المنشأة (Created)</span>
-                </span>
-                <span className="text-[11px] font-mono text-slate-500">حجم الإنشاء</span>
-              </div>
-              <div className="mt-3 flex items-baseline gap-2">
-                <div className="text-3xl font-extrabold font-mono text-slate-100 group-hover:text-blue-400 transition-colors tracking-tight">
-                  {data.createdCount.toLocaleString()}
-                </div>
-                <span className="text-xs text-slate-400 font-normal">طلب</span>
-              </div>
-              <div className="mt-2.5 pt-2.5 border-t border-slate-800/60 flex items-center justify-between text-xs">
-                <span className="text-slate-400">إجمالي المبيعات:</span>
-                <span className="font-mono font-bold text-slate-200">
-                  {(data.totalOrderValue || 0).toLocaleString()} <span className="text-[10px] text-slate-400">ج.م</span>
-                </span>
-              </div>
-              <div className="mt-1 flex items-center justify-between text-[11px] text-slate-500 font-mono">
-                <span>متوسط الطلب (AOV):</span>
-                <span>{(data.averageOrderValue || 0).toLocaleString()} ج.م</span>
-              </div>
-              <div className="mt-3 pt-2.5 border-t border-slate-800/80 flex items-center justify-between text-xs text-blue-400 font-medium group-hover:text-blue-300">
-                <span>عرض الطلبات والتفاصيل</span>
-                <ChevronLeft className="w-3.5 h-3.5 group-hover:-translate-x-1 transition-transform" />
-              </div>
-            </div>
-
-            {/* Pillar 2: Confirmed / Printed */}
-            <div
-              onClick={() => setDrilldownPillar('printed')}
-              className="p-5 rounded-2xl bg-gradient-to-b from-slate-900/90 to-slate-950/80 border border-slate-800/80 relative overflow-hidden shadow-lg group hover:border-emerald-500/50 hover:shadow-emerald-500/10 transition-all cursor-pointer"
-            >
-              <div className="absolute top-0 right-0 w-24 h-24 bg-emerald-500/5 rounded-full blur-2xl pointer-events-none group-hover:bg-emerald-500/10 transition-colors" />
-              <div className="flex items-center justify-between text-slate-400 text-xs font-medium">
-                <span className="flex items-center gap-1.5 text-emerald-400 font-semibold">
-                  <TrendingUp className="w-4 h-4 text-emerald-400" />
-                  <span>مؤكدة ومطبوعة (Printed)</span>
-                </span>
-                <span className="text-[11px] font-mono font-bold px-1.5 py-0.5 rounded bg-emerald-500/10 text-emerald-400 border border-emerald-500/20">
-                  {confirmationRate}% تأكيد
-                </span>
-              </div>
-              <div className="mt-3 flex items-baseline gap-2">
-                <div className="text-3xl font-extrabold font-mono text-emerald-400 group-hover:text-emerald-300 transition-colors tracking-tight">
-                  {printedOrdersCount.toLocaleString()}
-                </div>
-                <span className="text-xs text-emerald-400/70 font-normal">طلب جاهز</span>
-              </div>
-              <div className="mt-2.5 pt-2.5 border-t border-slate-800/60 flex items-center justify-between text-xs">
-                <span className="text-slate-400">قيمة المؤكد:</span>
-                <span className="font-mono font-bold text-emerald-300">
-                  {printedOrdersRevenue.toLocaleString()} <span className="text-[10px] text-slate-400">ج.م</span>
-                </span>
-              </div>
-              <div className="mt-1 flex items-center justify-between text-[11px] text-slate-500 font-mono">
-                <span>نسبة الإنجاز:</span>
-                <span>{printedOrdersCount} من {data.createdCount}</span>
-              </div>
-              <div className="mt-3 pt-2.5 border-t border-slate-800/80 flex items-center justify-between text-xs text-emerald-400 font-medium group-hover:text-emerald-300">
-                <span>عرض الطلبات والتفاصيل</span>
-                <ChevronLeft className="w-3.5 h-3.5 group-hover:-translate-x-1 transition-transform" />
-              </div>
-            </div>
-
-            {/* Pillar 3: Active Pipeline (Pending + Processing) */}
-            <div
-              onClick={() => setDrilldownPillar('pipeline')}
-              className="p-5 rounded-2xl bg-gradient-to-b from-slate-900/90 to-slate-950/80 border border-slate-800/80 relative overflow-hidden shadow-lg group hover:border-sky-500/50 hover:shadow-sky-500/10 transition-all cursor-pointer"
-            >
-              <div className="absolute top-0 right-0 w-24 h-24 bg-sky-500/5 rounded-full blur-2xl pointer-events-none group-hover:bg-sky-500/10 transition-colors" />
-              <div className="flex items-center justify-between text-slate-400 text-xs font-medium">
-                <span className="flex items-center gap-1.5 text-sky-400 font-semibold">
-                  <Clock className="w-4 h-4 text-sky-400" />
-                  <span>قيد التجهيز والمعالجة</span>
-                </span>
-                <span className="text-[11px] font-mono text-slate-400">الطلبات الحية</span>
-              </div>
-              <div className="mt-3 flex items-baseline gap-2">
-                <div className="text-3xl font-extrabold font-mono text-sky-400 group-hover:text-sky-300 transition-colors tracking-tight">
-                  {((data.statusCounts?.pending || 0) + (data.statusCounts?.processing || 0)).toLocaleString()}
-                </div>
-                <span className="text-xs text-sky-400/70 font-normal">طلب</span>
-              </div>
-              <div className="mt-2.5 pt-2.5 border-t border-slate-800/60 flex items-center justify-between text-xs">
-                <span className="text-slate-400">معلق (Pending):</span>
-                <span className="font-mono font-semibold text-amber-300">
-                  {data.statusCounts?.pending || 0} طلب
-                </span>
-              </div>
-              <div className="mt-1 flex items-center justify-between text-xs text-slate-400">
-                <span>قيد التنفيذ (Processing):</span>
-                <span className="font-mono font-semibold text-sky-300">
-                  {data.statusCounts?.processing || 0} طلب
-                </span>
-              </div>
-              <div className="mt-3 pt-2.5 border-t border-slate-800/80 flex items-center justify-between text-xs text-sky-400 font-medium group-hover:text-sky-300">
-                <span>عرض الطلبات والتفاصيل</span>
-                <ChevronLeft className="w-3.5 h-3.5 group-hover:-translate-x-1 transition-transform" />
-              </div>
-            </div>
-
-            {/* Pillar 4: Multi-Warehouse (المخازن) */}
-            <div
-              onClick={() => setDrilldownPillar('multi_warehouse')}
-              className="p-5 rounded-2xl bg-gradient-to-b from-slate-900/90 to-slate-950/80 border border-slate-800/80 relative overflow-hidden shadow-lg group hover:border-rose-500/50 hover:shadow-rose-500/10 transition-all cursor-pointer"
-            >
-              <div className="absolute top-0 right-0 w-24 h-24 bg-rose-500/5 rounded-full blur-2xl pointer-events-none group-hover:bg-rose-500/10 transition-colors" />
-              <div className="flex items-center justify-between text-slate-400 text-xs font-medium">
-                <span className="flex items-center gap-1.5 text-rose-400 font-semibold">
-                  <ShieldAlert className="w-4 h-4 text-rose-400" />
-                  <span>تعدد المخازن (Multi-Store)</span>
-                </span>
-                <span className="text-[11px] font-mono font-bold px-1.5 py-0.5 rounded bg-rose-500/10 text-rose-400 border border-rose-500/20">
-                  {data.createdCount > 0 ? ((data.multiWarehouseCount || 0) / data.createdCount * 100).toFixed(1) : 0}%
-                </span>
-              </div>
-              <div className="mt-3 flex items-baseline gap-2">
-                <div className="text-3xl font-extrabold font-mono text-rose-400 group-hover:text-rose-300 transition-colors tracking-tight">
-                  {(data.multiWarehouseCount || 0).toLocaleString()}
-                </div>
-                <span className="text-xs text-rose-400/70 font-normal">طلب متعدد</span>
-              </div>
-              <div className="mt-2.5 pt-2.5 border-t border-slate-800/60 flex items-center justify-between text-xs">
-                <span className="text-slate-400">مخزن واحد:</span>
-                <span className="font-mono font-bold text-slate-200">
-                  {(data.multiWarehouseStats?.singleOrders || (data.createdCount - (data.multiWarehouseCount || 0))).toLocaleString()} طلب
-                </span>
-              </div>
-              <div className="mt-1 flex items-center justify-between text-[11px] text-rose-400/80">
-                <span>تتطلب تنسيق وتجزئة بوالص</span>
-                <span className="font-mono">{(data.multiWarehouseStats?.multiValue || 0).toLocaleString()} ج.م</span>
-              </div>
-              <div className="mt-3 pt-2.5 border-t border-slate-800/80 flex items-center justify-between text-xs text-rose-400 font-medium group-hover:text-rose-300">
-                <span>عرض الطلبات والتفاصيل</span>
-                <ChevronLeft className="w-3.5 h-3.5 group-hover:-translate-x-1 transition-transform" />
-              </div>
-            </div>
-          </div>
-
-          {/* 2. SECONDARY OPERATIONAL PRECISION METRICS */}
-          <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
-            <div className="p-3.5 rounded-xl bg-slate-900/60 border border-slate-800/80 flex items-center justify-between">
               <div>
-                <div className="text-[11px] text-slate-400">حركات الإلغاء المسجلة</div>
-                <div className="text-lg font-bold font-mono text-rose-300 mt-0.5">
-                  {totalCancellations.toLocaleString()} <span className="text-[10px] text-slate-500">حركة</span>
-                </div>
-              </div>
-              <div className="p-2 rounded-lg bg-rose-500/10 border border-rose-500/20 text-rose-400">
-                <XCircle className="w-4 h-4" />
-              </div>
-            </div>
-
-            <div className="p-3.5 rounded-xl bg-slate-900/60 border border-slate-800/80 flex items-center justify-between">
-              <div>
-                <div className="text-[11px] text-slate-400">إجمالي الحركات الموثقة</div>
-                <div className="text-lg font-bold font-mono text-amber-400 mt-0.5">
-                  {data.totalEvents.toLocaleString()} <span className="text-[10px] text-slate-500">حركة</span>
-                </div>
-              </div>
-              <div className="p-2 rounded-lg bg-amber-500/10 border border-amber-500/20 text-amber-400">
-                <Layers className="w-4 h-4" />
-              </div>
-            </div>
-
-            <div className="p-3.5 rounded-xl bg-slate-900/60 border border-slate-800/80 flex items-center justify-between">
-              <div>
-                <div className="text-[11px] text-slate-400">المخازن النشطة المسجلة</div>
-                <div className="text-lg font-bold font-mono text-emerald-400 mt-0.5">
-                  {data.warehouses?.length || 0} <span className="text-[10px] text-slate-500">مخزن</span>
-                </div>
-              </div>
-              <div className="p-2 rounded-lg bg-emerald-500/10 border border-emerald-500/20 text-emerald-400">
-                <Building2 className="w-4 h-4" />
-              </div>
-            </div>
-
-            <div className="p-3.5 rounded-xl bg-slate-900/60 border border-slate-800/80 flex items-center justify-between">
-              <div>
-                <div className="text-[11px] text-slate-400">فريق العمليات الفعّال</div>
-                <div className="text-lg font-bold font-mono text-sky-400 mt-0.5">
-                  {data.employees?.length || 0} <span className="text-[10px] text-slate-500">موظف</span>
-                </div>
-              </div>
-              <div className="p-2 rounded-lg bg-sky-500/10 border border-sky-500/20 text-sky-400">
-                <Users className="w-4 h-4" />
-              </div>
-            </div>
-          </div>
-
-          {/* 3. VISUAL STATUS FUNNEL & PIPELINE (مسار تدفق الحالات التشغيلي) */}
-          <div className="p-5 rounded-2xl bg-slate-900/80 border border-slate-800 space-y-4 shadow-sm">
-            <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2 border-b border-slate-800/70 pb-3">
-              <div>
-                <h3 className="text-sm font-bold text-slate-200 flex items-center gap-2">
-                  <TrendingUp className="w-4 h-4 text-amber-400" />
-                  <span>مسار تدفق الحالات والمبيعات (Status Pipeline & Financial Distribution)</span>
-                </h3>
-                <p className="text-xs text-slate-400 mt-0.5">
-                  تفصيل دقيق لكافة الحالات مع عدد الطلبات، نسب التحويل، والقيمة المالية الإجمالية بالجنيه
+                <h1 className="text-xl font-bold text-slate-100 flex items-center gap-2">
+                  <span>تقرير النشاط التشغيلي الذكي من اللوجز</span>
+                  <span className="text-xs px-2.5 py-0.5 rounded-full bg-amber-500/10 text-amber-300 border border-amber-500/20 font-sans">
+                    لوجز Vendoor وحدها
+                  </span>
+                </h1>
+                <p className="text-xs text-slate-400 mt-0.5 font-sans">
+                  مصدر جميع المؤشرات التاريخية المعتمدة • قاعدة معتمدة:{' '}
+                  <span className="text-emerald-400 font-bold">Printed = تأكيد الأوردر</span>
                 </p>
               </div>
-              <div className="text-xs font-mono text-slate-400 bg-slate-950 px-3 py-1 rounded-lg border border-slate-800">
-                إجمالي القيمة: {(data.totalOrderValue || 0).toLocaleString()} ج.م
-              </div>
+            </div>
+          </div>
+
+          {/* Quick Presets & Calendar Mode Switcher */}
+          <div className="flex flex-wrap items-center gap-2">
+            <div className="bg-slate-950 p-1 rounded-xl border border-slate-800 flex items-center gap-1 text-xs">
+              <button
+                onClick={handlePresetToday}
+                className={`px-3 py-1.5 rounded-lg font-medium transition ${
+                  activePreset === 'today'
+                    ? 'bg-amber-500 text-slate-950 font-bold shadow'
+                    : 'text-slate-400 hover:text-slate-200'
+                }`}
+              >
+                اليوم
+              </button>
+              <button
+                onClick={handlePresetYesterday}
+                className={`px-3 py-1.5 rounded-lg font-medium transition ${
+                  activePreset === 'yesterday'
+                    ? 'bg-amber-500 text-slate-950 font-bold shadow'
+                    : 'text-slate-400 hover:text-slate-200'
+                }`}
+              >
+                أمس
+              </button>
+              <button
+                onClick={handlePresetWeek}
+                className={`px-3 py-1.5 rounded-lg font-medium transition ${
+                  activePreset === 'week'
+                    ? 'bg-amber-500 text-slate-950 font-bold shadow'
+                    : 'text-slate-400 hover:text-slate-200'
+                }`}
+              >
+                آخر 7 أيام
+              </button>
             </div>
 
-            {/* Pipeline Visual Bar */}
-            {data.ordersByStatus && data.ordersByStatus.length > 0 && (
-              <div className="space-y-2">
-                <div className="h-4 w-full bg-slate-950 rounded-lg overflow-hidden flex shadow-inner border border-slate-800/60">
-                  {data.ordersByStatus.map((s, idx) => {
-                    const total = data.createdCount || 1;
-                    const pct = Math.max(1, (s.count / total) * 100);
-                    const color =
-                      s.status === 'Printed'
-                        ? 'bg-emerald-500'
-                        : s.status === 'Pending'
-                        ? 'bg-amber-500'
-                        : s.status === 'Processing'
-                        ? 'bg-sky-500'
-                        : s.status === 'New'
-                        ? 'bg-blue-500'
-                        : 'bg-rose-500';
-                    return (
-                      <div
-                        key={idx}
-                        style={{ width: `${pct}%` }}
-                        className={`${color} h-full transition-all duration-300 relative group`}
-                        title={`${s.status}: ${s.count} طلب (${pct.toFixed(1)}%)`}
-                      />
-                    );
-                  })}
-                </div>
+            {/* Mode switch: Single Day vs Range */}
+            <div className="bg-slate-950 p-1 rounded-xl border border-slate-800 flex items-center gap-1 text-xs font-sans">
+              <button
+                onClick={() => {
+                  setCalendarMode('single');
+                  setActivePreset('custom');
+                }}
+                className={`px-3 py-1.5 rounded-lg font-medium transition ${
+                  calendarMode === 'single' && activePreset === 'custom'
+                    ? 'bg-slate-800 text-amber-400 font-bold'
+                    : 'text-slate-400 hover:text-slate-200'
+                }`}
+              >
+                يوم واحد
+              </button>
+              <button
+                onClick={() => {
+                  setCalendarMode('range');
+                  setActivePreset('custom');
+                }}
+                className={`px-3 py-1.5 rounded-lg font-medium transition ${
+                  calendarMode === 'range' && activePreset === 'custom'
+                    ? 'bg-slate-800 text-amber-400 font-bold'
+                    : 'text-slate-400 hover:text-slate-200'
+                }`}
+              >
+                أسبوع / نطاق
+              </button>
+            </div>
 
-                {/* Status Table with exact breakdown */}
-                <div className="border border-slate-800/80 rounded-xl overflow-hidden bg-slate-950/50">
-                  <table className="w-full text-right text-xs">
-                    <thead>
-                      <tr className="border-b border-slate-800 bg-slate-950/80 text-slate-400">
-                        <th className="py-2.5 px-4 font-semibold">حالة الطلب</th>
-                        <th className="py-2.5 px-4 font-semibold font-mono">عدد الطلبات</th>
-                        <th className="py-2.5 px-4 font-semibold">نسبة الحجم (%)</th>
-                        <th className="py-2.5 px-4 font-semibold font-mono">إجمالي القيمة (ج.م)</th>
-                        <th className="py-2.5 px-4 font-semibold font-mono">متوسط الطلب</th>
-                        <th className="py-2.5 px-4 font-semibold">الوصف التشغيلي</th>
-                      </tr>
-                    </thead>
-                    <tbody className="divide-y divide-slate-800/60 font-mono">
-                      {data.ordersByStatus.map((s, idx) => {
-                        const totalOrders = data.createdCount || 1;
-                        const pct = ((s.count / totalOrders) * 100).toFixed(1);
-                        const aov = s.count > 0 ? Math.round(s.total_value / s.count) : 0;
-                        const isPrinted = s.status === 'Printed';
-                        const isPending = s.status === 'Pending';
-                        const isProcessing = s.status === 'Processing';
-                        const isCanceled = s.status === 'Canceled';
-                        const isNew = s.status === 'New';
+            {/* Arabic RTL Date Picker */}
+            {calendarMode === 'single' ? (
+              <DateCalendarPicker
+                mode="single"
+                value={singleDate}
+                onChange={(d) => {
+                  setSingleDate(d);
+                  setActivePreset('custom');
+                }}
+                showPresets={false}
+              />
+            ) : (
+              <DateCalendarPicker
+                mode="range"
+                startDate={startDate}
+                endDate={endDate}
+                onRangeChange={(s, e) => {
+                  setStartDate(s);
+                  setEndDate(e);
+                  setActivePreset('custom');
+                }}
+                showPresets={false}
+              />
+            )}
 
-                        return (
-                          <tr key={idx} className="hover:bg-slate-800/30 transition-colors">
-                            <td className="py-3 px-4 font-sans font-bold flex items-center gap-2">
-                              <span
-                                className={`w-2 h-2 rounded-full ${
-                                  isPrinted
-                                    ? 'bg-emerald-400'
-                                    : isPending
-                                    ? 'bg-amber-400'
-                                    : isProcessing
-                                    ? 'bg-sky-400'
-                                    : isCanceled
-                                    ? 'bg-rose-400'
-                                    : 'bg-blue-400'
-                                }`}
-                              />
-                              <span
-                                className={`${
-                                  isPrinted
-                                    ? 'text-emerald-400'
-                                    : isPending
-                                    ? 'text-amber-400'
-                                    : isProcessing
-                                    ? 'text-sky-400'
-                                    : isCanceled
-                                    ? 'text-rose-400'
-                                    : 'text-blue-400'
-                                }`}
-                              >
-                                {isPrinted
-                                  ? 'مؤكدة ومطبوعة (Printed)'
-                                  : isPending
-                                  ? 'قيد الانتظار (Pending)'
-                                  : isProcessing
-                                  ? 'قيد التجهيز (Processing)'
-                                  : isCanceled
-                                  ? 'ملغاة (Canceled)'
-                                  : isNew
-                                  ? 'جديدة واردة (New)'
-                                  : s.status}
-                              </span>
-                            </td>
-                            <td className="py-3 px-4 font-bold text-slate-100">
-                              {s.count.toLocaleString()}
-                            </td>
-                            <td className="py-3 px-4 font-sans">
-                              <div className="flex items-center gap-2">
-                                <div className="w-16 bg-slate-800 h-1.5 rounded-full overflow-hidden">
-                                  <div
-                                    style={{ width: `${Math.max(4, Number(pct))}%` }}
-                                    className={`h-full rounded-full ${
-                                      isPrinted
-                                        ? 'bg-emerald-400'
-                                        : isPending
-                                        ? 'bg-amber-400'
-                                        : isProcessing
-                                        ? 'bg-sky-400'
-                                        : isCanceled
-                                        ? 'bg-rose-400'
-                                        : 'bg-blue-400'
-                                    }`}
-                                  />
-                                </div>
-                                <span className="font-mono text-xs text-slate-300">{pct}%</span>
-                              </div>
-                            </td>
-                            <td className="py-3 px-4 font-bold text-slate-200">
-                              {s.total_value.toLocaleString()} <span className="text-[10px] text-slate-500 font-sans">ج.م</span>
-                            </td>
-                            <td className="py-3 px-4 text-slate-400">
-                              {aov.toLocaleString()} <span className="text-[10px] text-slate-500 font-sans">ج.م</span>
-                            </td>
-                            <td className="py-3 px-4 font-sans text-slate-400 text-[11px]">
-                              {isPrinted && 'تم تأكيد الطلب وطباعة البوليصة وجاهز للشحن'}
-                              {isPending && 'في انتظار مراجعة وتأكيد خدمة العملاء'}
-                              {isProcessing && 'قيد الجمع والتجهيز داخل المخزن'}
-                              {isNew && 'طلب جديد ورد من المتجر الإلكتروني'}
-                              {isCanceled && 'تم إلغاء الطلب بناءً على طلب العميل أو المتجر'}
-                            </td>
-                          </tr>
-                        );
-                      })}
-                    </tbody>
-                  </table>
-                </div>
+            {/* Force Refresh / Sync Button */}
+            <button
+              onClick={() => fetchReport(effectiveStart, effectiveEnd, true)}
+              disabled={isFetchingLogs}
+              className="p-2.5 rounded-xl bg-slate-800 hover:bg-slate-700 text-slate-300 border border-slate-700/60 transition disabled:opacity-50"
+              title="إعادة فحص وجلب اللوجز الناقصة من Vendoor"
+            >
+              <RefreshCw className={`w-4 h-4 text-amber-400 ${isFetchingLogs ? 'animate-spin' : ''}`} />
+            </button>
+
+            {/* Copy Executive Summary */}
+            <button
+              onClick={handleCopySummary}
+              disabled={!report || isFetchingLogs}
+              className="flex items-center gap-1.5 px-3 py-2 rounded-xl bg-slate-800 hover:bg-slate-700 text-slate-200 border border-slate-700/60 text-xs font-semibold transition disabled:opacity-50"
+              title="نسخ التقرير التنفيذي بالعربية"
+            >
+              {copiedSummary ? (
+                <>
+                  <Check className="w-4 h-4 text-emerald-400" />
+                  <span className="text-emerald-400">تم النسخ!</span>
+                </>
+              ) : (
+                <>
+                  <Copy className="w-4 h-4 text-amber-400" />
+                  <span>نسخ التقرير</span>
+                </>
+              )}
+            </button>
+          </div>
+        </div>
+
+        {/* Period Details & Coverage Bar */}
+        {report && (
+          <div className="mt-4 pt-4 border-t border-slate-800/80 flex flex-wrap items-center justify-between gap-3 text-xs">
+            <div className="flex flex-wrap items-center gap-3">
+              <span className="text-slate-400">الفترة المعتمدة:</span>
+              <span className="px-2.5 py-1 rounded-lg bg-slate-950 font-mono text-amber-300 font-bold border border-slate-800">
+                {report.periodLabel}
+              </span>
+              <span className="text-slate-500 font-mono text-[11px]">
+                [{report.cairoInterval.startCairo.replace('T', ' ').slice(0, 19)} إلى{' '}
+                {report.cairoInterval.endExclusiveCairo.replace('T', ' ').slice(0, 19)})
+              </span>
+            </div>
+
+            <div className="flex items-center gap-3">
+              {/* Coverage Badge */}
+              <div className="flex items-center gap-1.5">
+                <span className="text-slate-400">التغطية:</span>
+                {report.status === 'COMPLETE' ? (
+                  <span className="inline-flex items-center gap-1 px-2.5 py-0.5 rounded-full bg-emerald-500/10 text-emerald-400 border border-emerald-500/20 font-sans font-medium">
+                    <CheckCircle2 className="w-3.5 h-3.5" />
+                    {report.loadedFromCache ? 'مكتمل (بيانات مخزنة)' : 'مكتمل من Vendoor'}
+                  </span>
+                ) : report.status === 'PARTIAL' ? (
+                  <span className="inline-flex items-center gap-1 px-2.5 py-0.5 rounded-full bg-amber-500/10 text-amber-400 border border-amber-500/20 font-sans font-medium">
+                    <AlertTriangle className="w-3.5 h-3.5" />
+                    تغطية جزئية ({report.coverage.completeDays}/{report.coverage.totalDays} يوم)
+                  </span>
+                ) : (
+                  <span className="inline-flex items-center gap-1 px-2.5 py-0.5 rounded-full bg-rose-500/10 text-rose-400 border border-rose-500/20 font-sans font-medium">
+                    <XCircle className="w-3.5 h-3.5" />
+                    غير مكتملة
+                  </span>
+                )}
+              </div>
+
+              {report.coverage.pagesRead > 0 && (
+                <span className="text-slate-400 font-mono">
+                  الصفحات: <strong className="text-slate-200">{report.coverage.pagesRead}</strong>
+                </span>
+              )}
+            </div>
+          </div>
+        )}
+      </div>
+
+      {/* 2. THE ANIMATED INFINITY LOADING INDICATOR (∞) */}
+      {isFetchingLogs && (
+        <div className="bg-slate-900/90 border border-amber-500/30 rounded-2xl p-6 shadow-2xl backdrop-blur-md flex flex-col items-center justify-center text-center animate-in fade-in duration-300">
+          {/* Animated Lemniscate SVG */}
+          <div className="relative mb-3 flex items-center justify-center animate-infinity-glow">
+            <svg
+              className="w-24 h-14"
+              viewBox="0 0 100 60"
+              fill="none"
+              xmlns="http://www.w3.org/2000/svg"
+            >
+              {/* Background trace */}
+              <path
+                d="M 30,30 C 15,10 5,20 5,30 C 5,40 15,50 30,30 C 45,10 55,10 70,30 C 85,50 95,40 95,30 C 95,20 85,10 70,30 C 55,50 45,50 30,30 Z"
+                stroke="currentColor"
+                className="text-amber-500/20"
+                strokeWidth="6"
+                strokeLinecap="round"
+                strokeLinejoin="round"
+              />
+              {/* Glowing animated stroke */}
+              <path
+                d="M 30,30 C 15,10 5,20 5,30 C 5,40 15,50 30,30 C 45,10 55,10 70,30 C 85,50 95,40 95,30 C 95,20 85,10 70,30 C 55,50 45,50 30,30 Z"
+                stroke="url(#infinityGradient)"
+                strokeWidth="6"
+                strokeLinecap="round"
+                strokeLinejoin="round"
+                className="animate-infinity-path"
+              />
+              <defs>
+                <linearGradient id="infinityGradient" x1="0%" y1="0%" x2="100%" y2="100%">
+                  <stop offset="0%" stopColor="#f59e0b" />
+                  <stop offset="50%" stopColor="#38bdf8" />
+                  <stop offset="100%" stopColor="#f59e0b" />
+                </linearGradient>
+              </defs>
+            </svg>
+          </div>
+
+          <div className="space-y-1.5">
+            <h3 className="text-base font-bold text-amber-300 font-sans">
+              {jobStatus?.stageLabelAr || 'جاري فحص وتجهيز تقرير اللوجز...'}
+            </h3>
+            <p className="text-xs text-slate-400 font-sans max-w-md">
+              يفحص النظام اللوجز المحفوظة محلياً ويجلب الصفحات الناقصة من Vendoor مباشرةً لضمان دقة المؤشرات التاريخية
+            </p>
+            {jobStatus && jobStatus.pagesTotal > 0 && jobStatus.pagesFetched > 0 && (
+              <div className="pt-2 flex items-center justify-center gap-3 text-xs font-mono text-slate-300">
+                <span className="px-2 py-0.5 rounded bg-slate-950 border border-slate-800">
+                  الصفحة {jobStatus.pagesFetched} من {jobStatus.pagesTotal}
+                </span>
+                <span className="px-2 py-0.5 rounded bg-slate-950 border border-slate-800 text-emerald-400">
+                  {jobStatus.eventsSaved.toLocaleString()} حركة محفوظة
+                </span>
               </div>
             )}
           </div>
+        </div>
+      )}
 
-          {/* 4. DEEP-DIVE TABS NAVIGATION */}
-          <div className="flex items-center gap-2 border-b border-slate-800 pb-1 text-xs font-semibold overflow-x-auto print:hidden">
-            <button
-              onClick={() => setActiveTab('overview')}
-              className={`px-4 py-2.5 border-b-2 transition-all cursor-pointer flex items-center gap-2 shrink-0 ${
-                activeTab === 'overview'
-                  ? 'border-amber-400 text-amber-300 font-bold bg-amber-500/5 rounded-t-lg'
-                  : 'border-transparent text-slate-400 hover:text-slate-200'
-              }`}
-            >
-              <ArrowRightLeft className="w-4 h-4" />
-              <span>مصفوفة التحويلات والنشاط اليومي</span>
-            </button>
-
-            <button
-              onClick={() => setActiveTab('warehouses')}
-              className={`px-4 py-2.5 border-b-2 transition-all cursor-pointer flex items-center gap-2 shrink-0 ${
-                activeTab === 'warehouses'
-                  ? 'border-amber-400 text-amber-300 font-bold bg-amber-500/5 rounded-t-lg'
-                  : 'border-transparent text-slate-400 hover:text-slate-200'
-              }`}
-            >
-              <Building2 className="w-4 h-4 text-amber-400" />
-              <span>تقرير المخازن والأصناف ({data.warehouses?.length || 0})</span>
-            </button>
-
-            <button
-              onClick={() => setActiveTab('team')}
-              className={`px-4 py-2.5 border-b-2 transition-all cursor-pointer flex items-center gap-2 shrink-0 ${
-                activeTab === 'team'
-                  ? 'border-amber-400 text-amber-300 font-bold bg-amber-500/5 rounded-t-lg'
-                  : 'border-transparent text-slate-400 hover:text-slate-200'
-              }`}
-            >
-              <Users className="w-4 h-4 text-sky-400" />
-              <span>إنتاجية الفريق والعمليات ({data.employees?.length || 0})</span>
-            </button>
-
-            <button
-              onClick={() => setActiveTab('regions')}
-              className={`px-4 py-2.5 border-b-2 transition-all cursor-pointer flex items-center gap-2 shrink-0 ${
-                activeTab === 'regions'
-                  ? 'border-amber-400 text-amber-300 font-bold bg-amber-500/5 rounded-t-lg'
-                  : 'border-transparent text-slate-400 hover:text-slate-200'
-              }`}
-            >
-              <MapPin className="w-4 h-4 text-emerald-400" />
-              <span>التوزيع الجغرافي والمحافظات</span>
-            </button>
+      {/* 3. EXECUTIVE QUESTIONS & ANSWERS KPI CARDS (CLICKABLE FOR DRILLDOWN) */}
+      {report && (
+        <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-5 gap-4">
+          {/* Card 1: What happened? Total Logs & Unique Orders Touched */}
+          <div
+            onClick={() => setDrilldownPillar('all')}
+            className="bg-slate-900 border border-slate-800 hover:border-slate-700 p-5 rounded-2xl shadow-lg cursor-pointer transition transform hover:-translate-y-0.5 group"
+          >
+            <div className="flex items-center justify-between mb-2">
+              <span className="text-xs text-slate-400 font-sans font-semibold">ماذا حدث في الفترة؟</span>
+              <div className="p-2 rounded-xl bg-slate-800 text-slate-300 group-hover:text-amber-400 transition">
+                <Activity className="w-5 h-5" />
+              </div>
+            </div>
+            <div className="text-2xl font-black text-slate-100 font-mono">
+              {report.metrics.totalLogs.toLocaleString()}
+            </div>
+            <div className="mt-2 pt-2 border-t border-slate-800/80 flex items-center justify-between text-xs">
+              <span className="text-slate-400 font-sans">أوردرات شهدت نشاطاً:</span>
+              <span className="font-bold text-amber-400 font-mono">
+                {report.metrics.uniqueOrdersTouched.toLocaleString()} طلب
+              </span>
+            </div>
           </div>
 
-          {/* TAB 1: OVERVIEW & TRANSITIONS */}
-          {(activeTab === 'overview' || typeof window !== 'undefined') && (
-            <div className={`space-y-6 ${activeTab !== 'overview' ? 'hidden print:block' : ''}`}>
-              {/* Daily / Timeline Activity Distribution */}
-              {data.timeline && data.timeline.length > 1 && (
-                <div className="p-5 rounded-2xl bg-slate-900/60 border border-slate-800 space-y-4">
-                  <div className="flex items-center justify-between">
-                    <div>
-                      <h3 className="text-sm font-bold text-slate-200 flex items-center gap-2">
-                        <BarChart3 className="w-4 h-4 text-amber-400" />
-                        <span>التوزيع الزمني للنشاط والعمليات عبر الأيام</span>
-                      </h3>
-                      <p className="text-xs text-slate-400 mt-0.5">
-                        حجم العمليات والطلبات التي خضعت للتحديث يومياً في هذا النطاق
-                      </p>
+          {/* Card 2: Created Orders */}
+          <div
+            onClick={() => setDrilldownPillar('created')}
+            className="bg-slate-900 border border-slate-800 hover:border-sky-500/40 p-5 rounded-2xl shadow-lg cursor-pointer transition transform hover:-translate-y-0.5 group"
+          >
+            <div className="flex items-center justify-between mb-2">
+              <span className="text-xs text-sky-400 font-sans font-semibold">كم أوردر تم إنشاؤه؟</span>
+              <div className="p-2 rounded-xl bg-sky-500/10 text-sky-400 border border-sky-500/20 group-hover:bg-sky-500/20 transition">
+                <TrendingUp className="w-5 h-5" />
+              </div>
+            </div>
+            <div className="text-2xl font-black text-sky-300 font-mono">
+              {report.metrics.createdOrdersCount.toLocaleString()}
+            </div>
+            <div className="mt-2 pt-2 border-t border-slate-800/80 flex items-center justify-between text-xs">
+              <span className="text-slate-400 font-sans">إجمالي أحداث الإنشاء:</span>
+              <span className="font-bold text-slate-300 font-mono">
+                {report.metrics.createdEventsCount.toLocaleString()} حدث
+              </span>
+            </div>
+          </div>
+
+          {/* Card 3: Confirmed Orders (RULE: Printed = التأكيد) */}
+          <div
+            onClick={() => setDrilldownPillar('confirmed')}
+            className="bg-slate-900 border border-emerald-500/30 hover:border-emerald-500/60 p-5 rounded-2xl shadow-lg cursor-pointer transition transform hover:-translate-y-0.5 group relative overflow-hidden"
+          >
+            <div className="absolute top-0 right-0 left-0 h-1 bg-emerald-500" />
+            <div className="flex items-center justify-between mb-2">
+              <div>
+                <span className="text-xs text-emerald-400 font-sans font-bold">كم أوردر تم تأكيده؟</span>
+                <span className="block text-[10px] text-slate-400">حالة Printed = تأكيد</span>
+              </div>
+              <div className="p-2 rounded-xl bg-emerald-500/10 text-emerald-400 border border-emerald-500/20 group-hover:bg-emerald-500/20 transition">
+                <CheckCircle2 className="w-5 h-5" />
+              </div>
+            </div>
+            <div className="text-2xl font-black text-emerald-300 font-mono">
+              {report.metrics.confirmedOrdersCount.toLocaleString()}
+            </div>
+            <div className="mt-2 pt-2 border-t border-slate-800/80 flex items-center justify-between text-xs">
+              <span className="text-slate-400 font-sans">أحداث الطباعة والتأكيد:</span>
+              <span className="font-bold text-emerald-400 font-mono">
+                {report.metrics.printedEventsCount.toLocaleString()} حركة
+              </span>
+            </div>
+          </div>
+
+          {/* Card 4: Canceled Orders (Strictly Canceled, Canceling separated) */}
+          <div
+            onClick={() => setDrilldownPillar('canceled')}
+            className="bg-slate-900 border border-slate-800 hover:border-rose-500/40 p-5 rounded-2xl shadow-lg cursor-pointer transition transform hover:-translate-y-0.5 group"
+          >
+            <div className="flex items-center justify-between mb-2">
+              <div>
+                <span className="text-xs text-rose-400 font-sans font-semibold">كم أوردر تم إلغاؤه؟</span>
+                <span className="block text-[10px] text-slate-400">حالة Canceled المؤكدة</span>
+              </div>
+              <div className="p-2 rounded-xl bg-rose-500/10 text-rose-400 border border-rose-500/20 group-hover:bg-rose-500/20 transition">
+                <XCircle className="w-5 h-5" />
+              </div>
+            </div>
+            <div className="text-2xl font-black text-rose-400 font-mono">
+              {report.metrics.canceledOrdersCount.toLocaleString()}
+            </div>
+            <div className="mt-2 pt-2 border-t border-slate-800/80 flex items-center justify-between text-xs">
+              <span className="text-slate-400 font-sans">قيد الإلغاء (معزول):</span>
+              <span className="font-bold text-amber-400 font-mono">
+                {report.metrics.cancelingEventsCount.toLocaleString()} طلب
+              </span>
+            </div>
+          </div>
+
+          {/* Card 5: Extra Phones Added */}
+          <div
+            onClick={() => setDrilldownPillar('extra_phone')}
+            className="bg-slate-900 border border-slate-800 hover:border-cyan-500/40 p-5 rounded-2xl shadow-lg cursor-pointer transition transform hover:-translate-y-0.5 group"
+          >
+            <div className="flex items-center justify-between mb-2">
+              <span className="text-xs text-cyan-400 font-sans font-semibold">كم رقم إضافي أُضيف؟</span>
+              <div className="p-2 rounded-xl bg-cyan-500/10 text-cyan-400 border border-cyan-500/20 group-hover:bg-cyan-500/20 transition">
+                <Phone className="w-5 h-5" />
+              </div>
+            </div>
+            <div className="text-2xl font-black text-cyan-300 font-mono">
+              {report.metrics.extraPhonesAddedUniqueOrders.toLocaleString()}
+            </div>
+            <div className="mt-2 pt-2 border-t border-slate-800/80 flex items-center justify-between text-xs">
+              <span className="text-slate-400 font-sans">إجمالي الإضافات:</span>
+              <span className="font-bold text-slate-300 font-mono">
+                {report.metrics.extraPhonesAddedEvents.toLocaleString()} حركة
+              </span>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* 4. Navigation Tabs */}
+      <div className="border-b border-slate-800 flex items-center gap-2 overflow-x-auto text-xs font-sans">
+        <button
+          onClick={() => setActiveTab('overview')}
+          className={`pb-3 px-4 font-bold border-b-2 transition flex items-center gap-2 ${
+            activeTab === 'overview'
+              ? 'border-amber-400 text-amber-400'
+              : 'border-transparent text-slate-400 hover:text-slate-200'
+          }`}
+        >
+          <BarChart3 className="w-4 h-4" />
+          النظرة العامة والتحليل
+        </button>
+
+        {report && report.days.length > 1 && (
+          <button
+            onClick={() => setActiveTab('daily_breakdown')}
+            className={`pb-3 px-4 font-bold border-b-2 transition flex items-center gap-2 ${
+              activeTab === 'daily_breakdown'
+                ? 'border-amber-400 text-amber-400'
+                : 'border-transparent text-slate-400 hover:text-slate-200'
+            }`}
+          >
+            <Calendar className="w-4 h-4" />
+            المقارنة اليومية للأسبوع ({report.days.length} أيام)
+          </button>
+        )}
+
+        <button
+          onClick={() => setActiveTab('employees')}
+          className={`pb-3 px-4 font-bold border-b-2 transition flex items-center gap-2 ${
+            activeTab === 'employees'
+              ? 'border-amber-400 text-amber-400'
+              : 'border-transparent text-slate-400 hover:text-slate-200'
+          }`}
+        >
+          <Users className="w-4 h-4" />
+          نشاط الموظفين ({report?.employees.length || 0})
+        </button>
+
+        <button
+          onClick={() => setActiveTab('transitions')}
+          className={`pb-3 px-4 font-bold border-b-2 transition flex items-center gap-2 ${
+            activeTab === 'transitions'
+              ? 'border-amber-400 text-amber-400'
+              : 'border-transparent text-slate-400 hover:text-slate-200'
+          }`}
+        >
+          <ArrowRightLeft className="w-4 h-4" />
+          تغييرات الحالات ({report?.transitions.length || 0})
+        </button>
+
+        <button
+          onClick={() => setActiveTab('admin_edits')}
+          className={`pb-3 px-4 font-bold border-b-2 transition flex items-center gap-2 ${
+            activeTab === 'admin_edits'
+              ? 'border-amber-400 text-amber-400'
+              : 'border-transparent text-slate-400 hover:text-slate-200'
+          }`}
+        >
+          <FileText className="w-4 h-4" />
+          التعديلات الإدارية ({report?.administrativeEdits.length || 0})
+        </button>
+
+        <button
+          onClick={() => setActiveTab('unresolved')}
+          className={`pb-3 px-4 font-bold border-b-2 transition flex items-center gap-2 ${
+            activeTab === 'unresolved'
+              ? 'border-purple-400 text-purple-400'
+              : 'border-transparent text-slate-400 hover:text-slate-200'
+          }`}
+        >
+          <ShieldAlert className="w-4 h-4" />
+          حركات للمراجعة ({report?.unresolvedActions.length || 0})
+        </button>
+      </div>
+
+      {/* 5. Tab Content */}
+      {report && (
+        <div>
+          {/* Tab 1: Overview */}
+          {activeTab === 'overview' && (
+            <div className="space-y-6">
+              {/* Operational Statuses Summary Table */}
+              <div className="bg-slate-900 border border-slate-800 rounded-2xl p-5 shadow-xl">
+                <div className="flex items-center justify-between mb-4">
+                  <h3 className="text-sm font-bold text-slate-100 flex items-center gap-2 font-sans">
+                    <CheckCircle2 className="w-4 h-4 text-emerald-400" />
+                    <span>ملخص الحركات والقرارات التشغيلية للفترة</span>
+                  </h3>
+                  <span className="text-xs text-slate-500 font-mono">
+                    القاعدة: Printed = تأكيد الأوردر
+                  </span>
+                </div>
+
+                <div className="grid grid-cols-1 md:grid-cols-3 gap-4 text-xs font-sans">
+                  <div className="p-4 rounded-xl bg-slate-950 border border-slate-800">
+                    <div className="text-slate-400 mb-1">نسبة التأكيد الموثقة (Printed)</div>
+                    <div className="text-2xl font-black text-emerald-400 font-mono">
+                      {report.metrics.createdOrdersCount > 0
+                        ? `${Math.round(
+                            (report.metrics.confirmedOrdersCount / report.metrics.createdOrdersCount) * 100
+                          )}%`
+                        : '—'}
                     </div>
-                    <span className="text-xs font-mono text-slate-400 bg-slate-950 px-2.5 py-1 rounded border border-slate-800">
-                      {data.timeline.length} يوم مسجل
-                    </span>
+                    <p className="text-[11px] text-slate-500 mt-1">
+                      محسوبة من وصول الأوردر لحالة Printed قياساً على المنشأ
+                    </p>
                   </div>
 
-                  <div className="grid grid-cols-7 md:grid-cols-14 lg:grid-cols-30 gap-1.5 items-end h-32 pt-4 border-b border-slate-800/80">
-                    {data.timeline.map((item, idx) => {
-                      const heightPercent = Math.max(12, Math.round((item.events_count / maxTimelineEvents) * 100));
-                      return (
-                        <div
-                          key={idx}
-                          className="flex flex-col items-center gap-1 h-full justify-end group relative"
-                        >
-                          {/* Tooltip on Hover */}
-                          <div className="opacity-0 group-hover:opacity-100 transition-opacity absolute bottom-full mb-1 z-20 pointer-events-none bg-slate-950 border border-slate-700 text-[10px] text-slate-200 p-2 rounded-lg shadow-xl whitespace-nowrap">
-                            <div className="font-bold text-amber-400 font-mono">{item.date}</div>
-                            <div>العمليات: {item.events_count}</div>
-                            <div>الطلبات: {item.unique_orders}</div>
-                          </div>
-                          {/* Bar */}
-                          <div
-                            style={{ height: `${heightPercent}%` }}
-                            className="w-full rounded-t bg-gradient-to-t from-amber-600/70 to-amber-400/80 hover:to-amber-300 transition-all cursor-pointer"
-                          />
-                          <span className="text-[9px] font-mono text-slate-500 truncate w-full text-center">
-                            {item.date.slice(5)}
-                          </span>
-                        </div>
-                      );
-                    })}
+                  <div className="p-4 rounded-xl bg-slate-950 border border-slate-800">
+                    <div className="text-slate-400 mb-1">نسبة الإلغاء النهائي (Canceled)</div>
+                    <div className="text-2xl font-black text-rose-400 font-mono">
+                      {report.metrics.createdOrdersCount > 0
+                        ? `${Math.round(
+                            (report.metrics.canceledOrdersCount / report.metrics.createdOrdersCount) * 100
+                          )}%`
+                        : '—'}
+                    </div>
+                    <p className="text-[11px] text-slate-500 mt-1">
+                      حركات Canceled المثبتة في اللوجز فقط
+                    </p>
+                  </div>
+
+                  <div className="p-4 rounded-xl bg-slate-950 border border-slate-800">
+                    <div className="text-slate-400 mb-1">معدل تكرار الحركات على الأوردر الواحد</div>
+                    <div className="text-2xl font-black text-amber-400 font-mono">
+                      {report.metrics.uniqueOrdersTouched > 0
+                        ? (report.metrics.totalLogs / report.metrics.uniqueOrdersTouched).toFixed(1)
+                        : '0'}
+                    </div>
+                    <p className="text-[11px] text-slate-500 mt-1">
+                      متوسط عدد العمليات المسجلة لكل أوردر خضع للنشاط
+                    </p>
                   </div>
                 </div>
-              )}
+              </div>
 
-              {/* Status Transitions Matrix & Cancellations Breakdown */}
-              <div className="grid grid-cols-1 lg:grid-cols-12 gap-6">
-                {/* Transitions Table (8 Cols) */}
-                <div className="lg:col-span-8 p-5 rounded-2xl bg-slate-900/60 border border-slate-800 space-y-4 shadow-sm">
-                  <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+              {/* Day-by-Day comparison table if multiple days */}
+              {report.days.length > 1 && (
+                <div className="bg-slate-900 border border-slate-800 rounded-2xl p-5 shadow-xl">
+                  <div className="flex items-center justify-between mb-4">
                     <div>
-                      <h3 className="text-sm font-bold text-slate-200 flex items-center gap-2">
-                        <ArrowRightLeft className="w-4 h-4 text-emerald-400" />
-                        <span>مصفوفة انتقالات الحالات الموثقة (Status Transitions)</span>
+                      <h3 className="text-sm font-bold text-slate-100 flex items-center gap-2 font-sans">
+                        <Calendar className="w-4 h-4 text-amber-400" />
+                        <span>جدول المقارنة اليومية للأسبوع</span>
                       </h3>
                       <p className="text-xs text-slate-400 mt-0.5">
-                        حركات الانتقال من حالة إلى أخرى بناءً على سجلات النشاط التشغيلية
+                        إجمالي الأوردرات الفريدة للأسبوع ككل:{' '}
+                        <strong className="text-amber-400 font-mono">
+                          {report.metrics.uniqueOrdersTouched.toLocaleString()}
+                        </strong>{' '}
+                        (محسوب من الأكواد الفريدة في الأسبوع بالكامل وليس جمع الأيام)
                       </p>
-                    </div>
-
-                    <div className="relative w-full sm:w-56">
-                      <Search className="w-3.5 h-3.5 absolute right-3 top-2.5 text-slate-500" />
-                      <input
-                        type="text"
-                        value={transitionSearch}
-                        onChange={(e) => setTransitionSearch(e.target.value)}
-                        placeholder="بحث بالحالة..."
-                        className="w-full bg-slate-950 border border-slate-800 rounded-lg pr-9 pl-3 py-1.5 text-xs text-slate-200 placeholder-slate-500 focus:outline-none focus:border-amber-500/50"
-                      />
                     </div>
                   </div>
 
-                  <div className="border border-slate-800/80 rounded-xl overflow-hidden bg-slate-950/40">
+                  <div className="overflow-x-auto rounded-xl border border-slate-800">
                     <table className="w-full text-right text-xs">
                       <thead>
-                        <tr className="border-b border-slate-800 bg-slate-950/80 text-slate-400">
-                          <th className="py-3 px-3 font-semibold">مسار الانتقال</th>
-                          <th className="py-3 px-3 font-semibold">الحالة السابقة</th>
-                          <th className="py-3 px-3 font-semibold">الحالة الجديدة</th>
-                          <th className="py-3 px-3 font-semibold font-mono">المرات</th>
-                          <th className="py-3 px-3 font-semibold font-mono">النسبة</th>
+                        <tr className="bg-slate-950 text-slate-400 border-b border-slate-800 font-sans">
+                          <th className="py-3 px-4">اليوم والتاريخ</th>
+                          <th className="py-3 px-4">إجمالي اللوجز</th>
+                          <th className="py-3 px-4">طلبات منشأة</th>
+                          <th className="py-3 px-4">مؤكدة (Printed)</th>
+                          <th className="py-3 px-4">ملغاة (Canceled)</th>
+                          <th className="py-3 px-4">هواتف إضافية</th>
+                          <th className="py-3 px-4">كادر العمليات</th>
+                          <th className="py-3 px-4">حالة التغطية</th>
                         </tr>
                       </thead>
-                      <tbody className="divide-y divide-slate-800/60">
-                        {filteredTransitions.length === 0 ? (
-                          <tr>
-                            <td colSpan={5} className="py-8 text-center text-slate-500">
-                              لا توجد انتقالات مسجلة مطابقة لمعايير البحث
+                      <tbody className="divide-y divide-slate-800/60 font-mono">
+                        {report.days.map((day) => (
+                          <tr key={day.date} className="hover:bg-slate-800/30 transition">
+                            <td className="py-3 px-4 font-bold text-slate-200 font-sans">
+                              {day.dayNameAr} ({day.date})
+                            </td>
+                            <td className="py-3 px-4 text-slate-300">
+                              {day.totalLogs.toLocaleString()}
+                            </td>
+                            <td className="py-3 px-4 font-bold text-sky-400">
+                              {day.createdOrdersCount.toLocaleString()}
+                            </td>
+                            <td className="py-3 px-4 font-bold text-emerald-400">
+                              {day.confirmedOrdersCount.toLocaleString()}
+                            </td>
+                            <td className="py-3 px-4 font-bold text-rose-400">
+                              {day.canceledOrdersCount.toLocaleString()}
+                            </td>
+                            <td className="py-3 px-4 font-bold text-cyan-400">
+                              {day.extraPhonesAddedCount.toLocaleString()}
+                            </td>
+                            <td className="py-3 px-4 text-slate-300">
+                              {day.activeEmployeesCount} موظف
+                            </td>
+                            <td className="py-3 px-4 font-sans">
+                              {day.coverageStatus === 'COMPLETE' ? (
+                                <span className="px-2 py-0.5 rounded-full bg-emerald-500/10 text-emerald-400 border border-emerald-500/20 text-[11px]">
+                                  مكتملة
+                                </span>
+                              ) : (
+                                <span className="px-2 py-0.5 rounded-full bg-amber-500/10 text-amber-400 border border-amber-500/20 text-[11px]">
+                                  جزئية
+                                </span>
+                              )}
                             </td>
                           </tr>
-                        ) : (
-                          filteredTransitions.map((t, idx) => {
-                            const totalT = data.transitions.reduce((acc, curr) => acc + curr.count, 0) || 1;
-                            const share = Math.round((t.count / totalT) * 100);
-                            return (
-                              <tr key={idx} className="hover:bg-slate-800/30 transition-colors">
-                                <td className="py-2.5 px-3 font-mono text-slate-300 flex items-center gap-1.5">
-                                  <span>{t.from_status || 'بداية'}</span>
-                                  <span className="text-slate-500">←</span>
-                                  <span
-                                    className={`font-bold ${
-                                      t.to_status === 'Printed'
-                                        ? 'text-emerald-400'
-                                        : t.to_status === 'Pending'
-                                        ? 'text-amber-400'
-                                        : t.to_status === 'Processing'
-                                        ? 'text-sky-400'
-                                        : t.to_status === 'Canceled'
-                                        ? 'text-rose-400'
-                                        : 'text-slate-200'
-                                    }`}
-                                  >
-                                    {t.to_status}
-                                  </span>
-                                </td>
-                                <td className="py-2.5 px-3 text-slate-400">
-                                  {t.from_status || 'طلب جديد'}
-                                </td>
-                                <td className="py-2.5 px-3 font-medium text-slate-200">
-                                  {t.to_status}
-                                </td>
-                                <td className="py-2.5 px-3 font-mono font-bold text-slate-100">
-                                  {t.count.toLocaleString()}
-                                </td>
-                                <td className="py-2.5 px-3">
-                                  <div className="flex items-center gap-2">
-                                    <div className="w-16 bg-slate-800 h-1.5 rounded-full overflow-hidden">
-                                      <div
-                                        style={{ width: `${Math.min(100, Math.max(5, share))}%` }}
-                                        className="bg-amber-400 h-full rounded-full"
-                                      />
-                                    </div>
-                                    <span className="font-mono text-[11px] text-slate-400">{share}%</span>
-                                  </div>
-                                </td>
-                              </tr>
-                            );
-                          })
-                        )}
+                        ))}
                       </tbody>
                     </table>
                   </div>
                 </div>
+              )}
 
-                {/* Cancellations Breakdown Card (4 Cols) */}
-                <div className="lg:col-span-4 p-5 rounded-2xl bg-slate-900/60 border border-slate-800 space-y-4 shadow-sm">
-                  <div>
-                    <h3 className="text-sm font-bold text-slate-200 flex items-center gap-2">
-                      <XCircle className="w-4 h-4 text-rose-400" />
-                      <span>تحليل حركات الإلغاء (Cancellations)</span>
-                    </h3>
-                    <p className="text-xs text-slate-400 mt-0.5">
-                      تفصيل الطلبات التي تحولت إلى قيد الإلغاء أو ملغية
-                    </p>
-                  </div>
-
-                  {data.cancellations.length === 0 ? (
-                    <div className="py-12 text-center text-slate-500 text-xs">
-                      لا توجد أي حركات إلغاء مسجلة في هذا النطاق الزمني
-                    </div>
-                  ) : (
-                    <div className="space-y-3">
-                      {data.cancellations.map((c, idx) => {
-                        const pct = totalCancellations > 0 ? Math.round((c.count / totalCancellations) * 100) : 0;
-                        return (
-                          <div
-                            key={idx}
-                            className="p-3.5 rounded-xl bg-slate-950/60 border border-slate-800/80 space-y-2"
-                          >
-                            <div className="flex items-center justify-between text-xs">
-                              <span className="font-bold text-rose-300">{c.to_status}</span>
-                              <span className="font-mono font-bold text-rose-400">
-                                {c.count.toLocaleString()} عملية ({pct}%)
-                              </span>
-                            </div>
-                            <div className="w-full bg-slate-800 h-2 rounded-full overflow-hidden">
-                              <div
-                                style={{ width: `${Math.max(5, pct)}%` }}
-                                className="bg-rose-500 h-full rounded-full"
-                              />
-                            </div>
-                          </div>
-                        );
-                      })}
-
-                      <div className="p-3 bg-rose-500/10 border border-rose-500/20 rounded-xl text-xs text-rose-300">
-                        <span className="font-bold">إجمالي الإلغاءات:</span> {totalCancellations.toLocaleString()} طلب
-                        {data.createdCount > 0 && (
-                          <span className="text-slate-400 mr-2 font-mono">
-                            (تمثل {Math.round((totalCancellations / data.createdCount) * 100)}% من حجم الإنشاء)
-                          </span>
-                        )}
-                      </div>
-                    </div>
-                  )}
-                </div>
-              </div>
-            </div>
-          )}
-
-          {/* TAB 2: WAREHOUSES REPORT (المخازن) */}
-          {(activeTab === 'warehouses' || typeof window !== 'undefined') && (
-            <div className={`space-y-6 ${activeTab !== 'warehouses' ? 'hidden print:block' : ''}`}>
-              {/* Warehouses Summary Cards */}
-              <div className="grid grid-cols-1 sm:grid-cols-4 gap-3">
-                <div className="p-4 rounded-xl bg-slate-900/80 border border-slate-800">
-                  <div className="text-xs text-slate-400">إجمالي المخازن النشطة</div>
-                  <div className="text-2xl font-bold font-mono text-amber-400 mt-1">
-                    {data.warehouses?.length || 0} <span className="text-xs text-slate-500">مخزن</span>
-                  </div>
-                  <div className="text-[11px] text-slate-500 mt-0.5">
-                    مخازن سُجلت لها أصناف أو بضائع
-                  </div>
+              {/* Recent Events Sample */}
+              <div className="bg-slate-900 border border-slate-800 rounded-2xl p-5 shadow-xl">
+                <div className="flex items-center justify-between mb-4">
+                  <h3 className="text-sm font-bold text-slate-100 flex items-center gap-2 font-sans">
+                    <Clock className="w-4 h-4 text-amber-400" />
+                    <span>آخر الحركات المصدرية المسجلة بالفترة (معاينة حية)</span>
+                  </h3>
+                  <button
+                    onClick={() => setDrilldownPillar('all')}
+                    className="text-xs text-amber-400 hover:text-amber-300 transition flex items-center gap-1 font-sans"
+                  >
+                    عرض الكل في النافذة التفصيلية
+                    <ChevronLeft className="w-4 h-4" />
+                  </button>
                 </div>
 
-                <div className="p-4 rounded-xl bg-slate-900/80 border border-slate-800">
-                  <div className="text-xs text-slate-400">إجمالي كمية الأصناف والقطع</div>
-                  <div className="text-2xl font-bold font-mono text-emerald-400 mt-1">
-                    {totalWarehouseItems.toLocaleString()} <span className="text-xs text-slate-500">قطعة</span>
-                  </div>
-                  <div className="text-[11px] text-slate-500 mt-0.5">
-                    إجمالي المنتجات المسحوبة من المخازن
-                  </div>
-                </div>
-
-                <div className="p-4 rounded-xl bg-slate-900/80 border border-slate-800">
-                  <div className="text-xs text-slate-400">تركز أعلى 3 مخازن</div>
-                  <div className="text-2xl font-bold font-mono text-sky-400 mt-1">
-                    {top3WarehouseConcentration}% <span className="text-xs text-slate-500">من القطع</span>
-                  </div>
-                  <div className="text-[11px] text-slate-500 mt-0.5">
-                    نسبة الاستحواذ لأول 3 مخازن
-                  </div>
-                </div>
-
-                <div className="p-4 rounded-xl bg-slate-900/80 border border-slate-800">
-                  <div className="text-xs text-slate-400">طلبات شحن متعددة المخازن</div>
-                  <div className="text-2xl font-bold font-mono text-rose-400 mt-1">
-                    {(data.multiWarehouseCount || 0).toLocaleString()} <span className="text-xs text-slate-500">طلب</span>
-                  </div>
-                  <div className="text-[11px] text-slate-500 mt-0.5">
-                    تتطلب تجزئة وتنسيق بوالص
-                  </div>
-                </div>
-              </div>
-
-              {/* Warehouses Table */}
-              <div className="p-5 rounded-2xl bg-slate-900/60 border border-slate-800 space-y-4 shadow-sm">
-                <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
-                  <div>
-                    <h3 className="text-sm font-bold text-slate-200 flex items-center gap-2">
-                      <Building2 className="w-4 h-4 text-amber-400" />
-                      <span>جدول أداء وكثافة تشغيل المخازن (Warehouses Breakdown)</span>
-                    </h3>
-                    <p className="text-xs text-slate-400 mt-0.5">
-                      تفصيل عدد الطلبات والكميات المسحوبة لكل مخزن مع القيمة التقديرية والحصة النسبية
-                    </p>
-                  </div>
-
-                  {/* Filters & Sorting */}
-                  <div className="flex items-center gap-2 w-full sm:w-auto">
-                    <div className="flex items-center gap-1 bg-slate-950 p-1 rounded-lg border border-slate-800 text-xs">
-                      <span className="text-slate-500 text-[11px] px-1.5">ترتيب:</span>
-                      <button
-                        onClick={() => setWarehouseSort('items')}
-                        className={`px-2 py-1 rounded cursor-pointer ${warehouseSort === 'items' ? 'bg-amber-500/20 text-amber-300 font-bold' : 'text-slate-400'}`}
-                      >
-                        القطع
-                      </button>
-                      <button
-                        onClick={() => setWarehouseSort('orders')}
-                        className={`px-2 py-1 rounded cursor-pointer ${warehouseSort === 'orders' ? 'bg-amber-500/20 text-amber-300 font-bold' : 'text-slate-400'}`}
-                      >
-                        الطلبات
-                      </button>
-                      <button
-                        onClick={() => setWarehouseSort('revenue')}
-                        className={`px-2 py-1 rounded cursor-pointer ${warehouseSort === 'revenue' ? 'bg-amber-500/20 text-amber-300 font-bold' : 'text-slate-400'}`}
-                      >
-                        القيمة
-                      </button>
-                    </div>
-
-                    <div className="relative w-full sm:w-56">
-                      <Search className="w-3.5 h-3.5 absolute right-3 top-2.5 text-slate-500" />
-                      <input
-                        type="text"
-                        value={warehouseSearch}
-                        onChange={(e) => setWarehouseSearch(e.target.value)}
-                        placeholder="بحث بكود المخزن..."
-                        className="w-full bg-slate-950 border border-slate-800 rounded-lg pr-9 pl-3 py-1.5 text-xs text-slate-200 placeholder-slate-500 focus:outline-none focus:border-amber-500/50"
-                      />
-                    </div>
-                  </div>
-                </div>
-
-                <div className="border border-slate-800/80 rounded-xl overflow-hidden bg-slate-950/40">
+                <div className="overflow-x-auto rounded-xl border border-slate-800">
                   <table className="w-full text-right text-xs">
                     <thead>
-                      <tr className="border-b border-slate-800 bg-slate-950/80 text-slate-400">
-                        <th className="py-3 px-4 font-semibold">م</th>
-                        <th className="py-3 px-4 font-semibold">كود المخزن</th>
-                        <th className="py-3 px-4 font-semibold font-mono">عدد الطلبات</th>
-                        <th className="py-3 px-4 font-semibold font-mono">إجمالي القطع</th>
-                        <th className="py-3 px-4 font-semibold">حصة المخزن من القطع</th>
-                        <th className="py-3 px-4 font-semibold font-mono">القيمة التقديرية (ج.م)</th>
-                        <th className="py-3 px-4 font-semibold">التصنيف التشغيلي</th>
+                      <tr className="bg-slate-950 text-slate-400 border-b border-slate-800 font-sans">
+                        <th className="py-2.5 px-3">التوقيت</th>
+                        <th className="py-2.5 px-3">كود الطلب</th>
+                        <th className="py-2.5 px-3">المنفذ</th>
+                        <th className="py-2.5 px-3">نوع الحركة</th>
+                        <th className="py-2.5 px-3">نص الحركة الأصلي الكامل</th>
                       </tr>
                     </thead>
                     <tbody className="divide-y divide-slate-800/60 font-mono">
-                      {processedWarehouses.length === 0 ? (
-                        <tr>
-                          <td colSpan={7} className="py-8 text-center text-slate-500 font-sans">
-                            لا توجد بيانات مخازن مطابقة لمعايير البحث
+                      {report.recentEvents.slice(0, 10).map((ev) => (
+                        <tr key={ev.id} className="hover:bg-slate-800/30 transition">
+                          <td className="py-2 px-3 text-slate-400 whitespace-nowrap text-[11px]">
+                            {ev.event_timestamp ? ev.event_timestamp.replace('T', ' ').slice(0, 19) : '—'}
+                          </td>
+                          <td className="py-2 px-3 font-bold text-amber-400">
+                            {ev.order_code || 'عام'}
+                          </td>
+                          <td className="py-2 px-3 font-sans text-slate-300">
+                            {ev.actor_name}
+                          </td>
+                          <td className="py-2 px-3 font-sans">
+                            <span className="px-2 py-0.5 rounded bg-slate-800 text-slate-200 text-[11px]">
+                              {ev.action_type}
+                            </span>
+                          </td>
+                          <td className="py-2 px-3 font-sans text-slate-400 text-xs max-w-md break-words">
+                            {ev.raw_action_text}
                           </td>
                         </tr>
-                      ) : (
-                        processedWarehouses.map((w, idx) => {
-                          const share = totalWarehouseItems > 0 ? Math.round((w.items_quantity / totalWarehouseItems) * 100) : 0;
-                          return (
-                            <tr key={idx} className="hover:bg-slate-800/30 transition-colors">
-                              <td className="py-3 px-4 text-slate-500 font-mono">{idx + 1}</td>
-                              <td className="py-3 px-4 font-bold text-amber-300 font-mono text-sm">
-                                {w.warehouse_code}
-                              </td>
-                              <td className="py-3 px-4 font-bold text-slate-100">
-                                {w.orders_count.toLocaleString()}
-                              </td>
-                              <td className="py-3 px-4 font-bold text-emerald-400">
-                                {w.items_quantity.toLocaleString()}
-                              </td>
-                              <td className="py-3 px-4 font-sans">
-                                <div className="flex items-center gap-2">
-                                  <div className="w-24 bg-slate-800 h-2 rounded-full overflow-hidden">
-                                    <div
-                                      style={{ width: `${Math.min(100, Math.max(4, share))}%` }}
-                                      className="bg-amber-400 h-full rounded-full"
-                                    />
-                                  </div>
-                                  <span className="font-mono text-xs text-slate-300">{share}%</span>
-                                </div>
-                              </td>
-                              <td className="py-3 px-4 font-bold text-slate-200">
-                                {(w.associated_revenue || 0).toLocaleString()} <span className="text-[10px] text-slate-500 font-sans">ج.م</span>
-                              </td>
-                              <td className="py-3 px-4 font-sans">
-                                {share >= 20 ? (
-                                  <span className="text-[11px] font-semibold text-emerald-400 bg-emerald-500/10 border border-emerald-500/20 px-2 py-0.5 rounded">
-                                    مخزن رئيسي استراتيجي
-                                  </span>
-                                ) : share >= 5 ? (
-                                  <span className="text-[11px] font-semibold text-sky-400 bg-sky-500/10 border border-sky-500/20 px-2 py-0.5 rounded">
-                                    مخزن نشط
-                                  </span>
-                                ) : (
-                                  <span className="text-[11px] text-slate-400 bg-slate-800/50 px-2 py-0.5 rounded">
-                                    مخزن اعتيادي
-                                  </span>
-                                )}
-                              </td>
-                            </tr>
-                          );
-                        })
-                      )}
+                      ))}
                     </tbody>
                   </table>
                 </div>
@@ -1303,161 +901,401 @@ export const ReportsView: React.FC<ReportsViewProps> = ({ onSelectOrder }) => {
             </div>
           )}
 
-          {/* TAB 3: TEAM & EMPLOYEES PERFORMANCE */}
-          {(activeTab === 'team' || typeof window !== 'undefined') && (
-            <div className={`space-y-6 ${activeTab !== 'team' ? 'hidden print:block' : ''}`}>
-              <div className="p-5 rounded-2xl bg-slate-900/60 border border-slate-800 space-y-4 shadow-sm">
-                <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
-                  <div>
-                    <h3 className="text-sm font-bold text-slate-200 flex items-center gap-2">
-                      <Users className="w-4 h-4 text-sky-400" />
-                      <span>تقرير إنتاجية الفريق والعمليات (Staff Productivity)</span>
-                    </h3>
-                    <p className="text-xs text-slate-400 mt-0.5">
-                      تتبع الإجراءات البشرية المنفذة على الطلبات والموثقة في سجلات النشاط التشغيلية
-                    </p>
+          {/* Tab 2: Daily Breakdown (when in week mode) */}
+          {activeTab === 'daily_breakdown' && (
+            <div className="bg-slate-900 border border-slate-800 rounded-2xl p-5 shadow-xl space-y-4">
+              <div className="flex items-center justify-between">
+                <div>
+                  <h3 className="text-base font-bold text-slate-100 font-sans">
+                    المقارنة اليومية الشاملة للأسبوع
+                  </h3>
+                  <p className="text-xs text-slate-400 mt-0.5 font-sans">
+                    مقارنة يوم بيوم لكافة حركات الإنشاء، التأكيد عبر Printed، الإلغاء، والأرقام الإضافية
+                  </p>
+                </div>
+              </div>
+
+              <div className="overflow-x-auto rounded-xl border border-slate-800">
+                <table className="w-full text-right text-xs">
+                  <thead>
+                    <tr className="bg-slate-950 text-slate-400 border-b border-slate-800 font-sans">
+                      <th className="py-3 px-4">اليوم والتاريخ</th>
+                      <th className="py-3 px-4">إجمالي اللوجز</th>
+                      <th className="py-3 px-4">أوردرات شهدت نشاطاً</th>
+                      <th className="py-3 px-4">منشأة جديدة</th>
+                      <th className="py-3 px-4">مؤكدة (Printed)</th>
+                      <th className="py-3 px-4">ملغاة (Canceled)</th>
+                      <th className="py-3 px-4">هواتف إضافية</th>
+                      <th className="py-3 px-4">الموظفين الفاعلين</th>
+                      <th className="py-3 px-4">التغطية</th>
+                    </tr>
+                  </thead>
+                  <tbody className="divide-y divide-slate-800/60 font-mono">
+                    {report.days.map((day) => (
+                      <tr key={day.date} className="hover:bg-slate-800/30 transition">
+                        <td className="py-3 px-4 font-bold text-slate-100 font-sans">
+                          {day.dayNameAr} ({day.date})
+                        </td>
+                        <td className="py-3 px-4 text-slate-300 font-bold">
+                          {day.totalLogs.toLocaleString()}
+                        </td>
+                        <td className="py-3 px-4 text-amber-400 font-bold">
+                          {day.uniqueOrdersTouched.toLocaleString()}
+                        </td>
+                        <td className="py-3 px-4 text-sky-400 font-bold">
+                          {day.createdOrdersCount.toLocaleString()}
+                        </td>
+                        <td className="py-3 px-4 text-emerald-400 font-bold">
+                          {day.confirmedOrdersCount.toLocaleString()}
+                        </td>
+                        <td className="py-3 px-4 text-rose-400 font-bold">
+                          {day.canceledOrdersCount.toLocaleString()}
+                        </td>
+                        <td className="py-3 px-4 text-cyan-400 font-bold">
+                          {day.extraPhonesAddedCount.toLocaleString()}
+                        </td>
+                        <td className="py-3 px-4 text-slate-300 font-sans">
+                          {day.activeEmployeesCount} موظف
+                        </td>
+                        <td className="py-3 px-4 font-sans">
+                          {day.coverageStatus === 'COMPLETE' ? (
+                            <span className="px-2 py-0.5 rounded-full bg-emerald-500/10 text-emerald-400 border border-emerald-500/20 text-[11px]">
+                              مكتملة
+                            </span>
+                          ) : (
+                            <span className="px-2 py-0.5 rounded-full bg-amber-500/10 text-amber-400 border border-amber-500/20 text-[11px]">
+                              جزئية
+                            </span>
+                          )}
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            </div>
+          )}
+
+          {/* Tab 3: Employees Activity */}
+          {activeTab === 'employees' && (
+            <div className="bg-slate-900 border border-slate-800 rounded-2xl p-5 shadow-xl space-y-4">
+              <div className="flex flex-col md:flex-row md:items-center justify-between gap-3">
+                <div>
+                  <h3 className="text-base font-bold text-slate-100 font-sans">
+                    سجل نشاط وإنتاجية الموظفين وكادر العمليات
+                  </h3>
+                  <p className="text-xs text-slate-400 mt-0.5 font-sans">
+                    محسوب حصراً من اللوجز المصدرية • انقر على أي سطر لفتح الحركات الأصلية للموظف
+                  </p>
+                </div>
+
+                <div className="flex flex-wrap items-center gap-2">
+                  <div className="bg-slate-950 p-1 rounded-xl border border-slate-800 flex items-center gap-1 text-xs">
+                    <button
+                      onClick={() => setEmployeeTypeFilter('ALL')}
+                      className={`px-3 py-1 rounded-lg transition ${
+                        employeeTypeFilter === 'ALL'
+                          ? 'bg-slate-800 text-amber-400 font-bold'
+                          : 'text-slate-400'
+                      }`}
+                    >
+                      الكل ({report.employees.length})
+                    </button>
+                    <button
+                      onClick={() => setEmployeeTypeFilter('STAFF')}
+                      className={`px-3 py-1 rounded-lg transition ${
+                        employeeTypeFilter === 'STAFF'
+                          ? 'bg-slate-800 text-amber-400 font-bold'
+                          : 'text-slate-400'
+                      }`}
+                    >
+                      فريق العمل ({report.employees.filter((e) => e.is_system === 0).length})
+                    </button>
+                    <button
+                      onClick={() => setEmployeeTypeFilter('SYSTEM')}
+                      className={`px-3 py-1 rounded-lg transition ${
+                        employeeTypeFilter === 'SYSTEM'
+                          ? 'bg-slate-800 text-amber-400 font-bold'
+                          : 'text-slate-400'
+                      }`}
+                    >
+                      النظام والتكاملات ({report.employees.filter((e) => e.is_system === 1).length})
+                    </button>
                   </div>
 
-                  <div className="relative w-full sm:w-64">
-                    <Search className="w-3.5 h-3.5 absolute right-3 top-2.5 text-slate-500" />
+                  <div className="relative">
+                    <Search className="w-3.5 h-3.5 text-slate-500 absolute right-3 top-2.5" />
                     <input
                       type="text"
                       value={employeeSearch}
                       onChange={(e) => setEmployeeSearch(e.target.value)}
-                      placeholder="بحث باسم الموظف..."
-                      className="w-full bg-slate-950 border border-slate-800 rounded-lg pr-9 pl-3 py-1.5 text-xs text-slate-200 placeholder-slate-500 focus:outline-none focus:border-amber-500/50"
+                      placeholder="بحث عن موظف..."
+                      className="bg-slate-950 border border-slate-800 rounded-xl pr-8 pl-3 py-1.5 text-xs text-slate-200 placeholder-slate-500 focus:outline-none focus:border-amber-500"
                     />
                   </div>
                 </div>
+              </div>
 
-                <div className="border border-slate-800/80 rounded-xl overflow-hidden bg-slate-950/40">
-                  <table className="w-full text-right text-xs">
-                    <thead>
-                      <tr className="border-b border-slate-800 bg-slate-950/80 text-slate-400">
-                        <th className="py-3 px-4 font-semibold">م</th>
-                        <th className="py-3 px-4 font-semibold">اسم الموظف / المسؤول</th>
-                        <th className="py-3 px-4 font-semibold font-mono">إجمالي الحركات</th>
-                        <th className="py-3 px-4 font-semibold font-mono">الطلبات المنجزة</th>
-                        <th className="py-3 px-4 font-semibold font-mono">تأكيدات الطباعة</th>
-                        <th className="py-3 px-4 font-semibold font-mono">الإلغاءات</th>
-                        <th className="py-3 px-4 font-semibold">معدل الحركات/طلب</th>
+              <div className="overflow-x-auto rounded-xl border border-slate-800">
+                <table className="w-full text-right text-xs">
+                  <thead>
+                    <tr className="bg-slate-950 text-slate-400 border-b border-slate-800 font-sans">
+                      <th className="py-3 px-4">#</th>
+                      <th className="py-3 px-4">اسم المنفذ</th>
+                      <th className="py-3 px-4">طبيعة المنفذ</th>
+                      <th className="py-3 px-4">إجمالي الحركات</th>
+                      <th className="py-3 px-4">أوردرات فريدة</th>
+                      <th className="py-3 px-4">مؤكدة (Printed)</th>
+                      <th className="py-3 px-4">ملغاة (Canceled)</th>
+                      <th className="py-3 px-4">أرقام إضافية</th>
+                      <th className="py-3 px-4">تغيير حالات</th>
+                      <th className="py-3 px-4">توزيع الإجراءات</th>
+                    </tr>
+                  </thead>
+                  <tbody className="divide-y divide-slate-800/60 font-mono">
+                    {filteredEmployees.map((emp, idx) => (
+                      <tr
+                        key={emp.actor_name}
+                        onClick={() => {
+                          setDrilldownActor(emp.actor_name);
+                          setDrilldownPillar('employee');
+                        }}
+                        className="hover:bg-slate-800/40 cursor-pointer transition group"
+                        title="انقر لفتح سجل حركات هذا الموظف"
+                      >
+                        <td className="py-3 px-4 text-slate-500">{idx + 1}</td>
+                        <td className="py-3 px-4 font-bold text-slate-100 font-sans group-hover:text-amber-400 transition">
+                          {emp.actor_name}
+                        </td>
+                        <td className="py-3 px-4 font-sans">
+                          {emp.is_system === 1 ? (
+                            <span className="px-2 py-0.5 rounded-full bg-slate-800 text-slate-400 text-[11px]">
+                              نظام / تلقائي
+                            </span>
+                          ) : (
+                            <span className="px-2 py-0.5 rounded-full bg-amber-500/10 text-amber-300 border border-amber-500/20 text-[11px] font-medium">
+                              موظف بشري
+                            </span>
+                          )}
+                        </td>
+                        <td className="py-3 px-4 font-bold text-slate-200">
+                          {emp.action_count.toLocaleString()}
+                        </td>
+                        <td className="py-3 px-4 font-bold text-amber-400">
+                          {emp.unique_orders.toLocaleString()}
+                        </td>
+                        <td className="py-3 px-4 font-bold text-emerald-400">
+                          {emp.confirmed_orders_count.toLocaleString()}
+                        </td>
+                        <td className="py-3 px-4 font-bold text-rose-400">
+                          {emp.canceled_orders_count.toLocaleString()}
+                        </td>
+                        <td className="py-3 px-4 font-bold text-cyan-400">
+                          {emp.extra_phones_added_count.toLocaleString()}
+                        </td>
+                        <td className="py-3 px-4 text-slate-300">
+                          {emp.status_changes_count.toLocaleString()}
+                        </td>
+                        <td className="py-3 px-4 font-sans">
+                          <div className="flex flex-wrap gap-1">
+                            {Object.entries(emp.actions_breakdown)
+                              .slice(0, 3)
+                              .map(([actionType, count]) => (
+                                <span
+                                  key={actionType}
+                                  className="px-1.5 py-0.5 rounded bg-slate-950 text-slate-400 text-[10px] font-mono border border-slate-800"
+                                >
+                                  {actionType}: {count}
+                                </span>
+                              ))}
+                          </div>
+                        </td>
                       </tr>
-                    </thead>
-                    <tbody className="divide-y divide-slate-800/60 font-mono">
-                      {filteredEmployees.length === 0 ? (
-                        <tr>
-                          <td colSpan={7} className="py-8 text-center text-slate-500 font-sans">
-                            لا توجد بيانات موظفين مسجلة مطابقة لمعايير البحث
-                          </td>
-                        </tr>
-                      ) : (
-                        filteredEmployees.map((emp, idx) => (
-                          <tr key={idx} className="hover:bg-slate-800/30 transition-colors">
-                            <td className="py-3 px-4 text-slate-500 font-mono">{idx + 1}</td>
-                            <td className="py-3 px-4 font-sans font-bold text-slate-200">
-                              {emp.actor_name}
-                            </td>
-                            <td className="py-3 px-4 font-bold text-amber-400">
-                              {emp.action_count.toLocaleString()}
-                            </td>
-                            <td className="py-3 px-4 font-bold text-sky-400">
-                              {emp.unique_orders.toLocaleString()}
-                            </td>
-                            <td className="py-3 px-4 font-bold text-emerald-400">
-                              {(emp.printed_count || 0).toLocaleString()}
-                            </td>
-                            <td className="py-3 px-4 font-bold text-rose-400">
-                              {(emp.cancel_count || 0).toLocaleString()}
-                            </td>
-                            <td className="py-3 px-4 font-sans">
-                              <span className="text-[11px] font-mono text-slate-300 bg-slate-800 px-2.5 py-1 rounded">
-                                {emp.unique_orders > 0 ? `${(emp.action_count / emp.unique_orders).toFixed(1)} حركة/طلب` : '—'}
-                              </span>
-                            </td>
-                          </tr>
-                        ))
-                      )}
-                    </tbody>
-                  </table>
-                </div>
+                    ))}
+                  </tbody>
+                </table>
               </div>
             </div>
           )}
 
-          {/* TAB 4: GOVERNORATES & REGIONS */}
-          {(activeTab === 'regions' || typeof window !== 'undefined') && (
-            <div className={`space-y-6 ${activeTab !== 'regions' ? 'hidden print:block' : ''}`}>
-              <div className="p-5 rounded-2xl bg-slate-900/60 border border-slate-800 space-y-4 shadow-sm">
+          {/* Tab 4: Status Transitions */}
+          {activeTab === 'transitions' && (
+            <div className="bg-slate-900 border border-slate-800 rounded-2xl p-5 shadow-xl space-y-4">
+              <div className="flex items-center justify-between">
                 <div>
-                  <h3 className="text-sm font-bold text-slate-200 flex items-center gap-2">
-                    <MapPin className="w-4 h-4 text-amber-400" />
-                    <span>التوزيع الجغرافي وحجم الطلبات بالمحافظات (Governorates)</span>
+                  <h3 className="text-base font-bold text-slate-100 font-sans">
+                    مصفوفة انتقالات وتغييرات الحالات
                   </h3>
-                  <p className="text-xs text-slate-400 mt-0.5">
-                    كثافة الطلبات ومناطق التسليم المستهدفة مع القيمة المالية
+                  <p className="text-xs text-slate-400 mt-0.5 font-sans">
+                    جميع الحركات التي غيرت حالة الأوردر من حالة إلى أخرى مسجلة في اللوجز
                   </p>
                 </div>
+                <button
+                  onClick={() => setDrilldownPillar('transitions')}
+                  className="text-xs text-amber-400 hover:text-amber-300 font-sans flex items-center gap-1"
+                >
+                  فتح السجلات الكاملة
+                  <ChevronLeft className="w-4 h-4" />
+                </button>
+              </div>
 
-                <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-3">
-                  {data.governorates && data.governorates.length > 0 ? (
-                    data.governorates.map((gov, idx) => {
-                      const totalGov = data.governorates!.reduce((acc, curr) => acc + curr.count, 0) || 1;
-                      const pct = Math.round((gov.count / totalGov) * 100);
-                      return (
-                        <div
-                          key={idx}
-                          className="p-4 rounded-xl bg-slate-950/60 border border-slate-800 space-y-2 hover:border-slate-700 transition-colors"
-                        >
-                          <div className="flex items-center justify-between text-xs">
-                            <span className="font-bold text-slate-200">{gov.governorate}</span>
-                            <span className="font-mono font-bold text-amber-400">
-                              {gov.count.toLocaleString()} طلب
-                            </span>
-                          </div>
-                          <div className="w-full bg-slate-800 h-1.5 rounded-full overflow-hidden">
-                            <div
-                              style={{ width: `${Math.max(5, pct)}%` }}
-                              className="bg-amber-400 h-full rounded-full"
-                            />
-                          </div>
-                          <div className="flex items-center justify-between text-[10px] text-slate-500 font-mono">
-                            <span>{pct}% من الطلبات</span>
-                            {gov.total_value ? <span>{(gov.total_value).toLocaleString()} ج.م</span> : null}
-                          </div>
-                        </div>
-                      );
-                    })
-                  ) : (
-                    <div className="col-span-full py-8 text-center text-slate-500 text-xs">
-                      لا توجد بيانات محافظات مسجلة
-                    </div>
-                  )}
+              <div className="overflow-x-auto rounded-xl border border-slate-800">
+                <table className="w-full text-right text-xs">
+                  <thead>
+                    <tr className="bg-slate-950 text-slate-400 border-b border-slate-800 font-sans">
+                      <th className="py-3 px-4">#</th>
+                      <th className="py-3 px-4">من الحالة</th>
+                      <th className="py-3 px-4">إلى الحالة</th>
+                      <th className="py-3 px-4">عدد الحركات</th>
+                      <th className="py-3 px-4">الطلبات الفريدة</th>
+                    </tr>
+                  </thead>
+                  <tbody className="divide-y divide-slate-800/60 font-mono">
+                    {report.transitions.map((t, idx) => (
+                      <tr key={idx} className="hover:bg-slate-800/30 transition">
+                        <td className="py-3 px-4 text-slate-500">{idx + 1}</td>
+                        <td className="py-3 px-4 font-bold text-slate-400">{t.from_status}</td>
+                        <td className="py-3 px-4 font-bold text-emerald-400">
+                          <span className="px-2 py-0.5 rounded bg-emerald-950/60 border border-emerald-800/60">
+                            {t.to_status}
+                          </span>
+                        </td>
+                        <td className="py-3 px-4 font-bold text-slate-100">
+                          {t.events_count.toLocaleString()}
+                        </td>
+                        <td className="py-3 px-4 font-bold text-amber-400">
+                          {t.unique_orders.toLocaleString()}
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            </div>
+          )}
+
+          {/* Tab 5: Administrative Edits */}
+          {activeTab === 'admin_edits' && (
+            <div className="bg-slate-900 border border-slate-800 rounded-2xl p-5 shadow-xl space-y-4">
+              <div className="flex items-center justify-between">
+                <div>
+                  <h3 className="text-base font-bold text-slate-100 font-sans">
+                    سجل التعديلات الإدارية
+                  </h3>
+                  <p className="text-xs text-slate-400 mt-0.5 font-sans">
+                    تعديلات العناوين وأرقام الهواتف والبيانات المالية والتعيينات والملاحظات
+                  </p>
                 </div>
+                <button
+                  onClick={() => setDrilldownPillar('admin_edits')}
+                  className="text-xs text-amber-400 hover:text-amber-300 font-sans flex items-center gap-1"
+                >
+                  فتح السجلات الكاملة
+                  <ChevronLeft className="w-4 h-4" />
+                </button>
+              </div>
+
+              <div className="overflow-x-auto rounded-xl border border-slate-800">
+                <table className="w-full text-right text-xs">
+                  <thead>
+                    <tr className="bg-slate-950 text-slate-400 border-b border-slate-800 font-sans">
+                      <th className="py-3 px-4">#</th>
+                      <th className="py-3 px-4">نوع التعديل</th>
+                      <th className="py-3 px-4">الحقل المعدل</th>
+                      <th className="py-3 px-4">عدد الحركات</th>
+                      <th className="py-3 px-4">الطلبات الفريدة</th>
+                    </tr>
+                  </thead>
+                  <tbody className="divide-y divide-slate-800/60 font-mono">
+                    {report.administrativeEdits.map((a, idx) => (
+                      <tr key={idx} className="hover:bg-slate-800/30 transition">
+                        <td className="py-3 px-4 text-slate-500">{idx + 1}</td>
+                        <td className="py-3 px-4 font-bold text-indigo-400 font-sans">
+                          {a.action_label_ar}
+                        </td>
+                        <td className="py-3 px-4 font-sans text-slate-300">{a.field_name}</td>
+                        <td className="py-3 px-4 font-bold text-slate-100">
+                          {a.events_count.toLocaleString()}
+                        </td>
+                        <td className="py-3 px-4 font-bold text-amber-400">
+                          {a.unique_orders.toLocaleString()}
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            </div>
+          )}
+
+          {/* Tab 6: Unresolved Actions */}
+          {activeTab === 'unresolved' && (
+            <div className="bg-slate-900 border border-slate-800 rounded-2xl p-5 shadow-xl space-y-4">
+              <div className="flex items-center justify-between">
+                <div>
+                  <h3 className="text-base font-bold text-slate-100 font-sans flex items-center gap-2">
+                    <ShieldAlert className="w-4 h-4 text-purple-400" />
+                    <span>حركات غير محسومة أو تحتاج إلى مراجعة</span>
+                  </h3>
+                  <p className="text-xs text-slate-400 mt-0.5 font-sans">
+                    سجلات اللوجز التي لم يُحسم تصنيفها تلقائياً للحفاظ عليها وعدم إهمال أي حركة
+                  </p>
+                </div>
+                <button
+                  onClick={() => setDrilldownPillar('unresolved')}
+                  className="text-xs text-purple-400 hover:text-purple-300 font-sans flex items-center gap-1"
+                >
+                  فتح السجلات الكاملة
+                  <ChevronLeft className="w-4 h-4" />
+                </button>
+              </div>
+
+              <div className="overflow-x-auto rounded-xl border border-slate-800">
+                <table className="w-full text-right text-xs">
+                  <thead>
+                    <tr className="bg-slate-950 text-slate-400 border-b border-slate-800 font-sans">
+                      <th className="py-3 px-4">#</th>
+                      <th className="py-3 px-4">كود الطلب</th>
+                      <th className="py-3 px-4">المنفذ</th>
+                      <th className="py-3 px-4">التوقيت</th>
+                      <th className="py-3 px-4">نص الحركة الأصلي الكامل</th>
+                    </tr>
+                  </thead>
+                  <tbody className="divide-y divide-slate-800/60 font-mono">
+                    {report.unresolvedActions.map((u, idx) => (
+                      <tr key={u.id || idx} className="hover:bg-slate-800/30 transition">
+                        <td className="py-3 px-4 text-slate-500">{idx + 1}</td>
+                        <td className="py-3 px-4 font-bold text-purple-400">{u.order_code || 'عام'}</td>
+                        <td className="py-3 px-4 font-sans text-slate-300">{u.actor_name}</td>
+                        <td className="py-3 px-4 text-slate-400 whitespace-nowrap text-[11px]">
+                          {u.event_timestamp ? u.event_timestamp.replace('T', ' ').slice(0, 19) : '—'}
+                        </td>
+                        <td className="py-3 px-4 font-sans text-slate-300 max-w-lg break-words">
+                          {u.raw_action_text}
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
               </div>
             </div>
           )}
         </div>
-      ) : null}
+      )}
 
-      {/* KPI Drilldown Modal for Detailed Orders and Data */}
+      {/* 6. Drilldown Modal */}
       <ReportKpiDrilldownModal
-        isOpen={Boolean(drilldownPillar)}
-        onClose={() => setDrilldownPillar(null)}
+        isOpen={drilldownPillar !== null}
+        onClose={() => {
+          setDrilldownPillar(null);
+          setDrilldownActor(undefined);
+        }}
         pillar={drilldownPillar}
-        startDate={data?.startDate || ''}
-        endDate={data?.endDate || ''}
-        periodLabel={
-          period === 'today'
-            ? 'اليوم'
-            : period === 'yesterday'
-            ? 'أمس'
-            : period === 'last_7_days'
-            ? 'آخر 7 أيام'
-            : period === 'last_30_days'
-            ? 'آخر 30 يوماً'
-            : 'مخصص'
-        }
-        reportData={data}
+        actorName={drilldownActor}
+        startDate={effectiveStart}
+        endDate={effectiveEnd}
+        periodLabel={report?.periodLabel || `${effectiveStart} إلى ${effectiveEnd}`}
+        reportData={report}
         onSelectOrder={onSelectOrder}
       />
     </div>

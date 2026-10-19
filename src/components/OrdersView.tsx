@@ -233,16 +233,25 @@ export const OrdersView: React.FC<OrdersViewProps> = ({
                         {order.governorate || '—'}
                       </td>
 
-                      {/* Warehouse Codes */}
+                      {/* Warehouse & Merchant Codes */}
                       <td className="py-3 px-4">
-                        {order.distinct_merchant_count > 1 ? (
-                          <span className="text-rose-400 font-bold inline-flex items-center gap-1">
-                            <AlertTriangle className="w-3.5 h-3.5" />
-                            <span>{order.distinct_merchant_count} مخازن</span>
-                          </span>
-                        ) : (
-                          <span className="text-slate-400 text-xs">مخزن واحد</span>
-                        )}
+                        <div className="flex flex-col gap-1 items-start">
+                          {order.distinct_merchant_count > 1 ? (
+                            <span className="text-rose-400 font-bold inline-flex items-center gap-1">
+                              <AlertTriangle className="w-3.5 h-3.5" />
+                              <span>{order.distinct_merchant_count} مخازن</span>
+                            </span>
+                          ) : (
+                            <span className="text-slate-400 text-xs">
+                              {order.warehouseCodes?.[0] ? `مخزن ${order.warehouseCodes[0]}` : 'مخزن واحد'}
+                            </span>
+                          )}
+                          {order.merchantCodes && order.merchantCodes.length > 0 && (
+                            <span className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded bg-amber-950/60 border border-amber-500/40 text-amber-300 text-[10px] font-mono">
+                              تاجر: {order.merchantCodes.join(', ')}
+                            </span>
+                          )}
+                        </div>
                       </td>
 
                       {/* Delivery Rate */}

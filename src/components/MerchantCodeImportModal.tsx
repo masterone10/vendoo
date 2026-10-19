@@ -89,6 +89,7 @@ export const MerchantCodeImportModal: React.FC<MerchantCodeImportModalProps> = (
           r['vendorCode'] ||
           r['merchant_id'] ||
           r['vendor_id'] ||
+          (r['كود المخزن'] && !r['كود المخزن'].startsWith('مخزن') ? r['كود المخزن'] : '') ||
           '';
 
         const orderCode =
@@ -103,17 +104,19 @@ export const MerchantCodeImportModal: React.FC<MerchantCodeImportModalProps> = (
 
         const vendorId = r['vendoor_id'] || r['معرف الطلب'] || r['Order ID'] ? parseInt(r['vendoor_id'] || r['معرف الطلب'] || r['Order ID'], 10) : null;
         const itemId = r['item_id'] || r['معرف الصنف'] || r['vendoor_item_id'] ? parseInt(r['item_id'] || r['معرف الصنف'] || r['vendoor_item_id'], 10) : null;
+        const productId = r['product_id'] || r['معرف المنتج'] || r['Product ID'] ? parseInt(r['product_id'] || r['معرف المنتج'] || r['Product ID'], 10) : null;
         const sku = r['SKU'] || r['كود الصنف'] || r['sku'] || r['كود المتغير'] || null;
         const productName = r['اسم الصنف'] || r['اسم المنتج'] || r['product_name'] || null;
         const merchantName = r['اسم التاجر'] || r['اسم المورد'] || r['merchant_name'] || r['التاجر'] || r['المورد'] || null;
         const warehouseName = r['اسم المستودع'] || r['اسم المخزن'] || r['المخزن'] || r['المستودع'] || r['warehouse_name'] || null;
-        const warehouseCode = r['كود المستودع'] || r['كود المخزن'] || r['warehouse_code'] || r['Warehouse Code'] || null;
+        const warehouseCode = r['كود المستودع'] || r['warehouse_code'] || r['Warehouse Code'] || (r['كود المخزن'] && r['كود المخزن'].startsWith('مخزن') ? r['كود المخزن'] : null);
 
         return {
           merchantCode: String(merchantCode).trim(),
           orderCode: orderCode ? String(orderCode).trim() : null,
           vendorId: !isNaN(vendorId as any) ? vendorId : null,
           itemId: !isNaN(itemId as any) ? itemId : null,
+          productId: !isNaN(productId as any) ? productId : null,
           sku: sku ? String(sku).trim() : null,
           productName: productName ? String(productName).trim() : null,
           merchantName: merchantName ? String(merchantName).trim() : null,

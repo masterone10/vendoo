@@ -1,1 +1,27 @@
 @import "tailwindcss";
+
+@keyframes infinity-glow {
+  0%, 100% {
+    transform: scale(1);
+    filter: drop-shadow(0 0 8px rgba(245, 158, 11, 0.4));
+  }
+  50% {
+    transform: scale(1.06);
+    filter: drop-shadow(0 0 16px rgba(245, 158, 11, 0.8));
+  }
+}
+
+@keyframes infinity-dash {
+  to {
+    stroke-dashoffset: -320;
+  }
+}
+
+.animate-infinity-glow {
+  animation: infinity-glow 2.5s ease-in-out infinite;
+}
+
+.animate-infinity-path {
+  stroke-dasharray: 80 20;
+  animation: infinity-dash 3s linear infinite;
+}
