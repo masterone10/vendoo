@@ -1,6 +1,7 @@
 import React, { useState, useEffect } from 'react';
 import { Activity, RefreshCw, CheckCircle2, AlertTriangle, XCircle, Clock, Database, ShieldCheck } from 'lucide-react';
 import { SyncStatus } from '../types';
+import { safeFetchJson } from '../utils/api';
 
 interface SyncHealthViewProps {
   syncStatus: SyncStatus | null;
@@ -23,9 +24,10 @@ export const SyncHealthView: React.FC<SyncHealthViewProps> = ({
   async function fetchSyncRuns() {
     setLoading(true);
     try {
-      const res = await fetch('/api/sync/runs');
-      const data = await res.json();
-      setRuns(data.runs || []);
+      const { ok, data } = await safeFetchJson<{ runs: any[] }>('/api/sync/runs');
+      if (ok && data) {
+        setRuns(data.runs || []);
+      }
     } catch (err) {
       console.error('Error fetching sync runs:', err);
     } finally {

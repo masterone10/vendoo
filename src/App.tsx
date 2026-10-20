@@ -16,6 +16,7 @@ import { SettingsView } from './components/SettingsView';
 import { OrderDetailsModal } from './components/OrderDetailsModal';
 import { useLiveUpdates } from './hooks/useLiveUpdates';
 import { DashboardStats } from './types';
+import { safeFetchJson } from './utils/api';
 
 export default function App() {
   const cairoToday = new Intl.DateTimeFormat('en-CA', {
@@ -47,14 +48,9 @@ export default function App() {
 
   const fetchStats = useCallback(async (dateToQuery?: string) => {
     const d = dateToQuery || selectedBusinessDate;
-    try {
-      const res = await fetch(`/api/dashboard/stats?date=${d}`);
-      if (res.ok) {
-        const data = await res.json();
-        setStats(data);
-      }
-    } catch (err) {
-      console.error('Error fetching dashboard stats:', err);
+    const { ok, data } = await safeFetchJson<DashboardStats>(`/api/dashboard/stats?date=${d}`);
+    if (ok && data) {
+      setStats(data);
     }
   }, [selectedBusinessDate]);
 

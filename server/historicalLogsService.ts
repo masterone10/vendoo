@@ -87,120 +87,142 @@ export function persistLogEntries(
     LIMIT 1
   `);
 
-  for (const entry of entries) {
-    const rawActionText = (entry.rawActionText || '').trim();
-    const eventTime = entry.eventTimestamp || nowIso;
-    const actorName = (entry.actorName || 'النظام').trim();
-    const orderCode = (entry.orderCode || '').trim() || null;
+  const findRawByHashStmt = db.prepare('SELECT id FROM raw_activity_events WHERE source_hash = ?');
+  const checkCanonStmt = db.prepare(`
+    SELECT id FROM canonical_activity_events
+    WHERE (raw_event_id IS NOT NULL AND raw_event_id = ?)
+       OR (order_code IS ? AND actor_name = ? AND action_type = ? AND event_timestamp = ?)
+    LIMIT 1
+  `);
+  const insertStatusEventStmt = db.prepare(`
+    INSERT INTO order_status_events (
+      order_id, random_number, from_status, to_status, actor_name,
+      event_time_source, storage_tier, observed_at, source_channel
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'system_log_audit')
+  `);
+  const updateOrderStatusStmt = db.prepare(`
+    UPDATE orders
+    SET current_status = ?,
+        validation_status = 'RESOLVED_VIA_AUDIT_LOGS',
+        last_observed_at = ?
+    WHERE id = ? AND (state_entry_at IS NULL OR state_entry_at <= ?)
+  `);
 
-    // Check Cairo date isolation bounds [startCairo, endCairo) if strictInterval is true
-    if (strictInterval && (eventTime < interval.startCairo || eventTime >= interval.endCairo)) {
-      continue;
-    }
+  const TX_BATCH_SIZE = 1000;
+  let inTx = false;
+  try {
+    db.exec('BEGIN TRANSACTION;');
+    inTx = true;
 
-    const sourceHash = crypto
-      .createHash('sha256')
-      .update(`${actorName}|${orderCode || ''}|${rawActionText}|${eventTime}`)
-      .digest('hex');
-
-    const logTier = isDateInHot(eventTime) ? 'HOT' : 'COLD';
-
-    const parsed = parseLogActionDetails(rawActionText, actorName, orderCode || '');
-    const detailsJson = JSON.stringify(parsed);
-
-    // 1. Insert into raw_activity_events
-    let rawEventId: number | null = null;
-    let isNewRaw = false;
-    try {
-      const res = insertRawStmt.run(
-        sourceHash,
-        orderCode,
-        actorName,
-        rawActionText,
-        eventTime,
-        logTier,
-        nowIso,
-        entry.vendoorOrderId || null,
-        entry.rawHtml || null,
-        detailsJson,
-        dataSource,
-        importId
-      );
-      if (res.changes > 0) {
-        rawEventId = Number(res.lastInsertRowid);
-        isNewRaw = true;
-      } else {
-        // Event hash already exists - retrieve existing rawEventId
-        const existingRow: any = db.prepare('SELECT id FROM raw_activity_events WHERE source_hash = ?').get(sourceHash);
-        rawEventId = existingRow?.id ? Number(existingRow.id) : null;
-        duplicates++;
+    for (let i = 0; i < entries.length; i++) {
+      if (i > 0 && i % TX_BATCH_SIZE === 0) {
+        db.exec('COMMIT; BEGIN TRANSACTION;');
       }
-    } catch {
-      duplicates++;
-    }
+      const entry = entries[i];
+      const rawActionText = (entry.rawActionText || '').trim();
+      const eventTime = entry.eventTimestamp || nowIso;
+      const actorName = (entry.actorName || 'النظام').trim();
+      const orderCode = (entry.orderCode || '').trim() || null;
 
-    const isSystem = (
-      actorName === 'النظام' ||
-      actorName.toLowerCase() === 'system' ||
-      actorName.toLowerCase().includes('cron') ||
-      actorName.includes('تلقائي')
-    ) ? 1 : 0;
+      // Check Cairo date isolation bounds [startCairo, endCairo) if strictInterval is true
+      if (strictInterval && (eventTime < interval.startCairo || eventTime >= interval.endCairo)) {
+        continue;
+      }
 
-    // Check if canonical event already exists for this exact raw_event_id or order, actor, action, timestamp
-    const existingCanon: any = db.prepare(`
-      SELECT id FROM canonical_activity_events
-      WHERE (raw_event_id IS NOT NULL AND raw_event_id = ?)
-         OR (order_code IS ? AND actor_name = ? AND action_type = ? AND event_timestamp = ?)
-    `).get(rawEventId, orderCode, actorName, parsed.actionType, eventTime);
+      const sourceHash = crypto
+        .createHash('sha256')
+        .update(`${actorName}|${orderCode || ''}|${rawActionText}|${eventTime}`)
+        .digest('hex');
 
-    if (!existingCanon && isNewRaw) {
+      const logTier = isDateInHot(eventTime) ? 'HOT' : 'COLD';
+
+      const parsed = parseLogActionDetails(rawActionText, actorName, orderCode || '');
+      const detailsJson = JSON.stringify(parsed);
+
+      // 1. Insert into raw_activity_events
+      let rawEventId: number | null = null;
+      let isNewRaw = false;
       try {
-        let matchedOrderId: number | null = null;
-        let matchStatus = 'UNRESOLVED';
-        let ord: any = null;
-        if (!orderCode) {
-          matchStatus = 'GENERAL_LOG';
-        } else {
-          ord = findOrderStmt.get(orderCode, orderCode, orderCode);
-          if (ord) {
-            matchedOrderId = ord.id;
-            matchStatus = 'MATCHED';
-          }
-        }
-
-        const insRes = insertCanonStmt.run(
-          rawEventId,
+        const res = insertRawStmt.run(
+          sourceHash,
           orderCode,
           actorName,
-          parsed.actionType,
-          parsed.fromStatus,
-          parsed.toStatus,
+          rawActionText,
           eventTime,
           logTier,
-          isSystem,
           nowIso,
-          matchedOrderId,
-          matchStatus,
-          parsed.isAdministrative ? 1 : 0,
-          parsed.fieldName,
-          parsed.oldValue,
-          parsed.newValue,
+          entry.vendoorOrderId || null,
+          entry.rawHtml || null,
           detailsJson,
           dataSource,
           importId
         );
+        if (res.changes > 0) {
+          rawEventId = Number(res.lastInsertRowid);
+          isNewRaw = true;
+        } else {
+          // Event hash already exists - retrieve existing rawEventId
+          const existingRow: any = findRawByHashStmt.get(sourceHash);
+          rawEventId = existingRow?.id ? Number(existingRow.id) : null;
+          duplicates++;
+        }
+      } catch {
+        duplicates++;
+      }
 
-        if (insRes.changes > 0) {
-          saved++;
+      const isSystem = (
+        actorName === 'النظام' ||
+        actorName.toLowerCase() === 'system' ||
+        actorName.toLowerCase().includes('cron') ||
+        actorName.includes('تلقائي')
+      ) ? 1 : 0;
 
-          // 3. If event provides verified status change and matches an existing order, link timeline
-          if (orderCode && parsed.actionType === 'status_change' && parsed.toStatus && ord) {
-              db.prepare(`
-                INSERT INTO order_status_events (
-                  order_id, random_number, from_status, to_status, actor_name,
-                  event_time_source, storage_tier, observed_at, source_channel
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'system_log_audit')
-              `).run(
+      // Check if canonical event already exists for this exact raw_event_id or order, actor, action, timestamp
+      const existingCanon: any = checkCanonStmt.get(rawEventId, orderCode, actorName, parsed.actionType, eventTime);
+
+      if (!existingCanon && isNewRaw) {
+        try {
+          let matchedOrderId: number | null = null;
+          let matchStatus = 'UNRESOLVED';
+          let ord: any = null;
+          if (!orderCode) {
+            matchStatus = 'GENERAL_LOG';
+          } else {
+            ord = findOrderStmt.get(orderCode, orderCode, orderCode);
+            if (ord) {
+              matchedOrderId = ord.id;
+              matchStatus = 'MATCHED';
+            }
+          }
+
+          const insRes = insertCanonStmt.run(
+            rawEventId,
+            orderCode,
+            actorName,
+            parsed.actionType,
+            parsed.fromStatus,
+            parsed.toStatus,
+            eventTime,
+            logTier,
+            isSystem,
+            nowIso,
+            matchedOrderId,
+            matchStatus,
+            parsed.isAdministrative ? 1 : 0,
+            parsed.fieldName,
+            parsed.oldValue,
+            parsed.newValue,
+            detailsJson,
+            dataSource,
+            importId
+          );
+
+          if (insRes.changes > 0) {
+            saved++;
+
+            // 3. If event provides verified status change and matches an existing order, link timeline
+            if (orderCode && parsed.actionType === 'status_change' && parsed.toStatus && ord) {
+              insertStatusEventStmt.run(
                 ord.id,
                 ord.random_number,
                 parsed.fromStatus || ord.current_status,
@@ -212,19 +234,22 @@ export function persistLogEntries(
               );
 
               // Update order current status if event is newer than state_entry_at
-              db.prepare(`
-                UPDATE orders
-                SET current_status = ?,
-                    validation_status = 'RESOLVED_VIA_AUDIT_LOGS',
-                    last_observed_at = ?
-                WHERE id = ? AND (state_entry_at IS NULL OR state_entry_at <= ?)
-              `).run(parsed.toStatus, nowIso, ord.id, eventTime);
+              updateOrderStatusStmt.run(parsed.toStatus, nowIso, ord.id, eventTime);
             }
           }
-      } catch (err: any) {
-        // Safe duplicate or constraint handling
+        } catch {
+          // Safe duplicate or constraint handling
+        }
       }
     }
+
+    db.exec('COMMIT;');
+    inTx = false;
+  } catch (err) {
+    if (inTx) {
+      try { db.exec('ROLLBACK;'); } catch {}
+    }
+    throw err;
   }
 
   return { saved, duplicates };

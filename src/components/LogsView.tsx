@@ -28,6 +28,7 @@ import {
 import { DateCalendarPicker, getCairoToday, formatDateArabic } from './common/DateCalendarPicker';
 import { SystemLogEvent, LogStats } from '../types';
 import { LogDetailsModal } from './LogDetailsModal';
+import { safeFetchJson } from '../utils/api';
 
 interface LogsViewProps {
   onSelectOrder?: (orderCode: string) => void;
@@ -113,13 +114,12 @@ export const LogsView: React.FC<LogsViewProps> = ({ onSelectOrder, selectedDate 
         params.set('date', startDate);
       }
 
-      const res = await fetch(`/api/logs?${params.toString()}`);
-      if (res.ok) {
-        const json = await res.json();
-        setLogs(json.logs || []);
-        setTotalCount(json.total || 0);
-        if (json.stats) {
-          setStats(json.stats);
+      const { ok, data } = await safeFetchJson<any>(`/api/logs?${params.toString()}`);
+      if (ok && data) {
+        setLogs(data.logs || []);
+        setTotalCount(data.total || 0);
+        if (data.stats) {
+          setStats(data.stats);
         }
       }
     } catch (err) {

@@ -2,6 +2,7 @@ import React, { useState, useEffect } from 'react';
 import { Users, Clock, CheckCircle2, RotateCw, XCircle, ChevronLeft, Calendar, Info, X } from 'lucide-react';
 import { TeamMember } from '../types';
 import { DateCalendarPicker } from './common/DateCalendarPicker';
+import { safeFetchJson } from '../utils/api';
 
 interface TeamViewProps {
   selectedDate?: string;
@@ -50,12 +51,13 @@ export const TeamView: React.FC<TeamViewProps> = ({ selectedDate, onSelectOrder 
           url = '/api/team?period=today';
         }
       }
-      const res = await fetch(url);
-      const data = await res.json();
-      setTeam(data.team || []);
-      setTotalActions(data.totalActions || 0);
-      setTotalUniqueOrders(data.totalUniqueOrders || 0);
-      setDateFilterLabel(data.dateFilter || customDate || '');
+      const { ok, data } = await safeFetchJson<any>(url);
+      if (ok && data) {
+        setTeam(data.team || []);
+        setTotalActions(data.totalActions || 0);
+        setTotalUniqueOrders(data.totalUniqueOrders || 0);
+        setDateFilterLabel(data.dateFilter || customDate || '');
+      }
     } catch (err) {
       console.error('Error fetching team stats:', err);
     } finally {
@@ -77,9 +79,10 @@ export const TeamView: React.FC<TeamViewProps> = ({ selectedDate, onSelectOrder 
       } else if (period === 'custom' && customDate) {
         url += `?date=${encodeURIComponent(customDate)}`;
       }
-      const res = await fetch(url);
-      const data = await res.json();
-      setMemberEvents(data.events || []);
+      const { ok, data } = await safeFetchJson<any>(url);
+      if (ok && data) {
+        setMemberEvents(data.events || []);
+      }
     } catch (err) {
       console.error('Error fetching member events:', err);
     } finally {

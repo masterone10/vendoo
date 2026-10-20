@@ -1,6 +1,7 @@
 import React, { useState, useEffect } from 'react';
 import { Database, CheckCircle2, AlertTriangle, XCircle, RefreshCw, Server, Play, KeyRound, Clock, ShieldCheck, FileText, Calendar } from 'lucide-react';
 import { SupabaseStatus } from '../types';
+import { safeFetchJson } from '../utils/api';
 
 export const SettingsView: React.FC = () => {
   const [loading, setLoading] = useState(false);
@@ -18,9 +19,8 @@ export const SettingsView: React.FC = () => {
 
   async function fetchSettings() {
     try {
-      const res = await fetch('/api/settings');
-      if (res.ok) {
-        const data = await res.json();
+      const { ok, data } = await safeFetchJson<any>('/api/settings');
+      if (ok && data) {
         setSettings(data);
       }
     } catch (err) {
@@ -31,9 +31,8 @@ export const SettingsView: React.FC = () => {
   async function fetchSupabaseStatus() {
     setLoading(true);
     try {
-      const res = await fetch('/api/supabase/status');
-      if (res.ok) {
-        const data = await res.json();
+      const { ok, data } = await safeFetchJson<SupabaseStatus>('/api/supabase/status');
+      if (ok && data) {
         setSupabaseStatus(data);
       }
     } catch (err) {

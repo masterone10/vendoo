@@ -2,6 +2,7 @@ import React, { useState, useEffect } from 'react';
 import { Search, Filter, Eye, AlertTriangle, Layers, ChevronRight, ChevronLeft } from 'lucide-react';
 import { Order } from '../types';
 import { isLowDeliveryRate } from '../utils/delivery';
+import { safeFetchJson } from '../utils/api';
 
 interface OrdersViewProps {
   initialStatus?: string;
@@ -46,10 +47,11 @@ export const OrdersView: React.FC<OrdersViewProps> = ({
       params.set('limit', String(limit));
       params.set('offset', String(page * limit));
 
-      const res = await fetch(`/api/orders?${params.toString()}`);
-      const data = await res.json();
-      setOrders(data.orders || []);
-      setTotal(data.total || 0);
+      const { ok, data } = await safeFetchJson<{ orders: Order[]; total: number }>(`/api/orders?${params.toString()}`);
+      if (ok && data) {
+        setOrders(data.orders || []);
+        setTotal(data.total || 0);
+      }
     } catch (err) {
       console.error('Error fetching orders:', err);
     } finally {

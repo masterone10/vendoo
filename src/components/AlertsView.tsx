@@ -1,6 +1,7 @@
 import React, { useState, useEffect } from 'react';
 import { ShieldAlert, AlertTriangle, CheckCircle, Clock, Eye, MessageSquare, Check, X } from 'lucide-react';
 import { Alert } from '../types';
+import { safeFetchJson } from '../utils/api';
 
 interface AlertsViewProps {
   onSelectOrder: (orderCode: string) => void;
@@ -23,9 +24,10 @@ export const AlertsView: React.FC<AlertsViewProps> = ({ onSelectOrder }) => {
     setLoading(true);
     try {
       const url = statusFilter === 'all' ? '/api/alerts' : `/api/alerts?status=${statusFilter}`;
-      const res = await fetch(url);
-      const data = await res.json();
-      setAlerts(data.alerts || []);
+      const { ok, data } = await safeFetchJson<{ alerts: Alert[] }>(url);
+      if (ok && data) {
+        setAlerts(data.alerts || []);
+      }
     } catch (err) {
       console.error('Error fetching alerts:', err);
     } finally {

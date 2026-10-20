@@ -2,6 +2,7 @@ import React, { useState, useEffect } from 'react';
 import { AlertTriangle, PhoneCall, ShoppingBag, CheckCircle, Search, Eye } from 'lucide-react';
 import { Order } from '../types';
 import { isLowDeliveryRate } from '../utils/delivery';
+import { safeFetchJson } from '../utils/api';
 
 interface PrintedViewProps {
   initialSubTab?: 'all' | 'no_extra_phone' | 'multi_merchant' | 'low_delivery';
@@ -28,9 +29,10 @@ export const PrintedView: React.FC<PrintedViewProps> = ({
   async function fetchPrintedOrders() {
     setLoading(true);
     try {
-      const res = await fetch(`/api/printed?category=${subTab}`);
-      const data = await res.json();
-      setOrders(data.orders || []);
+      const { ok, data } = await safeFetchJson<{ orders: Order[] }>(`/api/printed?category=${subTab}`);
+      if (ok && data) {
+        setOrders(data.orders || []);
+      }
     } catch (err) {
       console.error('Error fetching printed orders:', err);
     } finally {

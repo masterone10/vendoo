@@ -1,5 +1,6 @@
 import React, { useState, useEffect } from 'react';
 import { Archive, CheckCircle2, AlertTriangle, XCircle, Clock, RefreshCw, Play, ShieldCheck, Flame, Snowflake } from 'lucide-react';
+import { safeFetchJson } from '../utils/api';
 
 export const ArchiveView: React.FC = () => {
   const [coverageRecords, setCoverageRecords] = useState<any[]>([]);
@@ -16,10 +17,9 @@ export const ArchiveView: React.FC = () => {
   async function fetchCoverage() {
     setLoading(true);
     try {
-      const res = await fetch('/api/historical/coverage');
-      if (res.ok) {
-        const json = await res.json();
-        setCoverageRecords(json.coverage || []);
+      const { ok, data } = await safeFetchJson<{ coverage: any[] }>('/api/historical/coverage');
+      if (ok && data) {
+        setCoverageRecords(data.coverage || []);
       }
     } catch (err) {
       console.error('Error fetching coverage:', err);

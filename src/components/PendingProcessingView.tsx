@@ -1,6 +1,7 @@
 import React, { useState, useEffect } from 'react';
 import { Clock, RotateCw, Search, Eye, AlertTriangle } from 'lucide-react';
 import { Order } from '../types';
+import { safeFetchJson } from '../utils/api';
 
 interface PendingProcessingViewProps {
   statusType: 'Pending' | 'Processing';
@@ -24,9 +25,10 @@ export const PendingProcessingView: React.FC<PendingProcessingViewProps> = ({
     setLoading(true);
     try {
       const endpoint = statusType === 'Pending' ? '/api/pending' : '/api/processing';
-      const res = await fetch(endpoint);
-      const data = await res.json();
-      setOrders(data.orders || []);
+      const { ok, data } = await safeFetchJson<{ orders: any[] }>(endpoint);
+      if (ok && data) {
+        setOrders(data.orders || []);
+      }
     } catch (err) {
       console.error(`Error fetching ${statusType} orders:`, err);
     } finally {
