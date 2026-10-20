@@ -136,7 +136,7 @@ class VendoorClient {
     }
   }
 
-  private async fetchWithTimeout(url: string | URL, options: RequestInit = {}, timeoutMs = 15000): Promise<Response> {
+  private async fetchWithTimeout(url: string | URL, options: RequestInit = {}, timeoutMs = 25000): Promise<Response> {
     const controller = new AbortController();
     const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
     try {
@@ -153,6 +153,66 @@ class VendoorClient {
     } finally {
       clearTimeout(timeoutId);
     }
+  }
+
+  public async fetchWithRetry(
+    url: string | URL,
+    options: RequestInit = {},
+    timeoutMs = 25000,
+    maxRetries = 3
+  ): Promise<Response> {
+    let lastError: any = null;
+    for (let attempt = 1; attempt <= maxRetries; attempt++) {
+      try {
+        const res = await this.fetchWithTimeout(url, options, timeoutMs);
+        this.updateCookies(res);
+
+        // Re-authenticate if session expired or redirect to login
+        if (
+          res.status === 400 ||
+          res.status === 401 ||
+          res.status === 419 ||
+          (res.url && res.url.includes('/login'))
+        ) {
+          if (attempt < maxRetries) {
+            this.isAuthenticated = false;
+            await this.login();
+            const headers = new Headers(options.headers || {});
+            headers.set('Cookie', this.getCookieHeader());
+            options = { ...options, headers };
+            await new Promise(r => setTimeout(r, 500 * attempt));
+            continue;
+          }
+        }
+
+        // Retry on temporary upstream gateway errors (502, 503, 504)
+        if ((res.status === 502 || res.status === 503 || res.status === 504) && attempt < maxRetries) {
+          await new Promise(r => setTimeout(r, 800 * attempt));
+          continue;
+        }
+
+        return res;
+      } catch (err: any) {
+        lastError = err;
+        const errMsg = String(err?.message || '');
+        const isNetworkOrTimeout =
+          err.name === 'AbortError' ||
+          errMsg.includes('fetch failed') ||
+          errMsg.includes('timed out') ||
+          errMsg.includes('ECONNRESET') ||
+          errMsg.includes('ETIMEDOUT') ||
+          errMsg.includes('EAI_AGAIN') ||
+          errMsg.includes('socket hang up');
+
+        if (isNetworkOrTimeout && attempt < maxRetries) {
+          const delay = 600 * Math.pow(2, attempt - 1);
+          await new Promise(r => setTimeout(r, delay));
+          continue;
+        }
+        throw err;
+      }
+    }
+    throw lastError || new Error(`Request failed after ${maxRetries} attempts: ${url}`);
   }
 
   public async ensureAuthenticated(): Promise<boolean> {
@@ -179,13 +239,13 @@ class VendoorClient {
       try {
         this.cookieMap.clear();
 
-        // Step 1: GET Login Page (12s timeout)
-        const getRes = await this.fetchWithTimeout(`${this.baseUrl}/dashboard/login`, {
+        // Step 1: GET Login Page (15s timeout with retry)
+        const getRes = await this.fetchWithRetry(`${this.baseUrl}/dashboard/login`, {
           headers: {
             'User-Agent': this.userAgent,
             'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
           },
-        }, 12000);
+        }, 15000, 2);
 
         this.updateCookies(getRes);
         const html = await getRes.text();
@@ -216,7 +276,7 @@ class VendoorClient {
           },
           body: bodyParams.toString(),
           redirect: 'manual',
-        }, 15000);
+        }, 18000);
 
         this.updateCookies(postRes);
 
@@ -287,7 +347,7 @@ class VendoorClient {
       url.searchParams.set('end_date', endDate);
     }
 
-    const res = await this.fetchWithTimeout(url.toString(), {
+    const res = await this.fetchWithRetry(url.toString(), {
       headers: {
         'User-Agent': this.userAgent,
         'X-Requested-With': 'XMLHttpRequest',
@@ -295,35 +355,18 @@ class VendoorClient {
         'Cookie': this.getCookieHeader(),
         'Referer': `${this.baseUrl}/dashboard/orders`,
       },
-    }, 15000);
-
-    this.updateCookies(res);
-
-    if (res.status === 400 || res.status === 401 || res.status === 419) {
-      // Re-login and retry once
-      this.isAuthenticated = false;
-      await this.login();
-      const retryRes = await this.fetchWithTimeout(url.toString(), {
-        headers: {
-          'User-Agent': this.userAgent,
-          'X-Requested-With': 'XMLHttpRequest',
-          'Accept': 'application/json, text/javascript, */*; q=0.01',
-          'Cookie': this.getCookieHeader(),
-          'Referer': `${this.baseUrl}/dashboard/orders`,
-        },
-      }, 15000);
-      this.updateCookies(retryRes);
-      if (!retryRes.ok) {
-        throw new Error(`Failed to fetch orders from Vendoor after re-auth: HTTP ${retryRes.status}`);
-      }
-      return await retryRes.json();
-    }
+    }, 25000, 3);
 
     if (!res.ok) {
       throw new Error(`Failed to fetch orders from Vendoor: HTTP ${res.status}`);
     }
 
-    return await res.json();
+    const text = await res.text();
+    try {
+      return JSON.parse(text);
+    } catch {
+      throw new Error(`Invalid JSON response from Vendoor orders endpoint (HTTP ${res.status}): ${text.slice(0, 120)}`);
+    }
   }
 
   public async fetchCustomerIntelligence(phone: string, currentOrderId?: number): Promise<ParsedCustomerHistory> {
@@ -423,7 +466,8 @@ class VendoorClient {
   }
 
   public async fetchConfirmationAgePage(
-    category: 'one' | 'two' | 'three' | 'over_three'
+    category: 'one' | 'two' | 'three' | 'over_three',
+    timeoutMs = 6000
   ): Promise<ConfirmationRow[]> {
     await this.ensureAuthenticated();
 
@@ -434,7 +478,7 @@ class VendoorClient {
       over_three: 'over/three/day/order/confirmation',
     };
 
-    const res = await this.fetchWithTimeout(`${this.baseUrl}/dashboard/${pathMap[category]}`, {
+    const res = await this.fetchWithRetry(`${this.baseUrl}/dashboard/${pathMap[category]}`, {
       headers: {
         'User-Agent': this.userAgent,
         'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
@@ -442,29 +486,13 @@ class VendoorClient {
         'Cookie': this.getCookieHeader(),
         'Referer': `${this.baseUrl}/dashboard`,
       },
-    }, 4000);
+    }, timeoutMs, 2);
 
-    let activeRes = res;
-    if (activeRes.status === 400 || activeRes.status === 401 || activeRes.status === 419 || activeRes.url.includes('/login')) {
-      this.isAuthenticated = false;
-      await this.login();
-      activeRes = await this.fetchWithTimeout(`${this.baseUrl}/dashboard/${pathMap[category]}`, {
-        headers: {
-          'User-Agent': this.userAgent,
-          'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-          'Accept-Language': 'ar,en;q=0.9',
-          'Cookie': this.getCookieHeader(),
-          'Referer': `${this.baseUrl}/dashboard`,
-        },
-      }, 4000);
-      this.updateCookies(activeRes);
+    if (!res.ok) {
+      throw new Error(`Failed to fetch confirmation page for ${category}: HTTP ${res.status}`);
     }
 
-    if (!activeRes.ok) {
-      throw new Error(`Failed to fetch confirmation page for ${category}: HTTP ${activeRes.status}`);
-    }
-
-    const html = await activeRes.text();
+    const html = await res.text();
     const rows: ConfirmationRow[] = [];
 
     // Parse table rows
@@ -517,31 +545,18 @@ class VendoorClient {
     if (startDate) url.searchParams.set('start_date', startDate);
     if (endDate) url.searchParams.set('end_date', endDate);
 
-    const res = await this.fetchWithTimeout(url.toString(), {
+    const res = await this.fetchWithRetry(url.toString(), {
       headers: {
         'User-Agent': this.userAgent,
         'Cookie': this.getCookieHeader(),
       },
-    }, 12000);
+    }, 25000, 3);
 
-    let activeRes = res;
-    if (activeRes.status === 400 || activeRes.status === 401 || activeRes.status === 419 || activeRes.url.includes('/login')) {
-      this.isAuthenticated = false;
-      await this.login();
-      activeRes = await this.fetchWithTimeout(url.toString(), {
-        headers: {
-          'User-Agent': this.userAgent,
-          'Cookie': this.getCookieHeader(),
-        },
-      }, 12000);
-      this.updateCookies(activeRes);
+    if (!res.ok) {
+      throw new Error(`Failed to fetch system logs page ${page}: HTTP ${res.status}`);
     }
 
-    if (!activeRes.ok) {
-      throw new Error(`Failed to fetch system logs page ${page}: HTTP ${activeRes.status}`);
-    }
-
-    const html = await activeRes.text();
+    const html = await res.text();
     const entries: LogEntry[] = [];
 
     // Parse log table rows
@@ -603,7 +618,7 @@ class VendoorClient {
     if (cleanStart) url.searchParams.set('start_date', cleanStart);
     if (cleanEnd) url.searchParams.set('end_date', cleanEnd);
 
-    let res = await this.fetchWithTimeout(
+    const res = await this.fetchWithRetry(
       url.toString(),
       {
         headers: {
@@ -612,25 +627,9 @@ class VendoorClient {
           'Referer': `${this.baseUrl}/dashboard/log/system`,
         },
       },
-      45000
+      45000,
+      3
     );
-
-    if (res.status === 400 || res.status === 401 || res.status === 419 || res.url.includes('/login')) {
-      this.isAuthenticated = false;
-      await this.login();
-      res = await this.fetchWithTimeout(
-        url.toString(),
-        {
-          headers: {
-            'User-Agent': this.userAgent,
-            'Cookie': this.getCookieHeader(),
-            'Referer': `${this.baseUrl}/dashboard/log/system`,
-          },
-        },
-        45000
-      );
-      this.updateCookies(res);
-    }
 
     if (!res.ok) {
       throw new Error(`Failed to export system logs Excel from Vendoor: HTTP ${res.status}`);

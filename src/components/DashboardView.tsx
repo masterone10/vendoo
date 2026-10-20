@@ -281,47 +281,61 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
               <Calendar className="w-4 h-4 text-emerald-400" />
               <span>فئات عمر الطلبات المؤكدة (قوائم Vendoor الأصلية)</span>
             </h3>
-            <span className="text-xs text-slate-500">محدث من صفحات التأكيد</span>
+            {confirmationAges.state === 'NOT_AVAILABLE' ? (
+              <span className="text-[11px] font-medium text-amber-400 bg-amber-500/10 border border-amber-500/20 px-2 py-0.5 rounded">
+                غير متوفر حالياً (انتهت المهلة)
+              </span>
+            ) : confirmationAges.state === 'STALE' ? (
+              <span className="text-[11px] font-medium text-slate-400 bg-slate-800 px-2 py-0.5 rounded">
+                قيمة سابقة محفوظة
+              </span>
+            ) : (
+              <span className="text-xs text-slate-500">محدث من صفحات التأكيد</span>
+            )}
           </div>
 
           <div className="grid grid-cols-2 gap-3 pt-1">
             <button
               onClick={() => onFilterConfirmationAge('1_day')}
-              className="p-3 text-right rounded-lg bg-slate-950/60 border border-slate-800/80 hover:border-slate-700 hover:bg-slate-800/40 transition-all cursor-pointer group"
+              disabled={confirmationAges.state === 'NOT_AVAILABLE'}
+              className="p-3 text-right rounded-lg bg-slate-950/60 border border-slate-800/80 hover:border-slate-700 hover:bg-slate-800/40 transition-all cursor-pointer group disabled:cursor-not-allowed"
             >
               <div className="text-xs text-slate-400">مؤكدة منذ يوم</div>
               <div className="text-xl font-bold font-mono text-emerald-400 mt-1">
-                {confirmationAges['1_day']}
+                {confirmationAges.state === 'NOT_AVAILABLE' ? '—' : confirmationAges['1_day']}
               </div>
             </button>
 
             <button
               onClick={() => onFilterConfirmationAge('2_days')}
-              className="p-3 text-right rounded-lg bg-slate-950/60 border border-slate-800/80 hover:border-slate-700 hover:bg-slate-800/40 transition-all cursor-pointer group"
+              disabled={confirmationAges.state === 'NOT_AVAILABLE'}
+              className="p-3 text-right rounded-lg bg-slate-950/60 border border-slate-800/80 hover:border-slate-700 hover:bg-slate-800/40 transition-all cursor-pointer group disabled:cursor-not-allowed"
             >
               <div className="text-xs text-slate-400">مؤكدة منذ يومين</div>
               <div className="text-xl font-bold font-mono text-emerald-400 mt-1">
-                {confirmationAges['2_days']}
+                {confirmationAges.state === 'NOT_AVAILABLE' ? '—' : confirmationAges['2_days']}
               </div>
             </button>
 
             <button
               onClick={() => onFilterConfirmationAge('3_days')}
-              className="p-3 text-right rounded-lg bg-slate-950/60 border border-slate-800/80 hover:border-slate-700 hover:bg-slate-800/40 transition-all cursor-pointer group"
+              disabled={confirmationAges.state === 'NOT_AVAILABLE'}
+              className="p-3 text-right rounded-lg bg-slate-950/60 border border-slate-800/80 hover:border-slate-700 hover:bg-slate-800/40 transition-all cursor-pointer group disabled:cursor-not-allowed"
             >
               <div className="text-xs text-slate-400">مؤكدة منذ ثلاثة أيام</div>
               <div className="text-xl font-bold font-mono text-amber-400 mt-1">
-                {confirmationAges['3_days']}
+                {confirmationAges.state === 'NOT_AVAILABLE' ? '—' : confirmationAges['3_days']}
               </div>
             </button>
 
             <button
               onClick={() => onFilterConfirmationAge('over_3_days')}
-              className="p-3 text-right rounded-lg bg-slate-950/60 border border-slate-800/80 hover:border-slate-700 hover:bg-slate-800/40 transition-all cursor-pointer group"
+              disabled={confirmationAges.state === 'NOT_AVAILABLE'}
+              className="p-3 text-right rounded-lg bg-slate-950/60 border border-slate-800/80 hover:border-slate-700 hover:bg-slate-800/40 transition-all cursor-pointer group disabled:cursor-not-allowed"
             >
               <div className="text-xs text-slate-400">مؤكدة منذ أكثر من 3 أيام</div>
               <div className="text-xl font-bold font-mono text-rose-400 mt-1">
-                {confirmationAges['over_3_days']}
+                {confirmationAges.state === 'NOT_AVAILABLE' ? '—' : confirmationAges['over_3_days']}
               </div>
             </button>
           </div>

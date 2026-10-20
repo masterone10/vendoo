@@ -17,13 +17,32 @@ import {
 } from './vendoorClient.ts';
 import { parseLogActionDetails } from './logDetailsParser.ts';
 
+export interface CategoryDetailItem {
+  status: 'SUCCESS' | 'TIMEOUT' | 'ERROR' | 'PENDING' | 'NOT_AVAILABLE';
+  durationMs: number;
+  reason?: string;
+}
+
 export interface ConfirmationAgeSyncStatus {
   state: 'SUCCESS' | 'PARTIAL' | 'STALE' | 'NOT_AVAILABLE';
+  isAvailable: boolean;
   lastObservedAt: string | null;
   lastSuccessAt: string | null;
   lastError: string | null;
   categoryStatuses: Record<'one' | 'two' | 'three' | 'over_three', 'SUCCESS' | 'TIMEOUT' | 'ERROR' | 'PENDING'>;
+  categoryDetails?: Record<'one' | 'two' | 'three' | 'over_three', CategoryDetailItem>;
   counts: Record<string, number>;
+}
+
+export interface AbsentOrdersSummary {
+  lastCheckedAt: string;
+  totalActiveInDb: number;
+  presentInScan: number;
+  absentFromScan: number;
+  resolvedViaLogs: number;
+  confirmedViaLogs: number;
+  preservedUnresolved: number;
+  unresolvedRandomNumbers: string[];
 }
 
 export interface DetailedSyncMetrics {
@@ -72,6 +91,7 @@ export interface SyncEngineStatus {
   phaseTimings: PhaseTimings | null;
   detailedMetrics: DetailedSyncMetrics | null;
   confirmationAgeStatus?: ConfirmationAgeSyncStatus;
+  absentOrdersSummary?: AbsentOrdersSummary;
 }
 
 export interface StatusReconciliationItem {
@@ -1042,35 +1062,55 @@ export class SyncEngine {
       // Paginate through all remaining pages to guarantee 100% full coverage
       const batchSize = 100;
       for (let start = 100; start < totalOrdersInSource; start += batchSize) {
-        try {
-          const nextBatch = await vendoorClient.fetchOrdersBatch(start, batchSize);
-          if (nextBatch.recordsTotal !== totalOrdersInSource) {
-            totalChangedDuringScan = true;
-          }
-          const seenInSubPage = new Set<number>();
-          for (const ord of nextBatch.data) {
-            rawRowsReceived++;
-            if (!ord || typeof ord.id !== 'number') {
-              invalidRecordsCount++;
-              continue;
+        let batchFetched = false;
+        let lastBatchErr: any = null;
+
+        for (let attempt = 1; attempt <= 3; attempt++) {
+          try {
+            if (start > 100 && attempt === 1) {
+              // Gentle pacing to prevent socket reset or rate-limiting
+              await new Promise(r => setTimeout(r, 60));
             }
-            if (seenInSubPage.has(ord.id)) {
-              duplicatesWithinPage++;
-              duplicateSourceIds++;
-            } else if (ordersMap.has(ord.id)) {
-              duplicatesAcrossPages++;
-              duplicateSourceIds++;
-            } else {
-              ordersMap.set(ord.id, ord);
+
+            const nextBatch = await vendoorClient.fetchOrdersBatch(start, batchSize);
+            if (nextBatch.recordsTotal !== totalOrdersInSource) {
+              totalChangedDuringScan = true;
             }
-            seenInSubPage.add(ord.id);
+            const seenInSubPage = new Set<number>();
+            for (const ord of nextBatch.data) {
+              rawRowsReceived++;
+              if (!ord || typeof ord.id !== 'number') {
+                invalidRecordsCount++;
+                continue;
+              }
+              if (seenInSubPage.has(ord.id)) {
+                duplicatesWithinPage++;
+                duplicateSourceIds++;
+              } else if (ordersMap.has(ord.id)) {
+                duplicatesAcrossPages++;
+                duplicateSourceIds++;
+              } else {
+                ordersMap.set(ord.id, ord);
+              }
+              seenInSubPage.add(ord.id);
+            }
+            batchFetched = true;
+            break;
+          } catch (pageErr: any) {
+            lastBatchErr = pageErr;
+            if (attempt < 3) {
+              console.warn(`[SyncEngine] Retry ${attempt}/3 fetching orders batch at start ${start}: ${pageErr.message}`);
+              await new Promise(r => setTimeout(r, 600 * attempt));
+            }
           }
-        } catch (pageErr: any) {
-          console.error(`[SyncEngine] Error fetching orders batch at start ${start}:`, pageErr.message);
+        }
+
+        if (!batchFetched) {
+          console.error(`[SyncEngine] Error fetching orders batch at start ${start}:`, lastBatchErr?.message);
           errorsCount++;
           failedPagesCount++;
           hasFailedPage = true;
-          errorMessage = `Failed to fetch page at offset ${start}: ${pageErr.message}`;
+          errorMessage = `Failed to fetch page at offset ${start}: ${lastBatchErr?.message}`;
           break;
         }
       }
@@ -1150,6 +1190,7 @@ export class SyncEngine {
         let resolvedViaLogsCount = 0;
         let confirmedCurrentStatusViaLogsCount = 0;
         let preservedUnresolvedCount = 0;
+        const unresolvedRandomNumbers: string[] = [];
 
         const findLatestStatusEventStmt = db.prepare(`
           SELECT to_status, actor_name, event_timestamp
@@ -1206,9 +1247,21 @@ export class SyncEngine {
             `).run(nowIso, nowIso, act.id);
 
             preservedUnresolvedCount++;
+            unresolvedRandomNumbers.push(act.random_number);
           }
         }
         db.exec('COMMIT;');
+
+        this.status.absentOrdersSummary = {
+          lastCheckedAt: nowIso,
+          totalActiveInDb,
+          presentInScan: totalActiveInDb - absentFromActiveViewTotal,
+          absentFromScan: absentFromActiveViewTotal,
+          resolvedViaLogs: resolvedViaLogsCount,
+          confirmedViaLogs: confirmedCurrentStatusViaLogsCount,
+          preservedUnresolved: preservedUnresolvedCount,
+          unresolvedRandomNumbers,
+        };
 
         if (absentFromActiveViewTotal > 0) {
           console.log(
@@ -1408,6 +1461,7 @@ export class SyncEngine {
 
   /**
    * Sync confirmation age pages (1 day, 2 days, 3 days, >3 days)
+   * Runs categories concurrently with per-request timeouts to prevent blocking main sync cycle.
    */
   private async syncConfirmationAges(nowIso: string) {
     const categories: Array<{ key: 'one' | 'two' | 'three' | 'over_three'; label: string }> = [
@@ -1422,6 +1476,13 @@ export class SyncEngine {
       two: 'PENDING',
       three: 'PENDING',
       over_three: 'PENDING',
+    };
+
+    const categoryDetails: Record<'one' | 'two' | 'three' | 'over_three', CategoryDetailItem> = {
+      one: { status: 'PENDING', durationMs: 0 },
+      two: { status: 'PENDING', durationMs: 0 },
+      three: { status: 'PENDING', durationMs: 0 },
+      over_three: { status: 'PENDING', durationMs: 0 },
     };
 
     const updateConfStmt = db.prepare(`
@@ -1441,23 +1502,41 @@ export class SyncEngine {
       )
     `);
 
-    // Sequential execution to keep connection pool stable and prevent connection reset on Vendoor
-    for (const cat of categories) {
+    // Concurrently fetch all 4 categories with bounded timeouts (6000ms)
+    const fetchPromises = categories.map(async (cat) => {
+      const catStart = Date.now();
       try {
-        const rows: ConfirmationRow[] = await vendoorClient.fetchConfirmationAgePage(cat.key);
-        for (const r of rows) {
-          if (!r.randomNumber) continue;
-          updateConfStmt.run(cat.label, nowIso, r.printedDate || null, r.randomNumber);
-          insertObsStmt.run(r.randomNumber, r.randomNumber, cat.label, r.invoiceNo, r.printedDate, nowIso);
+        const rows: ConfirmationRow[] = await vendoorClient.fetchConfirmationAgePage(cat.key, 6000);
+        const durationMs = Date.now() - catStart;
+        db.exec('BEGIN TRANSACTION;');
+        try {
+          for (const r of rows) {
+            if (!r.randomNumber) continue;
+            updateConfStmt.run(cat.label, nowIso, r.printedDate || null, r.randomNumber);
+            insertObsStmt.run(r.randomNumber, r.randomNumber, cat.label, r.invoiceNo, r.printedDate, nowIso);
+          }
+          db.exec('COMMIT;');
+        } catch (dbErr) {
+          db.exec('ROLLBACK;');
+          throw dbErr;
         }
         categoryStatuses[cat.key] = 'SUCCESS';
+        categoryDetails[cat.key] = { status: 'SUCCESS', durationMs };
       } catch (err: any) {
-        const isTimeout = err.name === 'AbortError' || err.message?.includes('timeout') || err.message?.includes('15000ms');
-        categoryStatuses[cat.key] = isTimeout ? 'TIMEOUT' : 'ERROR';
-        console.info(`[SyncEngine] Confirmation age endpoint ${cat.key} check: ${categoryStatuses[cat.key]} (${err.message})`);
+        const durationMs = Date.now() - catStart;
+        const isTimeout = err.name === 'AbortError' || err.message?.includes('timeout') || err.message?.includes('timed out');
+        const finalStatus = isTimeout ? 'TIMEOUT' : 'ERROR';
+        categoryStatuses[cat.key] = finalStatus;
+        categoryDetails[cat.key] = {
+          status: finalStatus,
+          durationMs,
+          reason: isTimeout ? `Timeout after ${durationMs}ms` : err.message,
+        };
+        console.info(`[SyncEngine] Confirmation age endpoint ${cat.key} check: ${finalStatus} (${categoryDetails[cat.key].reason})`);
       }
-      await new Promise(r => setTimeout(r, 300));
-    }
+    });
+
+    await Promise.allSettled(fetchPromises);
 
     // Read current database counts so existing verified observations are preserved without zeroing out
     const dbAgeRows: any[] = db.prepare(`
@@ -1492,16 +1571,23 @@ export class SyncEngine {
       overallState = 'NOT_AVAILABLE';
     }
 
+    const isAvailable = overallState !== 'NOT_AVAILABLE';
+
     this.status.confirmationAgeStatus = {
       state: overallState,
+      isAvailable,
       lastObservedAt: nowIso,
       lastSuccessAt: successCount > 0 ? nowIso : (this.status.confirmationAgeStatus?.lastSuccessAt || null),
       lastError: successCount < 4 ? `Non-successful categories: ${Object.entries(categoryStatuses).filter(([_, s]) => s !== 'SUCCESS').map(([k, s]) => `${k}=${s}`).join(', ')}` : null,
       categoryStatuses,
+      categoryDetails,
       counts,
     };
 
-    console.log(`[SyncEngine] Confirmation Age observation summary (${overallState}): 1_day=${counts['1_day']}, 2_days=${counts['2_days']}, 3_days=${counts['3_days']}, over_3_days=${counts['over_3_days']}`);
+    console.log(
+      `[SyncEngine] Confirmation Age observation summary (${overallState}, isAvailable=${isAvailable}): ` +
+      `1_day=${counts['1_day']}, 2_days=${counts['2_days']}, 3_days=${counts['3_days']}, over_3_days=${counts['over_3_days']}`
+    );
   }
 
   /**

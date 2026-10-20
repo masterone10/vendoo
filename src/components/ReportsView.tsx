@@ -102,6 +102,9 @@ export const ReportsView: React.FC<ReportsViewProps> = ({ onSelectOrder }) => {
   async function fetchDayStatus(date: string) {
     try {
       const res = await fetch(`/api/reports/day-status?date=${date}`);
+      if (!res.ok) return;
+      const ct = res.headers.get('content-type') || '';
+      if (!ct.includes('application/json')) return;
       const data = await res.json();
       if (data.success && data.dayStatus) {
         setDayStatus(data.dayStatus);
@@ -124,8 +127,20 @@ export const ReportsView: React.FC<ReportsViewProps> = ({ onSelectOrder }) => {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ date: effectiveStart, action }),
       });
-      const data = await res.json();
-      if (data.success && data.dayStatus) {
+      const ct = res.headers.get('content-type') || '';
+      if (!ct.includes('application/json')) {
+        const text = await res.text();
+        console.warn(`Non-JSON response for day action (${res.status}):`, text.slice(0, 100));
+        return;
+      }
+      let data: any = null;
+      try {
+        data = await res.json();
+      } catch (parseErr) {
+        console.warn('Failed to parse JSON for day action:', parseErr);
+        return;
+      }
+      if (data && data.success && data.dayStatus) {
         setDayStatus(data.dayStatus);
       }
       await fetchReport(effectiveStart, effectiveEnd, action === 'force_refetch');
@@ -154,7 +169,22 @@ export const ReportsView: React.FC<ReportsViewProps> = ({ onSelectOrder }) => {
         res = await fetch(url);
       }
 
-      const json = await res.json();
+      const ct = res.headers.get('content-type') || '';
+      if (!ct.includes('application/json')) {
+        const text = await res.text();
+        console.warn(`Non-JSON response fetching report (${res.status}):`, text.slice(0, 100));
+        setLoading(false);
+        return;
+      }
+
+      let json: any = null;
+      try {
+        json = await res.json();
+      } catch (parseErr) {
+        console.warn('Failed to parse JSON for report:', parseErr);
+        setLoading(false);
+        return;
+      }
       if (json.success && json.report) {
         setReport(json.report);
         setJobStatus(json.jobStatus || null);
@@ -189,6 +219,8 @@ export const ReportsView: React.FC<ReportsViewProps> = ({ onSelectOrder }) => {
     pollIntervalRef.current = setInterval(async () => {
       try {
         const res = await fetch(`/api/reports/logs-status?startDate=${s}&endDate=${e}`);
+        const ct = res.headers.get('content-type') || '';
+        if (!ct.includes('application/json')) return;
         const data = await res.json();
         if (data.success && data.job) {
           setJobStatus(data.job);
@@ -196,9 +228,12 @@ export const ReportsView: React.FC<ReportsViewProps> = ({ onSelectOrder }) => {
             clearInterval(pollIntervalRef.current);
             // Refresh final report data
             const repRes = await fetch(`/api/reports/logs-intelligence?startDate=${s}&endDate=${e}&autoFetch=false`);
-            const repData = await repRes.json();
-            if (repData.success && repData.report) {
-              setReport(repData.report);
+            const repCt = repRes.headers.get('content-type') || '';
+            if (repCt.includes('application/json')) {
+              const repData = await repRes.json();
+              if (repData.success && repData.report) {
+                setReport(repData.report);
+              }
             }
             setLoading(false);
           }

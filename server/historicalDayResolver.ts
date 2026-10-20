@@ -1,6 +1,7 @@
 import { db, getCairoDateInterval, saveCoverageRecord, type HistoricalCoverageRecord } from './db.ts';
 import { vendoorClient } from './vendoorClient.ts';
 import { persistLogEntries } from './historicalLogsService.ts';
+import { importBatchLogFiles } from './batchLogsImporter.ts';
 import {
   isSupabaseConfigured,
   syncDayLogsToSupabase,
@@ -323,24 +324,83 @@ export async function resolveHistoricalDay(
         dataSource: 'VENDOOR_FETCH',
         strictInterval: true,
       });
-      recordsSavedThisPass += p1Res.saved;
-
-      // 2. Fetch remaining pages
-      for (let p = 2; p <= pagesDiscovered; p++) {
+      // 2. Fast-path: If day has multiple pages, attempt bulk Excel export to ingest full day in 1 call
+      if (pagesDiscovered > 3) {
         try {
-          options.onProgress?.('FETCHING_VENDOOR', `جاري جلب صفحة ${p} من ${pagesDiscovered}...`, p, pagesDiscovered, recordsSavedThisPass);
-          const nextP = await vendoorClient.fetchSystemLogs(p, cleanDate, cleanDate);
-          pagesRead = p;
+          options.onProgress?.('FETCHING_VENDOOR', `جاري محاولة التنزيل المباشر ليوم ${cleanDate}...`, 1, pagesDiscovered, recordsSavedThisPass);
+          const excelBuf = await vendoorClient.exportSystemLogsExcel(cleanDate, cleanDate);
+          if (excelBuf && excelBuf.length > 500) {
+            const batchRes = await importBatchLogFiles([
+              { fileName: `vendoor_logs_${cleanDate}.xlsx`, buffer: excelBuf }
+            ]);
+            if (batchRes && batchRes.discoveredDates.some(d => d.date === cleanDate && d.savedCount > 0)) {
+              const totalRaw = (db.prepare(`
+                SELECT COUNT(*) as c FROM raw_activity_events
+                WHERE event_timestamp >= ? AND event_timestamp < ?
+              `).get(interval.startCairo, interval.endCairo) as any)?.c || batchRes.totalSaved;
+              const totalEvents = (db.prepare(`
+                SELECT COUNT(*) as c FROM canonical_activity_events
+                WHERE event_timestamp >= ? AND event_timestamp < ?
+              `).get(interval.startCairo, interval.endCairo) as any)?.c || 0;
+              return {
+                date: cleanDate,
+                decision: 'FETCH_FROM_VENDOOR',
+                dataSource: 'VENDOOR_FETCH',
+                completionStatus: 'COMPLETE',
+                localStorageStatus: 'LOCAL_SAVED',
+                remoteArchiveStatus: isSupabaseConfigured() ? 'REMOTE_SYNCED' : 'NONE',
+                rawRecordsCount: totalRaw,
+                canonicalEventsCount: totalEvents,
+                loadedFromCache: false,
+                messageAr: `تم جلب وتحديث اليوم بالكامل (${totalRaw} حركة مسجلة)`,
+              };
+            }
+          }
+        } catch (excelErr: any) {
+          console.warn(`[HistoricalResolver] Bulk export skipped for ${cleanDate}, falling back to pagination:`, excelErr.message);
+        }
+      }
 
-          options.onProgress?.('SAVING_RECORDS', `جاري حفظ السجلات (صفحة ${p}/${pagesDiscovered})...`, p, pagesDiscovered, recordsSavedThisPass);
-          const nextRes = persistLogEntries(nextP.entries, interval, {
-            dataSource: 'VENDOOR_FETCH',
-            strictInterval: true,
-          });
-          recordsSavedThisPass += nextRes.saved;
-        } catch (pageErr: any) {
+      // 3. Fetch remaining pages with retry and pacing
+      for (let p = 2; p <= pagesDiscovered; p++) {
+        let pageFetched = false;
+        let lastPageErr: any = null;
+
+        for (let attempt = 1; attempt <= 3; attempt++) {
+          try {
+            if (p > 2 && attempt === 1) {
+              await new Promise(r => setTimeout(r, 50));
+            }
+            options.onProgress?.(
+              'FETCHING_VENDOOR',
+              `جاري جلب صفحة ${p} من ${pagesDiscovered}${attempt > 1 ? ` (محاولة ${attempt}/3)` : ''}...`,
+              p,
+              pagesDiscovered,
+              recordsSavedThisPass
+            );
+            const nextP = await vendoorClient.fetchSystemLogs(p, cleanDate, cleanDate);
+            pagesRead = p;
+
+            options.onProgress?.('SAVING_RECORDS', `جاري حفظ السجلات (صفحة ${p}/${pagesDiscovered})...`, p, pagesDiscovered, recordsSavedThisPass);
+            const nextRes = persistLogEntries(nextP.entries, interval, {
+              dataSource: 'VENDOOR_FETCH',
+              strictInterval: true,
+            });
+            recordsSavedThisPass += nextRes.saved;
+            pageFetched = true;
+            break;
+          } catch (pageErr: any) {
+            lastPageErr = pageErr;
+            if (attempt < 3) {
+              console.warn(`[HistoricalDayResolver] Retrying page ${p} (${attempt}/3) for ${cleanDate}: ${pageErr.message}`);
+              await new Promise(r => setTimeout(r, 600 * attempt));
+            }
+          }
+        }
+
+        if (!pageFetched) {
           isPartial = true;
-          fetchError = `تعذر قراءة الصفحة ${p}: ${pageErr.message}`;
+          fetchError = `تعذر قراءة الصفحة ${p}: ${lastPageErr?.message}`;
           break;
         }
       }

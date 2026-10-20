@@ -3,6 +3,7 @@ import { db, getCairoDateInterval, getCairoDateString, isDateInHot } from './db.
 import { vendoorClient } from './vendoorClient.ts';
 import { parseLogActionDetails } from './logDetailsParser.ts';
 import { persistLogEntries } from './historicalLogsService.ts';
+import { importBatchLogFiles } from './batchLogsImporter.ts';
 
 export type FetchStage =
   | 'IDLE'
@@ -197,50 +198,102 @@ export async function ensureCoverageForRange(
         throw new Error('بيانات دخول Vendoor غير مهيأة في بيئة التشغيل');
       }
 
-      // Fetch page 1
-      const p1 = await vendoorClient.fetchSystemLogs(1, date, date);
-      dayPagesTotal = Math.max(1, p1.totalPages);
-      dayPagesFetched = 1;
-      totalPagesDiscovered += dayPagesTotal;
-      totalPagesRead += 1;
-      job.pagesTotal = Math.max(job.pagesTotal, totalPagesDiscovered);
-      job.pagesFetched = totalPagesRead;
+      let bulkLoaded = false;
+      try {
+        job.stage = 'FETCHING_VENDOOR';
+        job.stageLabelAr = `جاري استخراج لوجز ${date} عبر تصدير Vendoor السريع`;
+        onProgress?.(job);
 
-      job.stage = 'SAVING_RECORDS';
-      job.stageLabelAr = `جاري حفظ السجلات (${dayPagesFetched}/${dayPagesTotal})`;
-      onProgress?.(job);
+        const excelBuf = await vendoorClient.exportSystemLogsExcel(date, date);
+        if (excelBuf && excelBuf.length > 500) {
+          const importRes = await importBatchLogFiles([
+            { fileName: `vendoor_logs_${date}.xlsx`, buffer: excelBuf },
+          ]);
+          if (importRes.success && importRes.totalSaved >= 0) {
+            dayEventsSaved = importRes.totalSaved;
+            totalSaved += importRes.totalSaved;
+            job.eventsSaved = totalSaved;
+            dayPagesTotal = 1;
+            dayPagesFetched = 1;
+            totalPagesDiscovered += 1;
+            totalPagesRead += 1;
+            job.pagesTotal = Math.max(job.pagesTotal, totalPagesDiscovered);
+            job.pagesFetched = totalPagesRead;
+            bulkLoaded = true;
+            dayStatus = 'COMPLETE';
+          }
+        }
+      } catch {
+        // Fall back gracefully to paginated fetch
+        bulkLoaded = false;
+      }
 
-      const p1Res = persistLogEntries(p1.entries, interval);
-      dayEventsSaved += p1Res.saved;
-      totalSaved += p1Res.saved;
-      job.eventsSaved = totalSaved;
+      if (!bulkLoaded) {
+        // Fetch page 1
+        const p1 = await vendoorClient.fetchSystemLogs(1, date, date);
+        dayPagesTotal = Math.max(1, p1.totalPages);
+        dayPagesFetched = 1;
+        totalPagesDiscovered += dayPagesTotal;
+        totalPagesRead += 1;
+        job.pagesTotal = Math.max(job.pagesTotal, totalPagesDiscovered);
+        job.pagesFetched = totalPagesRead;
 
-      // Fetch remaining pages
-      for (let p = 2; p <= dayPagesTotal; p++) {
-        try {
-          job.stage = 'FETCHING_VENDOOR';
-          job.stageLabelAr = `جاري جلب صفحة ${p} من ${dayPagesTotal} لليوم (${date})`;
-          onProgress?.(job);
+        job.stage = 'SAVING_RECORDS';
+        job.stageLabelAr = `جاري حفظ السجلات (${dayPagesFetched}/${dayPagesTotal})`;
+        onProgress?.(job);
 
-          const nextP = await vendoorClient.fetchSystemLogs(p, date, date);
-          dayPagesFetched = p;
-          totalPagesRead += 1;
-          job.pagesFetched = totalPagesRead;
+        const p1Res = persistLogEntries(p1.entries, interval);
+        dayEventsSaved += p1Res.saved;
+        totalSaved += p1Res.saved;
+        job.eventsSaved = totalSaved;
 
-          job.stage = 'SAVING_RECORDS';
-          job.stageLabelAr = `جاري حفظ السجلات (صفحة ${p}/${dayPagesTotal})`;
-          onProgress?.(job);
+        // Fetch remaining pages with retry and pacing
+        for (let p = 2; p <= dayPagesTotal; p++) {
+          let pageFetched = false;
+          let lastPageErr: any = null;
 
-          const nextRes = persistLogEntries(nextP.entries, interval);
-          dayEventsSaved += nextRes.saved;
-          totalSaved += nextRes.saved;
-          job.eventsSaved = totalSaved;
-        } catch (pageErr: any) {
-          console.warn(`[LogsIntelligence] Page ${p} failed for ${date}:`, pageErr.message);
-          hasFailedPage = true;
-          dayStatus = 'PARTIAL';
-          dayError = `فشل في الصفحة ${p}: ${pageErr.message}`;
-          break;
+          for (let attempt = 1; attempt <= 3; attempt++) {
+            try {
+              if (p > 2 && attempt === 1) {
+                await new Promise(r => setTimeout(r, 50));
+              }
+
+              job.stage = 'FETCHING_VENDOOR';
+              job.stageLabelAr = `جاري جلب صفحة ${p} من ${dayPagesTotal} لليوم (${date})${attempt > 1 ? ` (محاولة ${attempt}/3)` : ''}`;
+              onProgress?.(job);
+
+              const nextP = await vendoorClient.fetchSystemLogs(p, date, date);
+              dayPagesFetched = p;
+              totalPagesRead += 1;
+              job.pagesFetched = totalPagesRead;
+
+              job.stage = 'SAVING_RECORDS';
+              job.stageLabelAr = `جاري حفظ السجلات (صفحة ${p}/${dayPagesTotal})`;
+              onProgress?.(job);
+
+              const nextRes = persistLogEntries(nextP.entries, interval);
+              dayEventsSaved += nextRes.saved;
+              totalSaved += nextRes.saved;
+              job.eventsSaved = totalSaved;
+
+              pageFetched = true;
+              break;
+            } catch (pageErr: any) {
+              lastPageErr = pageErr;
+              if (attempt < 3) {
+                console.warn(`[LogsIntelligence] Retrying page ${p} (${attempt}/3) for ${date}: ${pageErr.message}`);
+                await new Promise(r => setTimeout(r, 600 * attempt));
+              }
+            }
+          }
+
+          if (!pageFetched) {
+            console.warn(`[LogsIntelligence] Page ${p} failed for ${date}:`, lastPageErr?.message);
+            hasFailedPage = true;
+            dayStatus = 'PARTIAL';
+            dayError = `فشل في الصفحة ${p}: ${lastPageErr?.message}`;
+            break;
+          }
         }
       }
 

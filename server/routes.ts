@@ -135,6 +135,8 @@ apiRouter.get('/dashboard/stats', (req: Request, res: Response) => {
     }
 
     // 3. Confirmation Age counts
+    const confStatus = syncEngine.getStatus().confirmationAgeStatus;
+    const isAvailable = confStatus?.isAvailable ?? false;
     const confRows: any[] = db.prepare(`
       SELECT confirmation_age_category, COUNT(*) as count
       FROM orders
@@ -142,11 +144,15 @@ apiRouter.get('/dashboard/stats', (req: Request, res: Response) => {
       GROUP BY confirmation_age_category
     `).all();
 
-    const confirmationAges: Record<string, number> = {
+    const confirmationAges: Record<string, any> = {
       '1_day': 0,
       '2_days': 0,
       '3_days': 0,
       'over_3_days': 0,
+      isAvailable,
+      state: confStatus?.state || 'NOT_AVAILABLE',
+      lastObservedAt: confStatus?.lastObservedAt || null,
+      lastSuccessAt: confStatus?.lastSuccessAt || null,
     };
     for (const cr of confRows) {
       if (cr.confirmation_age_category in confirmationAges) {
@@ -2033,6 +2039,41 @@ apiRouter.get('/sync/reconcile', async (_req: Request, res: Response) => {
   try {
     const report = await syncEngine.reconcileLiveWithVendoor();
     res.json(report);
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// 15b. Active Orders Verification & Absent Orders Review (Privacy-Preserving Audit)
+apiRouter.get('/sync/absent-orders', (_req: Request, res: Response) => {
+  try {
+    const status = syncEngine.getStatus();
+    const summary = status.absentOrdersSummary || {
+      lastCheckedAt: null,
+      totalActiveInDb: 0,
+      presentInScan: 0,
+      absentFromScan: 0,
+      resolvedViaLogs: 0,
+      confirmedViaLogs: 0,
+      preservedUnresolved: 0,
+      unresolvedRandomNumbers: [],
+    };
+
+    // Query absent and audit-resolved orders without customer PII (privacy-safe audit)
+    const absentOrdersList = db.prepare(`
+      SELECT 
+        id, vendoor_id, random_number, order_no, current_status,
+        validation_status, created_at_source, last_observed_at
+      FROM orders
+      WHERE validation_status IN ('UNRESOLVED_ABSENT_FROM_VIEW', 'RESOLVED_VIA_AUDIT_LOGS', 'CONFIRMED_VIA_AUDIT_LOGS')
+      ORDER BY last_observed_at DESC
+      LIMIT 100
+    `).all();
+
+    res.json({
+      summary,
+      orders: absentOrdersList,
+    });
   } catch (err: any) {
     res.status(500).json({ error: err.message });
   }

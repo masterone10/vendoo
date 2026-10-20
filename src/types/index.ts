@@ -104,6 +104,10 @@ export interface DashboardStats {
     '2_days': number;
     '3_days': number;
     'over_3_days': number;
+    isAvailable?: boolean;
+    state?: 'SUCCESS' | 'PARTIAL' | 'STALE' | 'NOT_AVAILABLE';
+    lastObservedAt?: string | null;
+    lastSuccessAt?: string | null;
   };
   riskIndicators: {
     multiMerchantPrinted: number;

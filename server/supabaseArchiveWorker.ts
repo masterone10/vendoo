@@ -4,10 +4,12 @@ import { db } from './db.ts';
 export interface ArchiveWorkerStatus {
   isEnabled: boolean;
   isArchiving: boolean;
+  isArchiveComplete: boolean;
   lastRunAt: string | null;
   lastSuccessAt: string | null;
   lastError: string | null;
-  status: 'IDLE' | 'SUCCESS' | 'PARTIAL' | 'FAILED';
+  status: 'IDLE' | 'DRAINING' | 'FULLY_ARCHIVED' | 'PARTIAL' | 'FAILED' | 'AWAITING_CONFIG';
+  batchStatus: 'SUCCESS' | 'PARTIAL' | 'FAILED' | 'IDLE';
   batchSize: number;
   ordersWaiting: number;
   ordersArchivedThisPass: number;
@@ -28,10 +30,12 @@ export interface ArchiveWorkerStatus {
 const status: ArchiveWorkerStatus = {
   isEnabled: false,
   isArchiving: false,
+  isArchiveComplete: false,
   lastRunAt: null,
   lastSuccessAt: null,
   lastError: null,
   status: 'IDLE',
+  batchStatus: 'IDLE',
   batchSize: 200,
   ordersWaiting: 0,
   ordersArchivedThisPass: 0,
@@ -49,11 +53,25 @@ const status: ArchiveWorkerStatus = {
   lastDurationMs: null,
 };
 
-let timer: NodeJS.Timeout | null = null;
+let drainTimer: NodeJS.Timeout | null = null;
+let periodicTimer: NodeJS.Timeout | null = null;
+let scheduledIntervalMs = 300000;
 const BATCH_SIZE = 200;
+const CHUNK_SIZE = 50;
 
 export function getArchiveWorkerStatus(): ArchiveWorkerStatus {
   return { ...status };
+}
+
+function clearScheduledTimers() {
+  if (drainTimer) {
+    clearTimeout(drainTimer);
+    drainTimer = null;
+  }
+  if (periodicTimer) {
+    clearTimeout(periodicTimer);
+    periodicTimer = null;
+  }
 }
 
 function getCheckpoint(entityType: string): { lastArchivedId: number; lastArchivedAt: string | null } {
@@ -98,10 +116,13 @@ export async function triggerArchivePass(): Promise<{
   ordersRemaining: number;
   eventsRemaining: number;
   rawLogsRemaining: number;
+  isArchiveComplete: boolean;
   error?: string;
 }> {
   if (!isSupabaseConfigured()) {
-    status.status = 'FAILED';
+    status.status = 'AWAITING_CONFIG';
+    status.batchStatus = 'IDLE';
+    status.isArchiveComplete = false;
     status.lastError = 'DATABASE_URL is not configured';
     return {
       success: false,
@@ -111,7 +132,8 @@ export async function triggerArchivePass(): Promise<{
       ordersRemaining: 0,
       eventsRemaining: 0,
       rawLogsRemaining: 0,
-      error: 'Supabase DATABASE_URL is not configured',
+      isArchiveComplete: false,
+      error: 'Supabase DATABASE_URL is not configured (running in local SQLite mode)',
     };
   }
 
@@ -124,6 +146,7 @@ export async function triggerArchivePass(): Promise<{
       ordersRemaining: status.ordersRemaining,
       eventsRemaining: status.eventsRemaining,
       rawLogsRemaining: status.rawLogsRemaining,
+      isArchiveComplete: status.isArchiveComplete,
       error: 'Archive pass already in progress',
     };
   }
@@ -139,7 +162,7 @@ export async function triggerArchivePass(): Promise<{
 
   try {
     // -------------------------------------------------------------------------
-    // 1. ORDERS: Cursor-paginated batch of up to BATCH_SIZE
+    // 1. ORDERS: Cursor-paginated batch of up to BATCH_SIZE with multi-row chunking
     // -------------------------------------------------------------------------
     const ordersCheckpoint = getCheckpoint('orders');
     const totalOrdersWaiting = (db.prepare('SELECT count(*) as c FROM orders WHERE id > ?').get(ordersCheckpoint.lastArchivedId) as any)?.c || 0;
@@ -158,56 +181,69 @@ export async function triggerArchivePass(): Promise<{
       LIMIT ?
     `).all(ordersCheckpoint.lastArchivedId, BATCH_SIZE);
 
-    let maxOrderId = ordersCheckpoint.lastArchivedId;
-    let maxOrderTime = ordersCheckpoint.lastArchivedAt;
+    let currentOrderCheckpointId = ordersCheckpoint.lastArchivedId;
+    let currentOrderCheckpointTime = ordersCheckpoint.lastArchivedAt;
 
-    for (const ord of ordersBatch) {
-      try {
-        await pgQuery(`
-          INSERT INTO orders (
-            vendoor_id, random_number, order_no, order_type, current_status,
-            distinct_merchant_count, multi_merchant_flag, delivery_rate,
-            customer_phone, customer_phone_extra, extra_phone_valid,
-            customer_name, governorate, address, total_price, shipping_cost,
-            total_order, created_at_source, state_entry_at, last_observed_at
-          ) VALUES (
-            $1, $2, $3, $4, $5,
-            $6, $7, $8,
-            $9, $10, $11,
-            $12, $13, $14, $15, $16,
-            $17, $18, $19, $20
-          )
-          ON CONFLICT (vendoor_id) DO UPDATE SET
-            current_status = EXCLUDED.current_status,
-            delivery_rate = EXCLUDED.delivery_rate,
-            last_observed_at = EXCLUDED.last_observed_at,
-            customer_phone_extra = COALESCE(EXCLUDED.customer_phone_extra, orders.customer_phone_extra),
-            extra_phone_valid = GREATEST(EXCLUDED.extra_phone_valid, orders.extra_phone_valid)
-        `, [
+    for (let i = 0; i < ordersBatch.length; i += CHUNK_SIZE) {
+      const chunk = ordersBatch.slice(i, i + CHUNK_SIZE);
+      const valuesSql: string[] = [];
+      const params: any[] = [];
+      let pIdx = 1;
+
+      for (const ord of chunk) {
+        valuesSql.push(`(
+          $${pIdx++}, $${pIdx++}, $${pIdx++}, $${pIdx++}, $${pIdx++},
+          $${pIdx++}, $${pIdx++}, $${pIdx++},
+          $${pIdx++}, $${pIdx++}, $${pIdx++},
+          $${pIdx++}, $${pIdx++}, $${pIdx++}, $${pIdx++}, $${pIdx++},
+          $${pIdx++}, $${pIdx++}, $${pIdx++}, $${pIdx++}
+        )`);
+        params.push(
           ord.vendoor_id, ord.random_number, ord.order_no, ord.order_type || 'اوردر جديد', ord.current_status,
           ord.distinct_merchant_count || 1, ord.multi_merchant_flag || 0, ord.delivery_rate,
           ord.customer_phone, ord.customer_phone_extra, ord.extra_phone_valid || 0,
           ord.customer_name, ord.governorate, ord.address, ord.total_price || 0, ord.shipping_cost || 0,
           ord.total_order || 0, ord.created_at_source, ord.state_entry_at, ord.last_observed_at
-        ]);
-        ordersArchived++;
-        if (ord.id > maxOrderId) maxOrderId = ord.id;
-        if (!maxOrderTime || ord.last_observed_at > maxOrderTime) maxOrderTime = ord.last_observed_at;
-      } catch (err: any) {
-        failedCount++;
+        );
+      }
+
+      const queryText = `
+        INSERT INTO orders (
+          vendoor_id, random_number, order_no, order_type, current_status,
+          distinct_merchant_count, multi_merchant_flag, delivery_rate,
+          customer_phone, customer_phone_extra, extra_phone_valid,
+          customer_name, governorate, address, total_price, shipping_cost,
+          total_order, created_at_source, state_entry_at, last_observed_at
+        ) VALUES ${valuesSql.join(', ')}
+        ON CONFLICT (vendoor_id) DO UPDATE SET
+          current_status = EXCLUDED.current_status,
+          delivery_rate = EXCLUDED.delivery_rate,
+          last_observed_at = EXCLUDED.last_observed_at,
+          customer_phone_extra = COALESCE(EXCLUDED.customer_phone_extra, orders.customer_phone_extra),
+          extra_phone_valid = GREATEST(EXCLUDED.extra_phone_valid, orders.extra_phone_valid)
+      `;
+
+      try {
+        await pgQuery(queryText, params);
+        ordersArchived += chunk.length;
+        const lastChunkItem = chunk[chunk.length - 1];
+        currentOrderCheckpointId = lastChunkItem.id;
+        currentOrderCheckpointTime = lastChunkItem.last_observed_at || currentOrderCheckpointTime;
+        updateCheckpoint('orders', currentOrderCheckpointId, currentOrderCheckpointTime, chunk.length);
+      } catch (chunkErr: any) {
+        failedCount += chunk.length;
+        console.warn(`[SupabaseArchive] Orders chunk (${chunk.length} rows) insert error:`, chunkErr.message);
+        break; // Stop advancing checkpoint past failed chunk
       }
     }
 
-    if (ordersBatch.length > 0) {
-      const highestExaminedOrderId = ordersBatch[ordersBatch.length - 1].id;
-      updateCheckpoint('orders', highestExaminedOrderId, maxOrderTime, ordersArchived);
-    }
-    const ordersRemaining = Math.max(0, totalOrdersWaiting - ordersBatch.length);
+    // Direct mathematical count from SQLite after cursor advance to prevent stale math drift
+    const ordersRemaining = (db.prepare('SELECT count(*) as c FROM orders WHERE id > ?').get(currentOrderCheckpointId) as any)?.c || 0;
     status.ordersArchivedThisPass = ordersArchived;
     status.ordersRemaining = ordersRemaining;
 
     // -------------------------------------------------------------------------
-    // 2. CANONICAL ACTIVITY EVENTS: Cursor-paginated batch of up to BATCH_SIZE
+    // 2. CANONICAL ACTIVITY EVENTS: Multi-row idempotent chunked insertion
     // -------------------------------------------------------------------------
     const canonCheckpoint = getCheckpoint('canonical_activity_events');
     const totalCanonWaiting = (db.prepare('SELECT count(*) as c FROM canonical_activity_events WHERE id > ?').get(canonCheckpoint.lastArchivedId) as any)?.c || 0;
@@ -221,43 +257,58 @@ export async function triggerArchivePass(): Promise<{
       LIMIT ?
     `).all(canonCheckpoint.lastArchivedId, BATCH_SIZE);
 
-    let maxCanonId = canonCheckpoint.lastArchivedId;
-    let maxCanonTime = canonCheckpoint.lastArchivedAt;
+    let currentCanonCheckpointId = canonCheckpoint.lastArchivedId;
+    let currentCanonCheckpointTime = canonCheckpoint.lastArchivedAt;
 
-    for (const ev of canonBatch) {
-      try {
-        // Idempotent insertion: only insert if identical event does not already exist
-        await pgQuery(`
-          INSERT INTO canonical_activity_events (
-            order_code, actor_name, action_type, from_status, to_status, event_timestamp, is_system_actor
-          )
-          SELECT $1, $2, $3, $4, $5, $6, $7
-          WHERE NOT EXISTS (
-            SELECT 1 FROM canonical_activity_events
-            WHERE (order_code IS NOT DISTINCT FROM $1) AND event_timestamp = $6 AND action_type = $3 AND actor_name = $2
-          )
-        `, [
+    for (let i = 0; i < canonBatch.length; i += CHUNK_SIZE) {
+      const chunk = canonBatch.slice(i, i + CHUNK_SIZE);
+      const valuesSql: string[] = [];
+      const params: any[] = [];
+      let pIdx = 1;
+
+      for (const ev of chunk) {
+        valuesSql.push(`($${pIdx++}, $${pIdx++}, $${pIdx++}, $${pIdx++}, $${pIdx++}, $${pIdx++}::timestamptz, $${pIdx++}::boolean)`);
+        params.push(
           ev.order_code, ev.actor_name, ev.action_type || 'action', ev.from_status, ev.to_status,
           ev.event_timestamp, Boolean(ev.is_system_actor)
-        ]);
-        eventsArchived++;
-        if (ev.id > maxCanonId) maxCanonId = ev.id;
-        if (!maxCanonTime || ev.event_timestamp > maxCanonTime) maxCanonTime = ev.event_timestamp;
-      } catch (err: any) {
-        failedCount++;
+        );
+      }
+
+      const queryText = `
+        INSERT INTO canonical_activity_events (
+          order_code, actor_name, action_type, from_status, to_status, event_timestamp, is_system_actor
+        )
+        SELECT v.order_code, v.actor_name, v.action_type, v.from_status, v.to_status, v.event_timestamp, v.is_system_actor
+        FROM (VALUES ${valuesSql.join(', ')}) AS v(order_code, actor_name, action_type, from_status, to_status, event_timestamp, is_system_actor)
+        WHERE NOT EXISTS (
+          SELECT 1 FROM canonical_activity_events c
+          WHERE (c.order_code IS NOT DISTINCT FROM v.order_code)
+            AND c.event_timestamp = v.event_timestamp
+            AND c.action_type = v.action_type
+            AND c.actor_name = v.actor_name
+        )
+      `;
+
+      try {
+        await pgQuery(queryText, params);
+        eventsArchived += chunk.length;
+        const lastChunkItem = chunk[chunk.length - 1];
+        currentCanonCheckpointId = lastChunkItem.id;
+        currentCanonCheckpointTime = lastChunkItem.event_timestamp || currentCanonCheckpointTime;
+        updateCheckpoint('canonical_activity_events', currentCanonCheckpointId, currentCanonCheckpointTime, chunk.length);
+      } catch (chunkErr: any) {
+        failedCount += chunk.length;
+        console.warn(`[SupabaseArchive] Canonical events chunk (${chunk.length} rows) error:`, chunkErr.message);
+        break; // Stop advancing checkpoint past failed chunk
       }
     }
 
-    if (canonBatch.length > 0) {
-      const highestExaminedCanonId = canonBatch[canonBatch.length - 1].id;
-      updateCheckpoint('canonical_activity_events', highestExaminedCanonId, maxCanonTime, eventsArchived);
-    }
-    const eventsRemaining = Math.max(0, totalCanonWaiting - canonBatch.length);
+    const eventsRemaining = (db.prepare('SELECT count(*) as c FROM canonical_activity_events WHERE id > ?').get(currentCanonCheckpointId) as any)?.c || 0;
     status.eventsArchivedThisPass = eventsArchived;
     status.eventsRemaining = eventsRemaining;
 
     // -------------------------------------------------------------------------
-    // 3. RAW ACTIVITY EVENTS: Cursor-paginated batch of up to BATCH_SIZE
+    // 3. RAW ACTIVITY EVENTS: Multi-row chunked insertion with ON CONFLICT DO NOTHING
     // -------------------------------------------------------------------------
     const rawCheckpoint = getCheckpoint('raw_activity_events');
     const totalRawWaiting = (db.prepare('SELECT count(*) as c FROM raw_activity_events WHERE id > ?').get(rawCheckpoint.lastArchivedId) as any)?.c || 0;
@@ -271,88 +322,146 @@ export async function triggerArchivePass(): Promise<{
       LIMIT ?
     `).all(rawCheckpoint.lastArchivedId, BATCH_SIZE);
 
-    let maxRawId = rawCheckpoint.lastArchivedId;
-    let maxRawTime = rawCheckpoint.lastArchivedAt;
+    let currentRawCheckpointId = rawCheckpoint.lastArchivedId;
+    let currentRawCheckpointTime = rawCheckpoint.lastArchivedAt;
 
-    for (const rawEv of rawBatch) {
-      try {
-        await pgQuery(`
-          INSERT INTO raw_activity_events (
-            source_hash, order_code, actor_name, raw_action_text, event_timestamp, page_source, is_duplicate
-          ) VALUES ($1, $2, $3, $4, $5, $6, $7)
-          ON CONFLICT (source_hash) DO NOTHING
-        `, [
+    for (let i = 0; i < rawBatch.length; i += CHUNK_SIZE) {
+      const chunk = rawBatch.slice(i, i + CHUNK_SIZE);
+      const valuesSql: string[] = [];
+      const params: any[] = [];
+      let pIdx = 1;
+
+      for (const rawEv of chunk) {
+        valuesSql.push(`($${pIdx++}, $${pIdx++}, $${pIdx++}, $${pIdx++}, $${pIdx++}::timestamptz, $${pIdx++}, $${pIdx++}::boolean)`);
+        params.push(
           rawEv.source_hash, rawEv.order_code, rawEv.actor_name, rawEv.raw_action_text,
           rawEv.event_timestamp, rawEv.page_source || 'log/system', Boolean(rawEv.is_duplicate)
-        ]);
-        rawLogsArchived++;
-        if (rawEv.id > maxRawId) maxRawId = rawEv.id;
-        if (!maxRawTime || rawEv.event_timestamp > maxRawTime) maxRawTime = rawEv.event_timestamp;
-      } catch (err: any) {
-        failedCount++;
+        );
+      }
+
+      const queryText = `
+        INSERT INTO raw_activity_events (
+          source_hash, order_code, actor_name, raw_action_text, event_timestamp, page_source, is_duplicate
+        ) VALUES ${valuesSql.join(', ')}
+        ON CONFLICT (source_hash) DO NOTHING
+      `;
+
+      try {
+        await pgQuery(queryText, params);
+        rawLogsArchived += chunk.length;
+        const lastChunkItem = chunk[chunk.length - 1];
+        currentRawCheckpointId = lastChunkItem.id;
+        currentRawCheckpointTime = lastChunkItem.event_timestamp || currentRawCheckpointTime;
+        updateCheckpoint('raw_activity_events', currentRawCheckpointId, currentRawCheckpointTime, chunk.length);
+      } catch (chunkErr: any) {
+        failedCount += chunk.length;
+        console.warn(`[SupabaseArchive] Raw logs chunk (${chunk.length} rows) error:`, chunkErr.message);
+        break; // Stop advancing checkpoint past failed chunk
       }
     }
 
-    if (rawBatch.length > 0) {
-      const highestExaminedRawId = rawBatch[rawBatch.length - 1].id;
-      updateCheckpoint('raw_activity_events', highestExaminedRawId, maxRawTime, rawLogsArchived);
-    }
-    const rawLogsRemaining = Math.max(0, totalRawWaiting - rawBatch.length);
+    const rawLogsRemaining = (db.prepare('SELECT count(*) as c FROM raw_activity_events WHERE id > ?').get(currentRawCheckpointId) as any)?.c || 0;
     status.rawLogsArchivedThisPass = rawLogsArchived;
     status.rawLogsRemaining = rawLogsRemaining;
+
+    // Cumulative totals
+    status.totalOrdersArchived += ordersArchived;
+    status.totalEventsArchived += eventsArchived;
+    status.totalRawLogsArchived += rawLogsArchived;
 
     const passDuration = Date.now() - startTime;
     status.lastDurationMs = passDuration;
     const totalArchivedThisPass = ordersArchived + eventsArchived + rawLogsArchived;
+    const totalRemaining = ordersRemaining + eventsRemaining + rawLogsRemaining;
     const totalWaitingBeforePass = totalOrdersWaiting + totalCanonWaiting + totalRawWaiting;
 
-    let passStatus: 'SUCCESS' | 'PARTIAL' | 'FAILED' | 'IDLE';
+    // Distinct evaluation of pass outcome vs overall archival state
+    let batchStatus: 'SUCCESS' | 'PARTIAL' | 'FAILED' | 'IDLE';
     if (failedCount > 0) {
-      passStatus = totalArchivedThisPass > 0 ? 'PARTIAL' : 'FAILED';
+      batchStatus = totalArchivedThisPass > 0 ? 'PARTIAL' : 'FAILED';
     } else if (totalArchivedThisPass > 0) {
-      passStatus = 'SUCCESS';
+      batchStatus = 'SUCCESS';
     } else {
-      passStatus = 'IDLE';
+      batchStatus = 'IDLE';
     }
-    status.status = passStatus;
+    status.batchStatus = batchStatus;
 
     if (totalArchivedThisPass > 0) {
       status.lastSuccessAt = new Date().toISOString();
+      status.lastError = null;
     }
 
-    if (totalWaitingBeforePass === 0 && totalArchivedThisPass === 0) {
-      console.log(`[SupabaseArchive] Archival worker idle — queue empty (0 records waiting).`);
+    const isArchiveComplete = totalRemaining === 0;
+    status.isArchiveComplete = isArchiveComplete;
+
+    if (isArchiveComplete) {
+      status.status = 'FULLY_ARCHIVED';
+    } else if (failedCount > 0 && totalArchivedThisPass === 0) {
+      status.status = 'FAILED';
+    } else if (failedCount > 0) {
+      status.status = 'PARTIAL';
     } else {
-      const totalUnarchived = ordersRemaining + eventsRemaining + rawLogsRemaining;
+      status.status = 'DRAINING';
+    }
+
+    // Diagnostics & logging level:
+    // Success and normal backlog drains log as INFO. Real errors log as WARN/ERROR.
+    if (totalWaitingBeforePass === 0 && totalArchivedThisPass === 0) {
+      console.log(`[SupabaseArchive] Idle — local queue is fully synchronized with Supabase (0 records remaining).`);
+    } else if (failedCount === 0) {
+      const stateMsg = isArchiveComplete
+        ? 'All records fully archived to Supabase!'
+        : `Backlog remaining: ${totalRemaining} (orders: ${ordersRemaining}, events: ${eventsRemaining}, logs: ${rawLogsRemaining}). Drain in progress.`;
       console.log(
-        `[SupabaseArchive] Archival pass (${passStatus}) completed in ${passDuration}ms: ` +
-        `orders: ${ordersArchived} archived (${ordersRemaining} remaining), ` +
-        `events: ${eventsArchived} archived (${eventsRemaining} remaining), ` +
-        `raw logs: ${rawLogsArchived} archived (${rawLogsRemaining} remaining). ` +
-        `Total unarchived across tables: ${totalUnarchived}. PassErrors: ${failedCount}`
+        `[SupabaseArchive] Batch pass (${batchStatus}) completed in ${passDuration}ms: ` +
+        `orders: ${ordersArchived}, events: ${eventsArchived}, raw logs: ${rawLogsArchived}. ${stateMsg}`
+      );
+    } else {
+      console.warn(
+        `[SupabaseArchive] Batch pass (${batchStatus}) completed with ${failedCount} errors in ${passDuration}ms: ` +
+        `orders: ${ordersArchived}, events: ${eventsArchived}, raw logs: ${rawLogsArchived}. Remaining: ${totalRemaining}`
       );
     }
 
-    // If there is significant backlog remaining, schedule next pass sooner (10 seconds)
-    if (ordersRemaining > 0 || eventsRemaining > 0 || rawLogsRemaining > 0) {
-      setTimeout(() => {
-        triggerArchivePass().catch(() => {});
-      }, 10000);
+    // Controlled scheduling:
+    // When remaining backlog exists, schedule next drain pass with small delay (6 seconds)
+    // When queue is empty, enter periodic mode (300 seconds)
+    clearScheduledTimers();
+    if (status.isEnabled) {
+      if (totalRemaining > 0) {
+        drainTimer = setTimeout(() => {
+          triggerArchivePass().catch(() => {});
+        }, 6000);
+      } else {
+        periodicTimer = setTimeout(() => {
+          triggerArchivePass().catch(() => {});
+        }, scheduledIntervalMs);
+      }
     }
 
     return {
-      success: passStatus !== 'FAILED',
+      success: batchStatus !== 'FAILED',
       ordersArchived,
       eventsArchived,
       rawLogsArchived,
       ordersRemaining,
       eventsRemaining,
       rawLogsRemaining,
+      isArchiveComplete,
     };
   } catch (err: any) {
     status.status = 'FAILED';
+    status.batchStatus = 'FAILED';
     status.lastError = `Archive error: ${err.message}`;
-    console.error('[SupabaseArchive Worker Error]:', err.message);
+    console.error('[SupabaseArchive Worker Fatal Error]:', err.message);
+
+    clearScheduledTimers();
+    if (status.isEnabled) {
+      periodicTimer = setTimeout(() => {
+        triggerArchivePass().catch(() => {});
+      }, 30000); // Retry after 30s on fatal exception
+    }
+
     return {
       success: false,
       ordersArchived,
@@ -361,6 +470,7 @@ export async function triggerArchivePass(): Promise<{
       ordersRemaining: status.ordersRemaining,
       eventsRemaining: status.eventsRemaining,
       rawLogsRemaining: status.rawLogsRemaining,
+      isArchiveComplete: false,
       error: err.message,
     };
   } finally {
@@ -373,23 +483,17 @@ export async function triggerArchivePass(): Promise<{
  */
 export function startSupabaseArchiveWorker(intervalSeconds = 300): void {
   status.isEnabled = true;
-  console.log(`[SupabaseArchive] Background archive worker started (batchSize: ${BATCH_SIZE}, interval: ${intervalSeconds}s)...`);
+  scheduledIntervalMs = intervalSeconds * 1000;
+  console.log(`[SupabaseArchive] Background archive worker started (batchSize: ${BATCH_SIZE}, chunkSize: ${CHUNK_SIZE}, periodicInterval: ${intervalSeconds}s)...`);
 
   // Initial trigger after 15 seconds to let server finish booting
-  setTimeout(() => {
+  clearScheduledTimers();
+  drainTimer = setTimeout(() => {
     triggerArchivePass().catch(() => {});
   }, 15000);
-
-  if (timer) clearInterval(timer);
-  timer = setInterval(() => {
-    triggerArchivePass().catch(() => {});
-  }, intervalSeconds * 1000);
 }
 
 export function stopSupabaseArchiveWorker(): void {
   status.isEnabled = false;
-  if (timer) {
-    clearInterval(timer);
-    timer = null;
-  }
+  clearScheduledTimers();
 }
