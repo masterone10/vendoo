@@ -7,6 +7,7 @@ import {
   type HistoricalCoverageRecord,
   getCairoDateString,
   getCairoDateInterval,
+  getHotThresholdDate,
 } from './db.ts';
 import {
   vendoorClient,
@@ -1039,8 +1040,56 @@ export class SyncEngine {
       const tOrdersStart = Date.now();
       const firstBatch = await vendoorClient.fetchOrdersBatch(0, 100);
       const totalOrdersInSource = firstBatch.recordsTotal;
+      const hotThreshold = getHotThresholdDate();
+      const existingOrdersCount = (db.prepare('SELECT count(*) as c FROM orders').get() as any)?.c || 0;
+      const isPeriodic = runType === 'PERIODIC' || (existingOrdersCount > 2000 && runType === 'INITIAL');
+      // When database already has historical data, only scan top 200 orders (2 pages).
+      // Only do a deep 30-day scan if the database is brand new (0 orders) or explicitly RECONCILIATION.
+      const maxScanOrders = isPeriodic ? 200 : 25000;
+
+      let newOrdersInserted = 0;
+      let existingOrdersExamined = 0;
+      let recordsWithFieldChanges = 0;
+      let statusChangesCount = 0;
+      let unresolvedStatusCount = 0;
+
+      const processBatchOrders = (ordersBatch: VendoorRawOrder[]): { newInBatch: number; changesInBatch: number } => {
+        let newInBatch = 0;
+        let changesInBatch = 0;
+        db.exec('BEGIN TRANSACTION;');
+        try {
+          for (const rawOrder of ordersBatch) {
+            const upsertRes = this.upsertCanonicalOrder(rawOrder, nowIso);
+            if (upsertRes.isNew) {
+              newOrdersInserted++;
+              newInBatch++;
+            } else {
+              existingOrdersExamined++;
+              if (upsertRes.businessFieldsChanged) {
+                recordsWithFieldChanges++;
+                changesInBatch++;
+              }
+              if (upsertRes.statusChanged) {
+                statusChangesCount++;
+                changesInBatch++;
+              }
+            }
+            if (upsertRes.currentStatus === 'Unknown') {
+              unresolvedStatusCount++;
+            }
+          }
+          db.exec('COMMIT;');
+        } catch (txErr) {
+          try { db.exec('ROLLBACK;'); } catch {}
+          throw txErr;
+        }
+        return { newInBatch, changesInBatch };
+      };
 
       const seenInPage0 = new Set<number>();
+      const batch0Valid: VendoorRawOrder[] = [];
+      let reachedHistoricalThreshold = false;
+
       for (const ord of firstBatch.data) {
         rawRowsReceived++;
         if (!ord || typeof ord.id !== 'number') {
@@ -1055,63 +1104,111 @@ export class SyncEngine {
           duplicateSourceIds++;
         } else {
           ordersMap.set(ord.id, ord);
+          batch0Valid.push(ord);
         }
         seenInPage0.add(ord.id);
+
+        if (ord.created_at && ord.created_at.slice(0, 10) < hotThreshold) {
+          reachedHistoricalThreshold = true;
+        }
       }
 
-      // Paginate through all remaining pages to guarantee 100% full coverage
+      // Persist first batch immediately so data is visible in real-time
+      let page0Delta = { newInBatch: 0, changesInBatch: 0 };
+      if (batch0Valid.length > 0) {
+        page0Delta = processBatchOrders(batch0Valid);
+        this.status.totalOrdersInDb = (db.prepare('SELECT count(*) as c FROM orders').get() as any)?.c || 0;
+      }
+
+      // If page 0 had 0 new orders and 0 field changes in periodic mode, we don't even need to fetch page 1!
+      if (isPeriodic && page0Delta.newInBatch === 0 && page0Delta.changesInBatch === 0) {
+        console.log('[SyncEngine] Page 0 had 0 changes. Periodic sync cycle up-to-date.');
+        reachedHistoricalThreshold = true;
+      }
+
+      // Paginate through remaining active/HOT pages with bound
       const batchSize = 100;
-      for (let start = 100; start < totalOrdersInSource; start += batchSize) {
-        let batchFetched = false;
-        let lastBatchErr: any = null;
+      const targetScanTotal = Math.min(totalOrdersInSource, maxScanOrders);
 
-        for (let attempt = 1; attempt <= 3; attempt++) {
-          try {
-            if (start > 100 && attempt === 1) {
-              // Gentle pacing to prevent socket reset or rate-limiting
-              await new Promise(r => setTimeout(r, 60));
-            }
+      if (!reachedHistoricalThreshold) {
+        for (let start = 100; start < targetScanTotal; start += batchSize) {
+          let batchFetched = false;
+          let lastBatchErr: any = null;
 
-            const nextBatch = await vendoorClient.fetchOrdersBatch(start, batchSize);
-            if (nextBatch.recordsTotal !== totalOrdersInSource) {
-              totalChangedDuringScan = true;
-            }
-            const seenInSubPage = new Set<number>();
-            for (const ord of nextBatch.data) {
-              rawRowsReceived++;
-              if (!ord || typeof ord.id !== 'number') {
-                invalidRecordsCount++;
-                continue;
+          for (let attempt = 1; attempt <= 3; attempt++) {
+            try {
+              if (start > 100 && attempt === 1) {
+                // Gentle pacing to prevent socket reset or rate-limiting
+                await new Promise(r => setTimeout(r, 60));
               }
-              if (seenInSubPage.has(ord.id)) {
-                duplicatesWithinPage++;
-                duplicateSourceIds++;
-              } else if (ordersMap.has(ord.id)) {
-                duplicatesAcrossPages++;
-                duplicateSourceIds++;
-              } else {
-                ordersMap.set(ord.id, ord);
+
+              const nextBatch = await vendoorClient.fetchOrdersBatch(start, batchSize);
+              if (nextBatch.recordsTotal !== totalOrdersInSource) {
+                totalChangedDuringScan = true;
               }
-              seenInSubPage.add(ord.id);
-            }
-            batchFetched = true;
-            break;
-          } catch (pageErr: any) {
-            lastBatchErr = pageErr;
-            if (attempt < 3) {
-              console.warn(`[SyncEngine] Retry ${attempt}/3 fetching orders batch at start ${start}: ${pageErr.message}`);
-              await new Promise(r => setTimeout(r, 600 * attempt));
+              const seenInSubPage = new Set<number>();
+              const subBatchValid: VendoorRawOrder[] = [];
+
+              for (const ord of nextBatch.data) {
+                rawRowsReceived++;
+                if (!ord || typeof ord.id !== 'number') {
+                  invalidRecordsCount++;
+                  continue;
+                }
+                if (seenInSubPage.has(ord.id)) {
+                  duplicatesWithinPage++;
+                  duplicateSourceIds++;
+                } else if (ordersMap.has(ord.id)) {
+                  duplicatesAcrossPages++;
+                  duplicateSourceIds++;
+                } else {
+                  ordersMap.set(ord.id, ord);
+                  subBatchValid.push(ord);
+                }
+                seenInSubPage.add(ord.id);
+
+                if (ord.created_at && ord.created_at.slice(0, 10) < hotThreshold) {
+                  reachedHistoricalThreshold = true;
+                }
+              }
+
+              let batchDelta = { newInBatch: 0, changesInBatch: 0 };
+              if (subBatchValid.length > 0) {
+                batchDelta = processBatchOrders(subBatchValid);
+                this.status.totalOrdersInDb = (db.prepare('SELECT count(*) as c FROM orders').get() as any)?.c || 0;
+              }
+
+              batchFetched = true;
+
+              // Early exit in periodic mode when page has no changes
+              if (isPeriodic && batchDelta.newInBatch === 0 && batchDelta.changesInBatch === 0) {
+                console.log(`[SyncEngine] Page offset ${start} had 0 changes. Periodic scan complete.`);
+                reachedHistoricalThreshold = true;
+                break;
+              }
+
+              break;
+            } catch (pageErr: any) {
+              lastBatchErr = pageErr;
+              if (attempt < 3) {
+                console.warn(`[SyncEngine] Retry ${attempt}/3 fetching orders batch at start ${start}: ${pageErr.message}`);
+                await new Promise(r => setTimeout(r, 600 * attempt));
+              }
             }
           }
-        }
 
-        if (!batchFetched) {
-          console.error(`[SyncEngine] Error fetching orders batch at start ${start}:`, lastBatchErr?.message);
-          errorsCount++;
-          failedPagesCount++;
-          hasFailedPage = true;
-          errorMessage = `Failed to fetch page at offset ${start}: ${lastBatchErr?.message}`;
-          break;
+          if (!batchFetched) {
+            console.error(`[SyncEngine] Error fetching orders batch at start ${start}:`, lastBatchErr?.message);
+            errorsCount++;
+            failedPagesCount++;
+            hasFailedPage = true;
+            errorMessage = `Failed to fetch page at offset ${start}: ${lastBatchErr?.message}`;
+            break;
+          }
+
+          if (reachedHistoricalThreshold) {
+            break;
+          }
         }
       }
 
@@ -1120,6 +1217,7 @@ export class SyncEngine {
       if (totalChangedDuringScan && !hasFailedPage) {
         try {
           const topCheck = await vendoorClient.fetchOrdersBatch(0, 50);
+          const topBatchValid: VendoorRawOrder[] = [];
           for (const ord of topCheck.data) {
             rawRowsReceived++;
             if (!ord || typeof ord.id !== 'number') {
@@ -1132,42 +1230,19 @@ export class SyncEngine {
             } else {
               ordersMap.set(ord.id, ord);
               recheckTopNewOrders++;
+              topBatchValid.push(ord);
             }
+          }
+          if (topBatchValid.length > 0) {
+            processBatchOrders(topBatchValid);
+            this.status.totalOrdersInDb = (db.prepare('SELECT count(*) as c FROM orders').get() as any)?.c || 0;
           }
         } catch {}
       }
 
       phaseTimings.ordersFetchMs = Date.now() - tOrdersStart;
+      phaseTimings.dbUpsertMs = 0;
       this.status.currentPhase = 'PROCESSING_ORDERS';
-
-      // 2. Canonical DB Upsert and Change Detection
-      const tDbStart = Date.now();
-      let newOrdersInserted = 0;
-      let existingOrdersExamined = 0;
-      let recordsWithFieldChanges = 0;
-      let statusChangesCount = 0;
-      let unresolvedStatusCount = 0;
-
-      db.exec('BEGIN TRANSACTION;');
-      for (const rawOrder of ordersMap.values()) {
-        const upsertRes = this.upsertCanonicalOrder(rawOrder, nowIso);
-        if (upsertRes.isNew) {
-          newOrdersInserted++;
-        } else {
-          existingOrdersExamined++;
-          if (upsertRes.businessFieldsChanged) {
-            recordsWithFieldChanges++;
-          }
-          if (upsertRes.statusChanged) {
-            statusChangesCount++;
-          }
-        }
-        if (upsertRes.currentStatus === 'Unknown') {
-          unresolvedStatusCount++;
-        }
-      }
-      db.exec('COMMIT;');
-      phaseTimings.dbUpsertMs = Date.now() - tDbStart;
 
       // 2b. Active Population Verification:
       // Orders previously active in DB that are absent from the current active search window

@@ -1,6 +1,7 @@
 import { DatabaseSync } from 'node:sqlite';
 import fs from 'node:fs';
 import path from 'node:path';
+import os from 'node:os';
 import { parseLogActionDetails } from './logDetailsParser.ts';
 
 const DB_DIR = path.resolve(process.cwd(), 'data');
@@ -9,11 +10,29 @@ if (!fs.existsSync(DB_DIR)) {
 }
 
 const rawEnvDbPath = process.env.DATABASE_PATH;
-export const DB_PATH = (rawEnvDbPath && rawEnvDbPath !== 'false' && rawEnvDbPath !== 'undefined')
-  ? rawEnvDbPath
-  : path.join(DB_DIR, 'vendoor_intelligence.sqlite');
+const isRunningInTest = process.env.NODE_ENV === 'test' ||
+  process.argv.some(arg => arg.includes('.test.') || arg.includes('/tests/'));
 
+let resolvedDbPath: string;
+if (isRunningInTest && (!rawEnvDbPath || rawEnvDbPath.includes('vendoor_intelligence.sqlite'))) {
+  // Test isolation guard: never touch production SQLite database during tests!
+  resolvedDbPath = path.join(os.tmpdir(), `test_isolated_vendoor_${process.pid}_${Date.now()}.sqlite`);
+  console.log(`[Database] Test execution detected. Using isolated test database: ${resolvedDbPath}`);
+} else if (rawEnvDbPath && rawEnvDbPath !== 'false' && rawEnvDbPath !== 'undefined') {
+  resolvedDbPath = rawEnvDbPath;
+} else {
+  resolvedDbPath = path.join(DB_DIR, 'vendoor_intelligence.sqlite');
+}
+
+export const DB_PATH = resolvedDbPath;
 export const db = new DatabaseSync(DB_PATH);
+
+if (isRunningInTest) {
+  // Automatically bootstrap tables for isolated test database
+  try {
+    initDatabase();
+  } catch {}
+}
 
 /**
  * Return YYYY-MM-DD for a given Date in Africa/Cairo timezone

@@ -167,12 +167,14 @@ class VendoorClient {
         const res = await this.fetchWithTimeout(url, options, timeoutMs);
         this.updateCookies(res);
 
-        // Re-authenticate if session expired or redirect to login
+        // Re-authenticate if session expired or redirect to login (only for non-login endpoints)
+        const urlStr = url.toString();
+        const isLoginRequest = urlStr.includes('/login');
         if (
-          res.status === 400 ||
-          res.status === 401 ||
-          res.status === 419 ||
-          (res.url && res.url.includes('/login'))
+          !isLoginRequest &&
+          (res.status === 401 ||
+           res.status === 419 ||
+           (res.url && res.url.includes('/login')))
         ) {
           if (attempt < maxRetries) {
             this.isAuthenticated = false;
@@ -215,6 +217,83 @@ class VendoorClient {
     throw lastError || new Error(`Request failed after ${maxRetries} attempts: ${url}`);
   }
 
+  public async fetchTextWithRetry(
+    url: string | URL,
+    options: RequestInit = {},
+    timeoutMs = 18000,
+    maxRetries = 2
+  ): Promise<{ status: number; text: string; ok: boolean; url: string }> {
+    let lastError: any = null;
+    for (let attempt = 1; attempt <= maxRetries; attempt++) {
+      const controller = new AbortController();
+      const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
+      try {
+        const res = await fetch(url.toString(), {
+          ...options,
+          signal: controller.signal,
+        });
+        this.updateCookies(res);
+
+        // Read text body while signal timeout is STILL actively guarding!
+        const text = await res.text();
+        clearTimeout(timeoutId);
+
+        // Re-authenticate if session expired or redirect to login (only for non-login endpoints)
+        const urlStr = url.toString();
+        const isLoginRequest = urlStr.includes('/login');
+        if (
+          !isLoginRequest &&
+          (res.status === 401 ||
+           res.status === 419 ||
+           (res.url && res.url.includes('/login')))
+        ) {
+          if (attempt < maxRetries) {
+            this.isAuthenticated = false;
+            await this.login();
+            const headers = new Headers(options.headers || {});
+            headers.set('Cookie', this.getCookieHeader());
+            options = { ...options, headers };
+            await new Promise(r => setTimeout(r, 500 * attempt));
+            continue;
+          }
+        }
+
+        // Retry on temporary upstream gateway errors (502, 503, 504)
+        if ((res.status === 502 || res.status === 503 || res.status === 504) && attempt < maxRetries) {
+          await new Promise(r => setTimeout(r, 800 * attempt));
+          continue;
+        }
+
+        return {
+          status: res.status,
+          text,
+          ok: res.ok,
+          url: res.url,
+        };
+      } catch (err: any) {
+        clearTimeout(timeoutId);
+        lastError = err;
+        const errMsg = String(err?.message || '');
+        const isNetworkOrTimeout =
+          err.name === 'AbortError' ||
+          errMsg.includes('Request timed out') ||
+          errMsg.includes('fetch failed') ||
+          errMsg.includes('ECONNRESET') ||
+          errMsg.includes('ETIMEDOUT') ||
+          errMsg.includes('EAI_AGAIN') ||
+          errMsg.includes('socket hang up');
+
+        if (isNetworkOrTimeout && attempt < maxRetries) {
+          const delay = 500 * Math.pow(2, attempt - 1);
+          await new Promise(r => setTimeout(r, delay));
+          continue;
+        }
+        throw err;
+      }
+    }
+    throw lastError || new Error(`Request failed after ${maxRetries} attempts: ${url}`);
+  }
+
   public async ensureAuthenticated(): Promise<boolean> {
     const now = Date.now();
     // Re-check or re-authenticate after 45 minutes
@@ -239,13 +318,13 @@ class VendoorClient {
       try {
         this.cookieMap.clear();
 
-        // Step 1: GET Login Page (15s timeout with retry)
-        const getRes = await this.fetchWithRetry(`${this.baseUrl}/dashboard/login`, {
+        // Step 1: GET Login Page (15s timeout)
+        const getRes = await this.fetchWithTimeout(`${this.baseUrl}/dashboard/login`, {
           headers: {
             'User-Agent': this.userAgent,
             'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
           },
-        }, 15000, 2);
+        }, 15000);
 
         this.updateCookies(getRes);
         const html = await getRes.text();
@@ -347,7 +426,7 @@ class VendoorClient {
       url.searchParams.set('end_date', endDate);
     }
 
-    const res = await this.fetchWithRetry(url.toString(), {
+    const result = await this.fetchTextWithRetry(url.toString(), {
       headers: {
         'User-Agent': this.userAgent,
         'X-Requested-With': 'XMLHttpRequest',
@@ -355,17 +434,16 @@ class VendoorClient {
         'Cookie': this.getCookieHeader(),
         'Referer': `${this.baseUrl}/dashboard/orders`,
       },
-    }, 25000, 3);
+    }, 18000, 2);
 
-    if (!res.ok) {
-      throw new Error(`Failed to fetch orders from Vendoor: HTTP ${res.status}`);
+    if (!result.ok) {
+      throw new Error(`Failed to fetch orders from Vendoor: HTTP ${result.status}`);
     }
 
-    const text = await res.text();
     try {
-      return JSON.parse(text);
+      return JSON.parse(result.text);
     } catch {
-      throw new Error(`Invalid JSON response from Vendoor orders endpoint (HTTP ${res.status}): ${text.slice(0, 120)}`);
+      throw new Error(`Invalid JSON response from Vendoor orders endpoint (HTTP ${result.status}): ${result.text.slice(0, 120)}`);
     }
   }
 
@@ -478,7 +556,7 @@ class VendoorClient {
       over_three: 'over/three/day/order/confirmation',
     };
 
-    const res = await this.fetchWithRetry(`${this.baseUrl}/dashboard/${pathMap[category]}`, {
+    const result = await this.fetchTextWithRetry(`${this.baseUrl}/dashboard/${pathMap[category]}`, {
       headers: {
         'User-Agent': this.userAgent,
         'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
@@ -486,13 +564,13 @@ class VendoorClient {
         'Cookie': this.getCookieHeader(),
         'Referer': `${this.baseUrl}/dashboard`,
       },
-    }, timeoutMs, 2);
+    }, timeoutMs, 1);
 
-    if (!res.ok) {
-      throw new Error(`Failed to fetch confirmation page for ${category}: HTTP ${res.status}`);
+    if (!result.ok) {
+      throw new Error(`Failed to fetch confirmation page for ${category}: HTTP ${result.status}`);
     }
 
-    const html = await res.text();
+    const html = result.text;
     const rows: ConfirmationRow[] = [];
 
     // Parse table rows
