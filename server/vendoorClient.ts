@@ -442,7 +442,7 @@ class VendoorClient {
         'Cookie': this.getCookieHeader(),
         'Referer': `${this.baseUrl}/dashboard`,
       },
-    }, 15000);
+    }, 4000);
 
     let activeRes = res;
     if (activeRes.status === 400 || activeRes.status === 401 || activeRes.status === 419 || activeRes.url.includes('/login')) {
@@ -456,7 +456,7 @@ class VendoorClient {
           'Cookie': this.getCookieHeader(),
           'Referer': `${this.baseUrl}/dashboard`,
         },
-      }, 15000);
+      }, 4000);
       this.updateCookies(activeRes);
     }
 
@@ -586,6 +586,64 @@ class VendoorClient {
     }
 
     return { entries, totalPages };
+  }
+
+  /**
+   * Native Vendoor System Logs Excel Export:
+   * Downloads the complete Excel file for a specified date range via /dashboard/log/xls/all
+   * This is the exact action performed by clicking the green Export button in Vendoor System Logs.
+   */
+  public async exportSystemLogsExcel(startDate: string, endDate: string): Promise<Buffer> {
+    await this.ensureAuthenticated();
+
+    const cleanStart = (startDate || '').trim().slice(0, 10);
+    const cleanEnd = (endDate || cleanStart).trim().slice(0, 10);
+
+    const url = new URL(`${this.baseUrl}/dashboard/log/xls/all`);
+    if (cleanStart) url.searchParams.set('start_date', cleanStart);
+    if (cleanEnd) url.searchParams.set('end_date', cleanEnd);
+
+    let res = await this.fetchWithTimeout(
+      url.toString(),
+      {
+        headers: {
+          'User-Agent': this.userAgent,
+          'Cookie': this.getCookieHeader(),
+          'Referer': `${this.baseUrl}/dashboard/log/system`,
+        },
+      },
+      45000
+    );
+
+    if (res.status === 400 || res.status === 401 || res.status === 419 || res.url.includes('/login')) {
+      this.isAuthenticated = false;
+      await this.login();
+      res = await this.fetchWithTimeout(
+        url.toString(),
+        {
+          headers: {
+            'User-Agent': this.userAgent,
+            'Cookie': this.getCookieHeader(),
+            'Referer': `${this.baseUrl}/dashboard/log/system`,
+          },
+        },
+        45000
+      );
+      this.updateCookies(res);
+    }
+
+    if (!res.ok) {
+      throw new Error(`Failed to export system logs Excel from Vendoor: HTTP ${res.status}`);
+    }
+
+    const arrayBuffer = await res.arrayBuffer();
+    const buffer = Buffer.from(arrayBuffer);
+
+    if (!buffer || buffer.length === 0) {
+      throw new Error('Exported system logs Excel file is empty');
+    }
+
+    return buffer;
   }
 
   public async fetchOrderDetailsEnrichment(vendoorOrderId: number): Promise<{

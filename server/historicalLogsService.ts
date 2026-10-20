@@ -43,21 +43,31 @@ const activeJobs = new Map<string, LogBackfillState>();
  * Persist log entries with deterministic SHA256 deduplication and Cairo business-date bounding.
  * Preserves raw log entry, parses canonical action, and avoids inserting raw_action_text into canonical table.
  */
+export interface PersistLogOptions {
+  dataSource?: 'EXCEL_IMPORT' | 'CSV_IMPORT' | 'VENDOOR_FETCH' | 'SUPABASE_ARCHIVE' | string;
+  batchId?: string;
+  strictInterval?: boolean;
+}
+
 export function persistLogEntries(
   entries: any[],
-  interval: { startCairo: string; endCairo: string }
+  interval: { startCairo: string; endCairo: string },
+  options?: PersistLogOptions
 ): { saved: number; duplicates: number } {
   let saved = 0;
   let duplicates = 0;
   const nowIso = new Date().toISOString();
+  const dataSource = options?.dataSource || 'VENDOOR_FETCH';
+  const importId = options?.batchId || null;
+  const strictInterval = options?.strictInterval !== false;
 
   const insertRawStmt = db.prepare(`
     INSERT INTO raw_activity_events (
       source_hash, order_code, actor_name, raw_action_text,
       event_timestamp, storage_tier, observed_at, page_source,
-      vendoor_order_id, raw_html, details_json
+      vendoor_order_id, raw_html, details_json, data_source, import_id
     )
-    VALUES (?, ?, ?, ?, ?, ?, ?, 'log/system', ?, ?, ?)
+    VALUES (?, ?, ?, ?, ?, ?, ?, 'log/system', ?, ?, ?, ?, ?)
     ON CONFLICT(source_hash) DO NOTHING
   `);
 
@@ -65,8 +75,9 @@ export function persistLogEntries(
     INSERT INTO canonical_activity_events (
       raw_event_id, order_code, actor_name, action_type, from_status, to_status,
       event_timestamp, storage_tier, is_system_actor, created_at,
-      order_id, order_match_status, is_administrative, field_name, old_value, new_value, details_json
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      order_id, order_match_status, is_administrative, field_name, old_value, new_value, details_json,
+      data_source, import_id
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
   `);
 
   const findOrderStmt = db.prepare(`
@@ -82,8 +93,8 @@ export function persistLogEntries(
     const actorName = (entry.actorName || 'النظام').trim();
     const orderCode = (entry.orderCode || '').trim() || null;
 
-    // Check Cairo date isolation bounds [startCairo, endCairo)
-    if (eventTime < interval.startCairo || eventTime >= interval.endCairo) {
+    // Check Cairo date isolation bounds [startCairo, endCairo) if strictInterval is true
+    if (strictInterval && (eventTime < interval.startCairo || eventTime >= interval.endCairo)) {
       continue;
     }
 
@@ -99,6 +110,7 @@ export function persistLogEntries(
 
     // 1. Insert into raw_activity_events
     let rawEventId: number | null = null;
+    let isNewRaw = false;
     try {
       const res = insertRawStmt.run(
         sourceHash,
@@ -110,10 +122,13 @@ export function persistLogEntries(
         nowIso,
         entry.vendoorOrderId || null,
         entry.rawHtml || null,
-        detailsJson
+        detailsJson,
+        dataSource,
+        importId
       );
       if (res.changes > 0) {
         rawEventId = Number(res.lastInsertRowid);
+        isNewRaw = true;
       } else {
         // Event hash already exists - retrieve existing rawEventId
         const existingRow: any = db.prepare('SELECT id FROM raw_activity_events WHERE source_hash = ?').get(sourceHash);
@@ -131,13 +146,14 @@ export function persistLogEntries(
       actorName.includes('تلقائي')
     ) ? 1 : 0;
 
-    // Check if canonical event already exists for this exact order, actor, action, timestamp
+    // Check if canonical event already exists for this exact raw_event_id or order, actor, action, timestamp
     const existingCanon: any = db.prepare(`
       SELECT id FROM canonical_activity_events
-      WHERE order_code = ? AND actor_name = ? AND action_type = ? AND event_timestamp = ?
-    `).get(orderCode, actorName, parsed.actionType, eventTime);
+      WHERE (raw_event_id IS NOT NULL AND raw_event_id = ?)
+         OR (order_code IS ? AND actor_name = ? AND action_type = ? AND event_timestamp = ?)
+    `).get(rawEventId, orderCode, actorName, parsed.actionType, eventTime);
 
-    if (!existingCanon) {
+    if (!existingCanon && isNewRaw) {
       try {
         let matchedOrderId: number | null = null;
         let matchStatus = 'UNRESOLVED';
@@ -169,7 +185,9 @@ export function persistLogEntries(
           parsed.fieldName,
           parsed.oldValue,
           parsed.newValue,
-          detailsJson
+          detailsJson,
+          dataSource,
+          importId
         );
 
         if (insRes.changes > 0) {

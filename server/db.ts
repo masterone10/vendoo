@@ -74,10 +74,24 @@ export interface HistoricalCoverageRecord {
   pagesRead: number;
   recordsExtracted: number;
   recordsSaved: number;
-  completionStatus: 'NOT_SYNCED' | 'IN_PROGRESS' | 'PARTIAL' | 'COMPLETE' | 'FAILED';
+  completionStatus: 'NOT_SYNCED' | 'IN_PROGRESS' | 'PARTIAL' | 'COMPLETE' | 'FAILED' | 'UNVERIFIED_SOURCE' | 'EMPTY_VERIFIED';
   errorMessage?: string | null;
-  lastAttemptedAt: string;
+  lastAttemptedAt?: string | null;
   completedAt?: string | null;
+  verifiedAt?: string | null;
+  timezone?: string;
+  dataSource?: 'EXCEL_IMPORT' | 'CSV_IMPORT' | 'VENDOOR_FETCH' | 'SUPABASE_ARCHIVE' | 'MIXED';
+  canonicalEventsCount?: number;
+  duplicatesCount?: number;
+  reviewRowsCount?: number;
+  batchId?: string | null;
+  localStorageStatus?: 'LOCAL_SAVED' | 'LOCAL_PARTIAL' | 'NONE';
+  remoteArchiveStatus?: 'PENDING_REMOTE' | 'REMOTE_SYNCED' | 'REMOTE_VERIFIED' | 'REMOTE_FAILED' | 'NONE';
+  lastImportAt?: string | null;
+  lastVendoorFetchAt?: string | null;
+  lastSupabaseVerifiedAt?: string | null;
+  sourceFileNames?: string | null;
+  notes?: string | null;
 }
 
 // Initialize database pragmas, tables, and migrations
@@ -280,6 +294,9 @@ export function initDatabase() {
       events_detected INTEGER DEFAULT 0,
       alerts_triggered INTEGER DEFAULT 0,
       errors_count INTEGER DEFAULT 0,
+      failed_pages_count INTEGER DEFAULT 0,
+      failed_enrichment_count INTEGER DEFAULT 0,
+      duration_ms INTEGER DEFAULT 0,
       started_at TEXT NOT NULL,
       completed_at TEXT,
       error_message TEXT
@@ -366,6 +383,26 @@ export function initDatabase() {
 
   // 2. Run soft schema migrations for existing database columns before creating indexes
   tryRunMigration("ALTER TABLE historical_coverage ADD COLUMN verified_at TEXT");
+  tryRunMigration("ALTER TABLE historical_coverage ADD COLUMN timezone TEXT DEFAULT 'Africa/Cairo'");
+  tryRunMigration("ALTER TABLE historical_coverage ADD COLUMN data_source TEXT DEFAULT 'VENDOOR_FETCH'");
+  tryRunMigration("ALTER TABLE historical_coverage ADD COLUMN canonical_events_count INTEGER DEFAULT 0");
+  tryRunMigration("ALTER TABLE historical_coverage ADD COLUMN duplicates_count INTEGER DEFAULT 0");
+  tryRunMigration("ALTER TABLE historical_coverage ADD COLUMN review_rows_count INTEGER DEFAULT 0");
+  tryRunMigration("ALTER TABLE historical_coverage ADD COLUMN batch_id TEXT");
+  tryRunMigration("ALTER TABLE historical_coverage ADD COLUMN local_storage_status TEXT DEFAULT 'LOCAL_SAVED'");
+  tryRunMigration("ALTER TABLE historical_coverage ADD COLUMN remote_archive_status TEXT DEFAULT 'PENDING_REMOTE'");
+  tryRunMigration("ALTER TABLE historical_coverage ADD COLUMN last_import_at TEXT");
+  tryRunMigration("ALTER TABLE historical_coverage ADD COLUMN last_vendoor_fetch_at TEXT");
+  tryRunMigration("ALTER TABLE historical_coverage ADD COLUMN last_supabase_verified_at TEXT");
+  tryRunMigration("ALTER TABLE historical_coverage ADD COLUMN source_file_names TEXT");
+  tryRunMigration("ALTER TABLE historical_coverage ADD COLUMN notes TEXT");
+
+  tryRunMigration("ALTER TABLE raw_activity_events ADD COLUMN data_source TEXT DEFAULT 'VENDOOR_FETCH'");
+  tryRunMigration("ALTER TABLE raw_activity_events ADD COLUMN import_id TEXT");
+
+  tryRunMigration("ALTER TABLE canonical_activity_events ADD COLUMN data_source TEXT DEFAULT 'VENDOOR_FETCH'");
+  tryRunMigration("ALTER TABLE canonical_activity_events ADD COLUMN import_id TEXT");
+
   tryRunMigration("ALTER TABLE orders ADD COLUMN validation_status TEXT DEFAULT 'PENDING_VALIDATION'");
   tryRunMigration("ALTER TABLE orders ADD COLUMN storage_tier TEXT DEFAULT 'HOT'");
   tryRunMigration("ALTER TABLE orders ADD COLUMN canceling_date TEXT");
@@ -408,6 +445,7 @@ export function initDatabase() {
   tryRunMigration("ALTER TABLE sync_runs ADD COLUMN unresolved_status_count INTEGER DEFAULT 0");
   tryRunMigration("ALTER TABLE sync_runs ADD COLUMN invalid_records_count INTEGER DEFAULT 0");
   tryRunMigration("ALTER TABLE sync_runs ADD COLUMN failed_pages_count INTEGER DEFAULT 0");
+  tryRunMigration("ALTER TABLE sync_runs ADD COLUMN failed_enrichment_count INTEGER DEFAULT 0");
   tryRunMigration("ALTER TABLE sync_runs ADD COLUMN duration_ms INTEGER DEFAULT 0");
   tryRunMigration("ALTER TABLE sync_runs ADD COLUMN phase_timings_json TEXT");
   tryRunMigration("ALTER TABLE merchant_code_mappings ADD COLUMN sku TEXT");
@@ -770,8 +808,20 @@ export function saveCoverageRecord(cov: HistoricalCoverageRecord) {
     INSERT INTO historical_coverage (
       account_id, source_domain, period_date, storage_tier,
       pages_discovered, pages_read, records_extracted, records_saved,
-      completion_status, error_message, last_attempted_at, completed_at
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      completion_status, error_message, last_attempted_at, completed_at,
+      verified_at, timezone, data_source, canonical_events_count,
+      duplicates_count, review_rows_count, batch_id, local_storage_status,
+      remote_archive_status, last_import_at, last_vendoor_fetch_at,
+      last_supabase_verified_at, source_file_names, notes
+    ) VALUES (
+      ?, ?, ?, ?,
+      ?, ?, ?, ?,
+      ?, ?, ?, ?,
+      ?, ?, ?, ?,
+      ?, ?, ?, ?,
+      ?, ?, ?,
+      ?, ?, ?
+    )
     ON CONFLICT(source_domain, period_date) DO UPDATE SET
       storage_tier = excluded.storage_tier,
       pages_discovered = excluded.pages_discovered,
@@ -781,20 +831,48 @@ export function saveCoverageRecord(cov: HistoricalCoverageRecord) {
       completion_status = excluded.completion_status,
       error_message = excluded.error_message,
       last_attempted_at = excluded.last_attempted_at,
-      completed_at = excluded.completed_at
+      completed_at = excluded.completed_at,
+      verified_at = COALESCE(excluded.verified_at, historical_coverage.verified_at),
+      timezone = COALESCE(excluded.timezone, historical_coverage.timezone),
+      data_source = COALESCE(excluded.data_source, historical_coverage.data_source),
+      canonical_events_count = COALESCE(excluded.canonical_events_count, historical_coverage.canonical_events_count),
+      duplicates_count = COALESCE(excluded.duplicates_count, historical_coverage.duplicates_count),
+      review_rows_count = COALESCE(excluded.review_rows_count, historical_coverage.review_rows_count),
+      batch_id = COALESCE(excluded.batch_id, historical_coverage.batch_id),
+      local_storage_status = COALESCE(excluded.local_storage_status, historical_coverage.local_storage_status),
+      remote_archive_status = COALESCE(excluded.remote_archive_status, historical_coverage.remote_archive_status),
+      last_import_at = COALESCE(excluded.last_import_at, historical_coverage.last_import_at),
+      last_vendoor_fetch_at = COALESCE(excluded.last_vendoor_fetch_at, historical_coverage.last_vendoor_fetch_at),
+      last_supabase_verified_at = COALESCE(excluded.last_supabase_verified_at, historical_coverage.last_supabase_verified_at),
+      source_file_names = COALESCE(excluded.source_file_names, historical_coverage.source_file_names),
+      notes = COALESCE(excluded.notes, historical_coverage.notes)
   `).run(
     cov.accountId || 'primary',
     cov.sourceDomain,
     cov.periodDate,
     cov.storageTier,
-    cov.pagesDiscovered,
-    cov.pagesRead,
-    cov.recordsExtracted,
-    cov.recordsSaved,
-    cov.completionStatus,
+    cov.pagesDiscovered || 0,
+    cov.pagesRead || 0,
+    cov.recordsExtracted || 0,
+    cov.recordsSaved || 0,
+    cov.completionStatus || 'PARTIAL',
     cov.errorMessage || null,
-    cov.lastAttemptedAt,
-    cov.completedAt || null
+    cov.lastAttemptedAt || new Date().toISOString(),
+    cov.completedAt || null,
+    cov.verifiedAt || null,
+    cov.timezone || 'Africa/Cairo',
+    cov.dataSource || 'VENDOOR_FETCH',
+    cov.canonicalEventsCount || 0,
+    cov.duplicatesCount || 0,
+    cov.reviewRowsCount || 0,
+    cov.batchId || null,
+    cov.localStorageStatus || 'LOCAL_SAVED',
+    cov.remoteArchiveStatus || 'PENDING_REMOTE',
+    cov.lastImportAt || null,
+    cov.lastVendoorFetchAt || null,
+    cov.lastSupabaseVerifiedAt || null,
+    cov.sourceFileNames || null,
+    cov.notes || null
   );
 }
 

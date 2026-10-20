@@ -108,6 +108,9 @@ export async function ensureCoverageForRange(
   }
 
   // Step 1: Check coverage for all dates
+  // Strict Policy: Existence of historical data in local storage (Excel/CSV import, Supabase archive,
+  // or prior Vendoor fetch) strictly blocks automatic full Vendoor download.
+  // Only completely unrecorded days trigger automatic Vendoor fetching.
   const missingDates: string[] = [];
   for (const date of dates) {
     if (forceRefetch) {
@@ -115,17 +118,49 @@ export async function ensureCoverageForRange(
       continue;
     }
 
+    const interval = getCairoDateInterval(date);
+
     const cov: any = db.prepare(`
-      SELECT completion_status FROM historical_coverage
+      SELECT completion_status, data_source FROM historical_coverage
       WHERE period_date = ? AND source_domain = 'logs'
     `).get(date);
 
-    if (cov?.completion_status !== 'COMPLETE') {
+    const hasLocalRaw = Boolean(
+      (db.prepare(`
+        SELECT 1 FROM raw_activity_events
+        WHERE event_timestamp >= ? AND event_timestamp < ?
+        LIMIT 1
+      `).get(interval.startCairo, interval.endCairo) as any)
+    );
+
+    const hasLocalCanon = Boolean(
+      (db.prepare(`
+        SELECT 1 FROM canonical_activity_events
+        WHERE event_timestamp >= ? AND event_timestamp < ?
+        LIMIT 1
+      `).get(interval.startCairo, interval.endCairo) as any)
+    );
+
+    const hasRecordedHistory = Boolean(
+      (cov && (
+        cov.completion_status === 'COMPLETE' ||
+        cov.completion_status === 'UNVERIFIED_SOURCE' ||
+        cov.completion_status === 'EMPTY_VERIFIED' ||
+        cov.completion_status === 'PARTIAL' ||
+        cov.data_source === 'EXCEL_IMPORT' ||
+        cov.data_source === 'CSV_IMPORT' ||
+        cov.data_source === 'SUPABASE_ARCHIVE'
+      )) ||
+      hasLocalRaw ||
+      hasLocalCanon
+    );
+
+    if (!hasRecordedHistory) {
       missingDates.push(date);
     }
   }
 
-  // If all dates are complete, finish immediately with cache indication
+  // If all dates are complete or already recorded, finish immediately with cache indication
   if (missingDates.length === 0) {
     job.stage = 'COMPLETE';
     job.stageLabelAr = 'مكتمل باستخدام البيانات المخزنة';
@@ -300,6 +335,8 @@ export interface LogsIntelligenceReport {
     pagesRead: number;
     recordsSaved: number;
     isFullyComplete: boolean;
+    dataSource?: string;
+    sourceSummary?: string;
   };
   metrics: {
     totalLogs: number;
@@ -330,6 +367,9 @@ export interface LogsIntelligenceReport {
     extraPhonesAddedCount: number;
     activeEmployeesCount: number;
     coverageStatus: string;
+    dataSource?: string;
+    localStorageStatus?: string;
+    remoteArchiveStatus?: string;
   }>;
   employees: Array<{
     actor_name: string;
@@ -425,12 +465,29 @@ export function generateLogsIntelligenceReport(startDateStr: string, endDateStr:
   for (const d of dayDates) {
     const cov = covMap.get(d);
     if (!cov) {
-      missingDays++;
+      const dInterval = getCairoDateInterval(d);
+      const hasEvents = Boolean(
+        db.prepare(`
+          SELECT 1 FROM canonical_activity_events
+          WHERE event_timestamp >= ? AND event_timestamp < ?
+          LIMIT 1
+        `).get(dInterval.startCairo, dInterval.endCairo)
+      );
+      if (hasEvents) {
+        partialDays++;
+      } else {
+        missingDays++;
+      }
     } else {
-      if (cov.completion_status === 'COMPLETE') completeDays++;
-      else if (cov.completion_status === 'PARTIAL') partialDays++;
-      else if (cov.completion_status === 'FAILED') failedDays++;
-      else missingDays++;
+      if (cov.completion_status === 'COMPLETE' || cov.completion_status === 'EMPTY_VERIFIED') {
+        completeDays++;
+      } else if (cov.completion_status === 'PARTIAL' || cov.completion_status === 'UNVERIFIED_SOURCE') {
+        partialDays++;
+      } else if (cov.completion_status === 'FAILED') {
+        failedDays++;
+      } else {
+        missingDays++;
+      }
 
       pagesRead += cov.pages_read || 0;
       recordsSaved += cov.records_saved || 0;
@@ -638,7 +695,8 @@ export function generateLogsIntelligenceReport(startDateStr: string, endDateStr:
     `).get(dayInterval.startCairo, dayInterval.endCairo) as any)?.c || 0;
 
     const cov = covMap.get(d);
-    const dayCovStatus = cov?.completion_status || 'NOT_SYNCED';
+    const dayCovStatus = cov?.completion_status || (dTotalLogs > 0 ? 'COMPLETE' : 'NOT_SYNCED');
+    const dayDataSource = cov?.data_source || (dTotalLogs > 0 ? 'LOCAL_STORAGE' : 'NONE');
 
     daysBreakdown.push({
       date: d,
@@ -651,6 +709,9 @@ export function generateLogsIntelligenceReport(startDateStr: string, endDateStr:
       extraPhonesAddedCount: dExtraPhones,
       activeEmployeesCount: dActiveEmployees,
       coverageStatus: dayCovStatus,
+      dataSource: dayDataSource,
+      localStorageStatus: cov?.local_storage_status || (dTotalLogs > 0 ? 'LOCAL_SAVED' : 'NONE'),
+      remoteArchiveStatus: cov?.remote_archive_status || 'NONE',
     });
   }
 
@@ -805,6 +866,7 @@ export function generateLogsIntelligenceReport(startDateStr: string, endDateStr:
       pagesRead,
       recordsSaved,
       isFullyComplete,
+      dataSource: dayDates.length === 1 && covMap.get(dayDates[0])?.data_source ? covMap.get(dayDates[0])?.data_source : undefined,
     },
     metrics: {
       totalLogs,

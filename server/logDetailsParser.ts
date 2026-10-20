@@ -159,8 +159,8 @@ export function parseLogActionDetails(rawText: string, actorName = '', orderCode
   }
 
   // 5. PHONE / EXTRA PHONE:
-  // Pattern 5a: Range (من X إلى Y)
-  const phoneRegex = /(?:رقم\s+هاتف\s+آخر|رقم\s+التليفون\s+البديل|الهاتف\s+الإضافي|الهاتف\s+الاضافي|هاتف\s+آخر|هاتف\s+بديل|رقم\s+الهاتف|الموبايل|التليفون|الهاتف)\s+من\s*['"״\s]?([\s\S]*?)(?:'|"|״)?\s*(?:إلى|إلي|الى)\s*['"״\s]?([\s\S]+?)(?:'|"|״)?\s*$/i;
+  // Pattern 5a: Range (من X إلى Y) - Allows empty Y for phone deletion
+  const phoneRegex = /(?:رقم\s+هاتف\s+آخر|رقم\s+التليفون\s+البديل|الهاتف\s+الإضافي|الهاتف\s+الاضافي|هاتف\s+آخر|هاتف\s+بديل|رقم\s+الهاتف|الموبايل|التليفون|الهاتف)\s+من\s*['"״\s]?([\s\S]*?)(?:'|"|״)?\s*(?:إلى|إلي|الى)\s*['"״\s]?([\s\S]*?)(?:'|"|״)?\s*$/i;
   const phoneMatch = t.match(phoneRegex);
   if (phoneMatch) {
     const isExtra = t.includes('آخر') || t.includes('بديل') || t.includes('إضافي') || t.includes('اضافي');
@@ -192,8 +192,8 @@ export function parseLogActionDetails(rawText: string, actorName = '', orderCode
     return result;
   }
 
-  // Pattern 5b: Direct Addition of extra phone (أضاف رقم هاتف آخر : 010... أو رقم هاتف آخر إلى '010...')
-  const extraAddRegex = /(?:أضاف|اضاف)\s+(?:رقم\s+هاتف\s+آخر|رقم\s+التليفون\s+البديل|الهاتف\s+الإضافي|الهاتف\s+الاضافي|هاتف\s+آخر|هاتف\s+بديل)\s*[:：]\s*([\d\+\-\s]+)/i;
+  // Pattern 5b: Direct Addition of extra phone (أضاف [اسم الموظف] رقم هاتف آخر : 010... أو رقم هاتف آخر إلى '010...')
+  const extraAddRegex = /(?:أضاف|اضاف)\s+(?:.+?\s+)?(?:رقم\s+هاتف\s+آخر|رقم\s+التليفون\s+البديل|الهاتف\s+الإضافي|الهاتف\s+الاضافي|هاتف\s+آخر|هاتف\s+بديل)\s*[:：]\s*([\d\+\-\s]+)/i;
   const extraAddMatch = t.match(extraAddRegex);
   if (extraAddMatch) {
     const newVal = extraAddMatch[1].trim();
@@ -209,7 +209,7 @@ export function parseLogActionDetails(rawText: string, actorName = '', orderCode
   }
 
   // Pattern 5c: Target only extra phone (رقم هاتف آخر إلى '010...')
-  const extraToRegex = /(?:رقم\s+هاتف\s+آخر|رقم\s+التليفون\s+البديل|الهاتف\s+الإضافي|الهاتف\s+الاضافي|هاتف\s+آخر|هاتف\s+بديل)\s+(?:إلى|إلي|الى)\s*['"״\s]?([\s\S]+?)(?:'|"|״)?\s*$/i;
+  const extraToRegex = /(?:.+?\s+)?(?:رقم\s+هاتف\s+آخر|رقم\s+التليفون\s+البديل|الهاتف\s+الإضافي|الهاتف\s+الاضافي|هاتف\s+آخر|هاتف\s+بديل)\s+(?:إلى|إلي|الى)\s*['"״\s]?([\s\S]+?)(?:'|"|״)?\s*$/i;
   const extraToMatch = t.match(extraToRegex);
   if (extraToMatch) {
     const newVal = extraToMatch[1].trim().replace(/^['"״]|['"״]$/g, '');

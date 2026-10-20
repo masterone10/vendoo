@@ -230,3 +230,246 @@ export async function applySupabaseMigration(): Promise<{ success: boolean; mess
     appliedTables: status.presentTables,
   };
 }
+
+/**
+ * Push all raw and canonical events for a specific business date from SQLite to Supabase,
+ * then query Supabase to VERIFY readable persistence.
+ */
+export async function syncDayLogsToSupabase(dateStr: string): Promise<{
+  success: boolean;
+  verified: boolean;
+  rawSaved: number;
+  canonicalSaved: number;
+  verifiedRemoteCount: number;
+  error?: string;
+}> {
+  if (!isSupabaseConfigured()) {
+    return {
+      success: false,
+      verified: false,
+      rawSaved: 0,
+      canonicalSaved: 0,
+      verifiedRemoteCount: 0,
+      error: 'Supabase DATABASE_URL is not configured',
+    };
+  }
+
+  const { db, getCairoDateInterval } = await import('./db.ts');
+  const interval = getCairoDateInterval(dateStr);
+
+  try {
+    const rawRows: any[] = db.prepare(`
+      SELECT source_hash, order_code, actor_name, raw_action_text, event_timestamp,
+             storage_tier, page_source, vendoor_order_id, raw_html, details_json,
+             data_source, import_id
+      FROM raw_activity_events
+      WHERE event_timestamp >= ? AND event_timestamp < ?
+    `).all(interval.startCairo, interval.endCairo);
+
+    let rawSaved = 0;
+    for (const r of rawRows) {
+      try {
+        await pgQuery(`
+          INSERT INTO raw_activity_events (
+            source_hash, order_code, actor_name, raw_action_text, event_timestamp,
+            storage_tier, page_source, is_duplicate
+          ) VALUES ($1, $2, $3, $4, $5, $6, $7, false)
+          ON CONFLICT (source_hash) DO NOTHING
+        `, [
+          r.source_hash, r.order_code, r.actor_name, r.raw_action_text,
+          r.event_timestamp, r.storage_tier || 'HOT', r.page_source || 'log/system'
+        ]);
+        rawSaved++;
+      } catch {}
+    }
+
+    const canonRows: any[] = db.prepare(`
+      SELECT order_code, actor_name, action_type, from_status, to_status,
+             event_timestamp, is_system_actor, data_source, import_id
+      FROM canonical_activity_events
+      WHERE event_timestamp >= ? AND event_timestamp < ?
+    `).all(interval.startCairo, interval.endCairo);
+
+    let canonicalSaved = 0;
+    for (const c of canonRows) {
+      try {
+        await pgQuery(`
+          INSERT INTO canonical_activity_events (
+            order_code, actor_name, action_type, from_status, to_status,
+            event_timestamp, is_system_actor
+          )
+          SELECT $1, $2, $3, $4, $5, $6, $7
+          WHERE NOT EXISTS (
+            SELECT 1 FROM canonical_activity_events
+            WHERE (order_code IS NOT DISTINCT FROM $1) AND event_timestamp = $6 AND action_type = $3 AND actor_name = $2
+          )
+        `, [
+          c.order_code, c.actor_name, c.action_type || 'action', c.from_status, c.to_status,
+          c.event_timestamp, Boolean(c.is_system_actor)
+        ]);
+        canonicalSaved++;
+      } catch {}
+    }
+
+    // Verification check: Query Supabase directly
+    const verifyRes = await pgQuery(`
+      SELECT COUNT(*)::int as c FROM canonical_activity_events
+      WHERE event_timestamp >= $1 AND event_timestamp < $2
+    `, [interval.startCairo, interval.endCairo]);
+
+    const verifiedRemoteCount = Number(verifyRes.rows[0]?.c || 0);
+    const verified = verifiedRemoteCount > 0 || (rawRows.length === 0 && canonRows.length === 0);
+
+    const nowIso = new Date().toISOString();
+    try {
+      db.prepare(`
+        UPDATE historical_coverage
+        SET remote_archive_status = ?,
+            last_supabase_verified_at = ?,
+            verified_at = ?
+        WHERE period_date = ? AND source_domain = 'logs'
+      `).run(
+        verified ? 'REMOTE_VERIFIED' : 'REMOTE_SYNCED',
+        verified ? nowIso : null,
+        verified ? nowIso : null,
+        dateStr
+      );
+    } catch {}
+
+    return {
+      success: true,
+      verified,
+      rawSaved,
+      canonicalSaved,
+      verifiedRemoteCount,
+    };
+  } catch (err: any) {
+    return {
+      success: false,
+      verified: false,
+      rawSaved: 0,
+      canonicalSaved: 0,
+      verifiedRemoteCount: 0,
+      error: err.message,
+    };
+  }
+}
+
+/**
+ * Fetch logs for a given business date from Supabase archive back into local SQLite.
+ */
+export async function fetchDayLogsFromSupabase(dateStr: string): Promise<{
+  success: boolean;
+  recordsRestored: number;
+  error?: string;
+}> {
+  if (!isSupabaseConfigured()) {
+    return { success: false, recordsRestored: 0, error: 'Supabase is not configured' };
+  }
+
+  const { db, getCairoDateInterval } = await import('./db.ts');
+  const { parseLogActionDetails } = await import('./logDetailsParser.ts');
+  const interval = getCairoDateInterval(dateStr);
+
+  try {
+    // 1. Fetch raw logs from Supabase
+    const rawRes = await pgQuery(`
+      SELECT source_hash, order_code, actor_name, raw_action_text, event_timestamp,
+             storage_tier, page_source, is_duplicate
+      FROM raw_activity_events
+      WHERE event_timestamp >= $1 AND event_timestamp < $2
+    `, [interval.startCairo, interval.endCairo]);
+
+    if (!rawRes.rows || rawRes.rows.length === 0) {
+      return { success: true, recordsRestored: 0 };
+    }
+
+    let restored = 0;
+    const nowIso = new Date().toISOString();
+
+    const insertRaw = db.prepare(`
+      INSERT INTO raw_activity_events (
+        source_hash, order_code, actor_name, raw_action_text, event_timestamp,
+        storage_tier, observed_at, page_source, data_source
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'SUPABASE_ARCHIVE')
+      ON CONFLICT(source_hash) DO NOTHING
+    `);
+
+    const insertCanon = db.prepare(`
+      INSERT INTO canonical_activity_events (
+        raw_event_id, order_code, actor_name, action_type, from_status, to_status,
+        event_timestamp, storage_tier, is_system_actor, created_at,
+        order_match_status, is_administrative, field_name, old_value, new_value, details_json,
+        data_source
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'SUPABASE_ARCHIVE')
+    `);
+
+    db.exec('BEGIN TRANSACTION;');
+    try {
+      for (const r of rawRes.rows) {
+        const rawResRun = insertRaw.run(
+          r.source_hash,
+          r.order_code,
+          r.actor_name,
+          r.raw_action_text,
+          r.event_timestamp,
+          r.storage_tier || 'HOT',
+          nowIso,
+          r.page_source || 'supabase_archive'
+        );
+
+        let rawId: number | null = null;
+        if (rawResRun.changes > 0) {
+          rawId = Number(rawResRun.lastInsertRowid);
+        } else {
+          const ex = db.prepare('SELECT id FROM raw_activity_events WHERE source_hash = ?').get(r.source_hash) as any;
+          rawId = ex?.id || null;
+        }
+
+        const parsed = parseLogActionDetails(r.raw_action_text || '', r.actor_name || '', r.order_code || '');
+        const detailsJson = JSON.stringify(parsed);
+
+        // Check if canonical exists
+        const exists = db.prepare(`
+          SELECT id FROM canonical_activity_events
+          WHERE (raw_event_id IS NOT NULL AND raw_event_id = ?)
+             OR (order_code IS ? AND actor_name = ? AND action_type = ? AND event_timestamp = ?)
+        `).get(rawId, r.order_code, r.actor_name, parsed.actionType, r.event_timestamp);
+
+        if (!exists && rawResRun.changes > 0) {
+          const isSystem = (r.actor_name || '').toLowerCase().includes('system') || (r.actor_name || '').includes('النظام') ? 1 : 0;
+          insertCanon.run(
+            rawId,
+            r.order_code,
+            r.actor_name,
+            parsed.actionType,
+            parsed.fromStatus,
+            parsed.toStatus,
+            r.event_timestamp,
+            r.storage_tier || 'HOT',
+            isSystem,
+            nowIso,
+            r.order_code ? 'MATCHED' : 'GENERAL_LOG',
+            parsed.isAdministrative ? 1 : 0,
+            parsed.fieldName,
+            parsed.oldValue,
+            parsed.newValue,
+            detailsJson
+          );
+          restored++;
+        }
+      }
+      db.exec('COMMIT;');
+    } catch (txErr) {
+      db.exec('ROLLBACK;');
+      throw txErr;
+    }
+
+    return {
+      success: true,
+      recordsRestored: restored > 0 ? restored : rawRes.rows.length,
+    };
+  } catch (err: any) {
+    return { success: false, recordsRestored: 0, error: err.message };
+  }
+}

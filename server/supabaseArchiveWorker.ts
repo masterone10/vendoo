@@ -198,10 +198,11 @@ export async function triggerArchivePass(): Promise<{
       }
     }
 
-    if (ordersArchived > 0) {
-      updateCheckpoint('orders', maxOrderId, maxOrderTime, ordersArchived);
+    if (ordersBatch.length > 0) {
+      const highestExaminedOrderId = ordersBatch[ordersBatch.length - 1].id;
+      updateCheckpoint('orders', highestExaminedOrderId, maxOrderTime, ordersArchived);
     }
-    const ordersRemaining = Math.max(0, totalOrdersWaiting - ordersArchived);
+    const ordersRemaining = Math.max(0, totalOrdersWaiting - ordersBatch.length);
     status.ordersArchivedThisPass = ordersArchived;
     status.ordersRemaining = ordersRemaining;
 
@@ -233,11 +234,11 @@ export async function triggerArchivePass(): Promise<{
           SELECT $1, $2, $3, $4, $5, $6, $7
           WHERE NOT EXISTS (
             SELECT 1 FROM canonical_activity_events
-            WHERE order_code = $1 AND event_timestamp = $6 AND action_type = $3
+            WHERE (order_code IS NOT DISTINCT FROM $1) AND event_timestamp = $6 AND action_type = $3 AND actor_name = $2
           )
         `, [
           ev.order_code, ev.actor_name, ev.action_type || 'action', ev.from_status, ev.to_status,
-          ev.event_timestamp, ev.is_system_actor || 0
+          ev.event_timestamp, Boolean(ev.is_system_actor)
         ]);
         eventsArchived++;
         if (ev.id > maxCanonId) maxCanonId = ev.id;
@@ -247,10 +248,11 @@ export async function triggerArchivePass(): Promise<{
       }
     }
 
-    if (eventsArchived > 0) {
-      updateCheckpoint('canonical_activity_events', maxCanonId, maxCanonTime, eventsArchived);
+    if (canonBatch.length > 0) {
+      const highestExaminedCanonId = canonBatch[canonBatch.length - 1].id;
+      updateCheckpoint('canonical_activity_events', highestExaminedCanonId, maxCanonTime, eventsArchived);
     }
-    const eventsRemaining = Math.max(0, totalCanonWaiting - eventsArchived);
+    const eventsRemaining = Math.max(0, totalCanonWaiting - canonBatch.length);
     status.eventsArchivedThisPass = eventsArchived;
     status.eventsRemaining = eventsRemaining;
 
@@ -281,7 +283,7 @@ export async function triggerArchivePass(): Promise<{
           ON CONFLICT (source_hash) DO NOTHING
         `, [
           rawEv.source_hash, rawEv.order_code, rawEv.actor_name, rawEv.raw_action_text,
-          rawEv.event_timestamp, rawEv.page_source || 'log/system', rawEv.is_duplicate || 0
+          rawEv.event_timestamp, rawEv.page_source || 'log/system', Boolean(rawEv.is_duplicate)
         ]);
         rawLogsArchived++;
         if (rawEv.id > maxRawId) maxRawId = rawEv.id;
@@ -291,10 +293,11 @@ export async function triggerArchivePass(): Promise<{
       }
     }
 
-    if (rawLogsArchived > 0) {
-      updateCheckpoint('raw_activity_events', maxRawId, maxRawTime, rawLogsArchived);
+    if (rawBatch.length > 0) {
+      const highestExaminedRawId = rawBatch[rawBatch.length - 1].id;
+      updateCheckpoint('raw_activity_events', highestExaminedRawId, maxRawTime, rawLogsArchived);
     }
-    const rawLogsRemaining = Math.max(0, totalRawWaiting - rawLogsArchived);
+    const rawLogsRemaining = Math.max(0, totalRawWaiting - rawBatch.length);
     status.rawLogsArchivedThisPass = rawLogsArchived;
     status.rawLogsRemaining = rawLogsRemaining;
 
@@ -320,7 +323,14 @@ export async function triggerArchivePass(): Promise<{
     if (totalWaitingBeforePass === 0 && totalArchivedThisPass === 0) {
       console.log(`[SupabaseArchive] Archival worker idle — queue empty (0 records waiting).`);
     } else {
-      console.log(`[SupabaseArchive] Archival pass (${passStatus}) completed in ${passDuration}ms: ${ordersArchived} orders (waiting: ${totalOrdersWaiting}, remaining: ${ordersRemaining}), ${eventsArchived} canonical events (waiting: ${totalCanonWaiting}, remaining: ${eventsRemaining}), ${rawLogsArchived} raw logs (waiting: ${totalRawWaiting}, remaining: ${rawLogsRemaining}). UnsyncedCount: ${failedCount}`);
+      const totalUnarchived = ordersRemaining + eventsRemaining + rawLogsRemaining;
+      console.log(
+        `[SupabaseArchive] Archival pass (${passStatus}) completed in ${passDuration}ms: ` +
+        `orders: ${ordersArchived} archived (${ordersRemaining} remaining), ` +
+        `events: ${eventsArchived} archived (${eventsRemaining} remaining), ` +
+        `raw logs: ${rawLogsArchived} archived (${rawLogsRemaining} remaining). ` +
+        `Total unarchived across tables: ${totalUnarchived}. PassErrors: ${failedCount}`
+      );
     }
 
     // If there is significant backlog remaining, schedule next pass sooner (10 seconds)

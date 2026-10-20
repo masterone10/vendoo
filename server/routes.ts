@@ -19,6 +19,7 @@ import {
   applySupabaseMigration,
   getDatabaseUrl,
   isSupabaseConfigured,
+  syncDayLogsToSupabase,
 } from './supabaseClient.ts';
 import { runSqliteToSupabaseImport } from './importSqliteToSupabase.ts';
 import {
@@ -34,6 +35,8 @@ import {
 } from './logsIntelligenceService.ts';
 import { applyMerchantCodeMappings } from './excelMerchantCodes.ts';
 import { getArchiveWorkerStatus, triggerArchivePass } from './supabaseArchiveWorker.ts';
+import { importBatchLogFiles } from './batchLogsImporter.ts';
+import { resolveHistoricalDay } from './historicalDayResolver.ts';
 
 export function isCSEmployee(actorName: string): boolean {
   if (!actorName) return false;
@@ -932,6 +935,65 @@ apiRouter.post('/reports/logs-fetch', async (req: Request, res: Response) => {
     res.json({ success: true, job, report });
   } catch (err: any) {
     res.status(500).json({ error: err.message });
+  }
+});
+
+// Single Day Resolution Status: checks local storage, external imports, and remote Supabase archive
+apiRouter.get('/reports/day-status', async (req: Request, res: Response) => {
+  try {
+    const rawDate = typeof req.query.date === 'string' ? req.query.date.trim().slice(0, 10) : '';
+    const targetDate = rawDate || getCairoDateString();
+    const result = await resolveHistoricalDay(targetDate, { autoFetchMissing: false });
+    res.json({ success: true, dayStatus: result });
+  } catch (err: any) {
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// Single Day Actions: explicit re-check, manual completion of missing pages, or force full refetch
+apiRouter.post('/reports/day-action', async (req: Request, res: Response) => {
+  try {
+    const { date, action } = req.body;
+    if (!date) {
+      res.status(400).json({ success: false, error: 'date is required' });
+      return;
+    }
+    const cleanDate = String(date).slice(0, 10);
+
+    let result;
+    if (action === 'recheck') {
+      result = await resolveHistoricalDay(cleanDate, { autoFetchMissing: false, forceRefetch: false });
+    } else if (action === 'complete_missing') {
+      result = await resolveHistoricalDay(cleanDate, { autoFetchMissing: true, forceRefetch: false });
+    } else if (action === 'force_refetch') {
+      result = await resolveHistoricalDay(cleanDate, { forceRefetch: true });
+    } else if (action === 'sync_supabase') {
+      await syncDayLogsToSupabase(cleanDate);
+      result = await resolveHistoricalDay(cleanDate, { autoFetchMissing: false });
+    } else {
+      res.status(400).json({ success: false, error: `Unknown action: ${action}` });
+      return;
+    }
+
+    res.json({ success: true, dayStatus: result });
+  } catch (err: any) {
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// Batch Logs Ingestion: Multi-day Excel & CSV logs upload with automatic date discovery
+apiRouter.post('/logs/import-batch', async (req: Request, res: Response) => {
+  try {
+    const { files } = req.body;
+    if (!files || !Array.isArray(files) || files.length === 0) {
+      res.status(400).json({ success: false, error: 'files array is required' });
+      return;
+    }
+
+    const result = await importBatchLogFiles(files);
+    res.json({ success: true, result });
+  } catch (err: any) {
+    res.status(500).json({ success: false, error: err.message });
   }
 });
 

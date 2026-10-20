@@ -298,6 +298,8 @@ export interface LogsIntelligenceReport {
     pagesRead: number;
     recordsSaved: number;
     isFullyComplete: boolean;
+    dataSource?: string;
+    sourceSummary?: string;
   };
   metrics: {
     totalLogs: number;
@@ -328,6 +330,9 @@ export interface LogsIntelligenceReport {
     extraPhonesAddedCount: number;
     activeEmployeesCount: number;
     coverageStatus: string;
+    dataSource?: string;
+    localStorageStatus?: string;
+    remoteArchiveStatus?: string;
   }>;
   employees: Array<{
     actor_name: string;
@@ -378,3 +383,51 @@ export interface LogsIntelligenceReport {
   }>;
 }
 
+export interface HistoricalDayStatus {
+  date: string;
+  decision: string;
+  dataSource: string;
+  completionStatus: string;
+  localStorageStatus: string;
+  remoteArchiveStatus: string;
+  rawRecordsCount: number;
+  canonicalEventsCount: number;
+  loadedFromCache: boolean;
+  messageAr: string;
+  lastAttemptedAt?: string | null;
+  completedAt?: string | null;
+  verifiedAt?: string | null;
+  lastImportAt?: string | null;
+  sourceFileNames?: string | null;
+}
+
+export interface DiscoveredDaySummary {
+  date: string;
+  rowsCount: number;
+  savedCount: number;
+  duplicatesCount: number;
+  canonicalCount: number;
+  coverageStatus: string;
+  dataSource: string;
+  remoteArchiveStatus: string;
+}
+
+export interface BatchImportResult {
+  success: boolean;
+  batchId: string;
+  filesProcessed: string[];
+  sheetsProcessed: string[];
+  totalRowsRead: number;
+  totalSaved: number;
+  totalDuplicates: number;
+  unparseableRows: number;
+  discoveredDates: DiscoveredDaySummary[];
+  reviewRows: Array<{
+    fileName: string;
+    sheetName: string;
+    rowIndex: number;
+    reason: string;
+    sampleData: Record<string, any>;
+  }>;
+  warnings: string[];
+}

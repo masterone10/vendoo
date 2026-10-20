@@ -33,10 +33,13 @@ import {
   HelpCircle,
   Info,
   ExternalLink,
+  FileSpreadsheet,
+  Database,
 } from 'lucide-react';
 import { DateCalendarPicker, getCairoToday, formatDateArabic } from './common/DateCalendarPicker';
 import { ReportKpiDrilldownModal, DrilldownPillar } from './ReportKpiDrilldownModal';
-import { LogsIntelligenceReport, RangeJobState } from '../types';
+import { BatchLogsImportModal } from './BatchLogsImportModal';
+import { LogsIntelligenceReport, RangeJobState, HistoricalDayStatus } from '../types';
 
 interface ReportsViewProps {
   onSelectOrder?: (orderCode: string) => void;
@@ -72,6 +75,13 @@ export const ReportsView: React.FC<ReportsViewProps> = ({ onSelectOrder }) => {
   // Polling ref for job status
   const pollIntervalRef = useRef<any>(null);
 
+  // Batch Logs Import Modal state
+  const [showImportModal, setShowImportModal] = useState<boolean>(false);
+
+  // Day Provenance & Resolution Status
+  const [dayStatus, setDayStatus] = useState<HistoricalDayStatus | null>(null);
+  const [dayActionLoading, setDayActionLoading] = useState<boolean>(false);
+
   // Effective start & end dates
   const effectiveStart = calendarMode === 'single' ? singleDate : startDate;
   const effectiveEnd = calendarMode === 'single' ? singleDate : endDate;
@@ -79,10 +89,52 @@ export const ReportsView: React.FC<ReportsViewProps> = ({ onSelectOrder }) => {
   // Load report when date selection changes
   useEffect(() => {
     fetchReport(effectiveStart, effectiveEnd);
+    if (calendarMode === 'single' || effectiveStart === effectiveEnd) {
+      fetchDayStatus(effectiveStart);
+    } else {
+      setDayStatus(null);
+    }
     return () => {
       if (pollIntervalRef.current) clearInterval(pollIntervalRef.current);
     };
-  }, [effectiveStart, effectiveEnd]);
+  }, [effectiveStart, effectiveEnd, calendarMode]);
+
+  async function fetchDayStatus(date: string) {
+    try {
+      const res = await fetch(`/api/reports/day-status?date=${date}`);
+      const data = await res.json();
+      if (data.success && data.dayStatus) {
+        setDayStatus(data.dayStatus);
+      }
+    } catch (err) {
+      console.error('Error fetching day status:', err);
+    }
+  }
+
+  async function handleDayAction(action: 'recheck' | 'complete_missing' | 'force_refetch' | 'sync_supabase') {
+    if (!effectiveStart) return;
+    if (action === 'force_refetch') {
+      const ok = window.confirm('هل تريد بالتأكيد إعادة جلب هذا اليوم بالكامل من Vendoor وتحديث الحركات؟');
+      if (!ok) return;
+    }
+    setDayActionLoading(true);
+    try {
+      const res = await fetch('/api/reports/day-action', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ date: effectiveStart, action }),
+      });
+      const data = await res.json();
+      if (data.success && data.dayStatus) {
+        setDayStatus(data.dayStatus);
+      }
+      await fetchReport(effectiveStart, effectiveEnd, action === 'force_refetch');
+    } catch (err) {
+      console.error('Error executing day action:', err);
+    } finally {
+      setDayActionLoading(false);
+    }
+  }
 
   async function fetchReport(s: string, e: string, forceFetch = false) {
     setLoading(true);
@@ -381,6 +433,16 @@ export const ReportsView: React.FC<ReportsViewProps> = ({ onSelectOrder }) => {
               <RefreshCw className={`w-4 h-4 text-amber-400 ${isFetchingLogs ? 'animate-spin' : ''}`} />
             </button>
 
+            {/* Batch Logs Import Button */}
+            <button
+              onClick={() => setShowImportModal(true)}
+              className="flex items-center gap-1.5 px-3 py-2 rounded-xl bg-amber-500/10 hover:bg-amber-500/20 text-amber-300 border border-amber-500/30 text-xs font-semibold transition"
+              title="استيراد لوجز Excel أو CSV متعددة الأيام"
+            >
+              <FileSpreadsheet className="w-4 h-4 text-amber-400" />
+              <span>استيراد لوجز (Excel / CSV)</span>
+            </button>
+
             {/* Copy Executive Summary */}
             <button
               onClick={handleCopySummary}
@@ -448,6 +510,149 @@ export const ReportsView: React.FC<ReportsViewProps> = ({ onSelectOrder }) => {
           </div>
         )}
       </div>
+
+      {/* Day Provenance & Resolution Status Banner */}
+      {dayStatus && (
+        <div className="bg-slate-900 border border-slate-800 rounded-2xl p-4 shadow-lg text-xs animate-in fade-in duration-300">
+          <div className="flex flex-col lg:flex-row lg:items-center justify-between gap-4">
+            {/* Title & Provenance Badges */}
+            <div className="flex flex-wrap items-center gap-3">
+              <div className="p-2 rounded-xl bg-slate-800 text-amber-400 border border-slate-700/60">
+                <Database className="w-5 h-5" />
+              </div>
+              <div>
+                <div className="flex flex-wrap items-center gap-2">
+                  <span className="font-bold text-slate-100 text-sm">سجل اليوم الموحد ({dayStatus.date})</span>
+
+                  {/* Data Source Badge */}
+                  <span
+                    className={`px-2.5 py-0.5 rounded-full text-[11px] font-sans font-medium border ${
+                      dayStatus.dataSource === 'EXCEL_IMPORT' || dayStatus.dataSource === 'CSV_IMPORT'
+                        ? 'bg-purple-500/10 text-purple-300 border-purple-500/30'
+                        : dayStatus.dataSource === 'SUPABASE_ARCHIVE'
+                        ? 'bg-sky-500/10 text-sky-300 border-sky-500/30'
+                        : dayStatus.dataSource === 'VENDOOR_FETCH'
+                        ? 'bg-amber-500/10 text-amber-300 border-amber-500/30'
+                        : 'bg-slate-800 text-slate-400 border-slate-700'
+                    }`}
+                  >
+                    {dayStatus.dataSource === 'EXCEL_IMPORT'
+                      ? 'ملف Excel مستورد'
+                      : dayStatus.dataSource === 'CSV_IMPORT'
+                      ? 'ملف CSV مستورد'
+                      : dayStatus.dataSource === 'SUPABASE_ARCHIVE'
+                      ? 'أرشيف Supabase البعيد'
+                      : dayStatus.dataSource === 'VENDOOR_FETCH'
+                      ? 'جلب Vendoor المباشر'
+                      : 'مصدر غير مسجل'}
+                  </span>
+
+                  {/* Completion Status Badge */}
+                  <span
+                    className={`px-2.5 py-0.5 rounded-full text-[11px] font-sans font-medium border ${
+                      dayStatus.completionStatus === 'COMPLETE'
+                        ? 'bg-emerald-500/10 text-emerald-400 border-emerald-500/30'
+                        : dayStatus.completionStatus === 'UNVERIFIED_SOURCE'
+                        ? 'bg-amber-500/10 text-amber-300 border-amber-500/30'
+                        : dayStatus.completionStatus === 'EMPTY_VERIFIED'
+                        ? 'bg-blue-500/10 text-blue-300 border-blue-500/30'
+                        : 'bg-rose-500/10 text-rose-300 border-rose-500/30'
+                    }`}
+                  >
+                    {dayStatus.completionStatus === 'COMPLETE'
+                      ? '✅ مكتمل وموثق'
+                      : dayStatus.completionStatus === 'UNVERIFIED_SOURCE'
+                      ? '⚠️ اكتمال المصدر غير مؤكد'
+                      : dayStatus.completionStatus === 'EMPTY_VERIFIED'
+                      ? 'ℹ️ يوم فارغ تم التحقق منه'
+                      : dayStatus.completionStatus === 'PARTIAL'
+                      ? '⚠️ تغطية جزئية'
+                      : '❌ غير مكتمل'}
+                  </span>
+                </div>
+                <p className="text-[11px] text-slate-400 mt-1 font-sans">
+                  {dayStatus.messageAr}
+                </p>
+              </div>
+            </div>
+
+            {/* Counts, Remote Status, and Explicit User Actions */}
+            <div className="flex flex-wrap items-center gap-2.5">
+              <div className="flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg bg-slate-950 border border-slate-800 font-mono text-xs">
+                <span className="text-slate-400">حركات خام:</span>
+                <span className="text-amber-300 font-bold">{dayStatus.rawRecordsCount.toLocaleString()}</span>
+              </div>
+              <div className="flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg bg-slate-950 border border-slate-800 font-mono text-xs">
+                <span className="text-slate-400">أحداث معيارية:</span>
+                <span className="text-emerald-400 font-bold">{dayStatus.canonicalEventsCount.toLocaleString()}</span>
+              </div>
+              <div className="flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg bg-slate-950 border border-slate-800 text-xs">
+                <span className="text-slate-400">Supabase:</span>
+                <span
+                  className={
+                    dayStatus.remoteArchiveStatus === 'REMOTE_VERIFIED'
+                      ? 'text-emerald-400 font-medium'
+                      : 'text-amber-400 font-medium'
+                  }
+                >
+                  {dayStatus.remoteArchiveStatus === 'REMOTE_VERIFIED'
+                    ? 'مؤرشف ومتحقق منه'
+                    : dayStatus.remoteArchiveStatus === 'PENDING_REMOTE'
+                    ? 'قيد المزامنة'
+                    : dayStatus.remoteArchiveStatus === 'REMOTE_FAILED'
+                    ? 'فشلت المزامنة'
+                    : 'محلي فقط'}
+                </span>
+              </div>
+
+              {/* Action buttons */}
+              <div className="flex items-center gap-1.5 mr-auto lg:mr-0">
+                {(dayStatus.completionStatus === 'PARTIAL' ||
+                  dayStatus.completionStatus === 'UNVERIFIED_SOURCE') && (
+                  <button
+                    onClick={() => handleDayAction('complete_missing')}
+                    disabled={dayActionLoading}
+                    className="flex items-center gap-1 px-2.5 py-1.5 rounded-lg bg-amber-500/10 hover:bg-amber-500/20 text-amber-300 border border-amber-500/30 text-xs font-semibold transition disabled:opacity-50"
+                    title="جلب الصفحات الناقصة فقط من Vendoor دون مسح البيانات الحالية"
+                  >
+                    <RefreshCw className={`w-3.5 h-3.5 ${dayActionLoading ? 'animate-spin' : ''}`} />
+                    <span>استكمال اليوم من Vendoor</span>
+                  </button>
+                )}
+
+                <button
+                  onClick={() => handleDayAction('recheck')}
+                  disabled={dayActionLoading}
+                  className="flex items-center gap-1 px-2.5 py-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-300 border border-slate-700 text-xs font-medium transition disabled:opacity-50"
+                  title="إعادة فحص حالة اليوم"
+                >
+                  <span>إعادة فحص</span>
+                </button>
+
+                {dayStatus.remoteArchiveStatus !== 'REMOTE_VERIFIED' && (
+                  <button
+                    onClick={() => handleDayAction('sync_supabase')}
+                    disabled={dayActionLoading}
+                    className="flex items-center gap-1 px-2.5 py-1.5 rounded-lg bg-sky-500/10 hover:bg-sky-500/20 text-sky-300 border border-sky-500/30 text-xs font-medium transition disabled:opacity-50"
+                    title="مزامنة بيانات اليوم إلى Supabase"
+                  >
+                    <span>مزامنة للأرشيف</span>
+                  </button>
+                )}
+
+                <button
+                  onClick={() => handleDayAction('force_refetch')}
+                  disabled={dayActionLoading}
+                  className="flex items-center gap-1 px-2.5 py-1.5 rounded-lg bg-rose-500/10 hover:bg-rose-500/20 text-rose-300 border border-rose-500/30 text-xs font-medium transition disabled:opacity-50"
+                  title="إعادة سحب اليوم كاملاً من Vendoor"
+                >
+                  <span>إعادة سحب كامل</span>
+                </button>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
 
       {/* 2. THE ANIMATED INFINITY LOADING INDICATOR (∞) */}
       {isFetchingLogs && (
@@ -1297,6 +1502,23 @@ export const ReportsView: React.FC<ReportsViewProps> = ({ onSelectOrder }) => {
         periodLabel={report?.periodLabel || `${effectiveStart} إلى ${effectiveEnd}`}
         reportData={report}
         onSelectOrder={onSelectOrder}
+      />
+
+      {/* 7. Batch Logs Import Modal (Multi-day Excel / CSV) */}
+      <BatchLogsImportModal
+        isOpen={showImportModal}
+        onClose={() => setShowImportModal(false)}
+        onImportSuccess={() => {
+          fetchReport(effectiveStart, effectiveEnd);
+          if (effectiveStart === effectiveEnd || calendarMode === 'single') {
+            fetchDayStatus(effectiveStart);
+          }
+        }}
+        onSelectDateForReport={(date) => {
+          setCalendarMode('single');
+          setSingleDate(date);
+          setActivePreset('custom');
+        }}
       />
     </div>
   );
