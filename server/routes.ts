@@ -1,4 +1,5 @@
 import { Router, type Request, type Response } from 'express';
+import { processAndDeduplicateTeamEvents } from './teamDeduplication.ts';
 import {
   db,
   DB_PATH,
@@ -36,6 +37,7 @@ import {
 import { applyMerchantCodeMappings } from './excelMerchantCodes.ts';
 import { getArchiveWorkerStatus, triggerArchivePass } from './supabaseArchiveWorker.ts';
 import { importBatchLogFiles } from './batchLogsImporter.ts';
+import { handleLogUploadChunk, getImportJob, getActiveOrRecentJob } from './importJobManager.ts';
 import { resolveHistoricalDay } from './historicalDayResolver.ts';
 
 export function isCSEmployee(actorName: string): boolean {
@@ -73,18 +75,21 @@ apiRouter.get('/dashboard/stats', (req: Request, res: Response) => {
     const dateInterval = getCairoDateInterval(targetDate);
 
     // 1. Status Counts:
-    // When isToday: live active population in database (reconciled in real-time with Vendoor)
-    // When historical date: counts strictly scoped to orders created on that target date to prevent data mixing
-    const statusCountsRaw: any[] = isToday
+    // Active workflow states (New, Pending, Processing, Canceling) reflect authoritative active population.
+    // Printed reflects orders confirmed/printed on targetDate (backed by Vendoor logs & transitions).
+    // Canceled reflects orders canceled on targetDate strictly from Vendoor logs.
+    const activeStatesRaw: any[] = isToday
       ? db.prepare(`
           SELECT current_status, COUNT(*) as count
           FROM orders
+          WHERE current_status IN ('New', 'Pending', 'Processing', 'Canceling')
           GROUP BY current_status
         `).all()
       : db.prepare(`
           SELECT current_status, COUNT(*) as count
           FROM orders
           WHERE created_at_source >= ? AND created_at_source < ?
+            AND current_status IN ('New', 'Pending', 'Processing', 'Canceling')
           GROUP BY current_status
         `).all(dateInterval.startCairo, dateInterval.endCairo);
 
@@ -97,11 +102,39 @@ apiRouter.get('/dashboard/stats', (req: Request, res: Response) => {
       Canceled: 0,
     };
 
-    for (const r of statusCountsRaw) {
+    for (const r of activeStatesRaw) {
       if (r.current_status in currentCounts) {
         (currentCounts as any)[r.current_status] = r.count;
       }
     }
+
+    // Authoritative Printed Count for targetDate (distinct orders confirmed on that date)
+    const printedForDateCount = (db.prepare(`
+      SELECT COUNT(DISTINCT o_id) as count FROM (
+        SELECT c.order_code as o_id
+        FROM canonical_activity_events c
+        WHERE c.event_timestamp >= ? AND c.event_timestamp < ?
+          AND (c.to_status = 'Printed' OR c.action_type = 'confirmation')
+          AND c.order_code IS NOT NULL AND c.order_code != ''
+        UNION
+        SELECT o.random_number as o_id
+        FROM orders o
+        WHERE o.printed_date >= ? AND o.printed_date < ?
+          AND o.current_status = 'Printed'
+      )
+    `).get(dateInterval.startCairo, dateInterval.endCairo, dateInterval.startCairo, dateInterval.endCairo) as any)?.count || 0;
+
+    // Authoritative Canceled Count for targetDate (strictly from verified Vendoor logs)
+    const canceledForDateCount = (db.prepare(`
+      SELECT COUNT(DISTINCT c.order_code) as count
+      FROM canonical_activity_events c
+      WHERE c.event_timestamp >= ? AND c.event_timestamp < ?
+        AND (c.to_status = 'Canceled' OR c.action_type = 'order_canceled')
+        AND c.order_code IS NOT NULL AND c.order_code != ''
+    `).get(dateInterval.startCairo, dateInterval.endCairo) as any)?.count || 0;
+
+    currentCounts.Printed = printedForDateCount;
+    currentCounts.Canceled = canceledForDateCount;
 
     const dayTransitions: any[] = db.prepare(`
       SELECT to_status, COUNT(*) as count
@@ -112,11 +145,11 @@ apiRouter.get('/dashboard/stats', (req: Request, res: Response) => {
 
     const todayActivity = {
       Created: 0,
-      Printed: 0,
+      Printed: printedForDateCount,
       Pending: 0,
       Processing: 0,
       Canceling: 0,
-      Canceled: 0,
+      Canceled: canceledForDateCount,
     };
 
     const createdOnDate = (db.prepare(`
@@ -127,11 +160,9 @@ apiRouter.get('/dashboard/stats', (req: Request, res: Response) => {
     todayActivity.Created = createdOnDate;
 
     for (const t of dayTransitions) {
-      if (t.to_status === 'Printed') todayActivity.Printed = t.count;
-      else if (t.to_status === 'Pending') todayActivity.Pending = t.count;
+      if (t.to_status === 'Pending') todayActivity.Pending = t.count;
       else if (t.to_status === 'Processing') todayActivity.Processing = t.count;
       else if (t.to_status === 'Canceling') todayActivity.Canceling = t.count;
-      else if (t.to_status === 'Canceled') todayActivity.Canceled = t.count;
     }
 
     // 3. Confirmation Age counts
@@ -307,12 +338,28 @@ apiRouter.get('/orders', (req: Request, res: Response) => {
     if (startDate && endDate) {
       const sInterval = getCairoDateInterval(startDate as string);
       const eInterval = getCairoDateInterval(endDate as string);
-      conditions.push('created_at_source >= ? AND created_at_source < ?');
-      params.push(sInterval.startCairo, eInterval.endCairo);
+      if (status === 'Printed') {
+        conditions.push(`((printed_date >= ? AND printed_date < ?) OR EXISTS (SELECT 1 FROM canonical_activity_events c WHERE (c.order_code = orders.random_number OR c.order_id = orders.id) AND c.event_timestamp >= ? AND c.event_timestamp < ? AND c.to_status = 'Printed'))`);
+        params.push(sInterval.startCairo, eInterval.endCairo, sInterval.startCairo, eInterval.endCairo);
+      } else if (status === 'Canceled') {
+        conditions.push(`((canceling_date >= ? AND canceling_date < ?) OR EXISTS (SELECT 1 FROM canonical_activity_events c WHERE (c.order_code = orders.random_number OR c.order_id = orders.id) AND c.event_timestamp >= ? AND c.event_timestamp < ? AND c.to_status = 'Canceled'))`);
+        params.push(sInterval.startCairo, eInterval.endCairo, sInterval.startCairo, eInterval.endCairo);
+      } else {
+        conditions.push('created_at_source >= ? AND created_at_source < ?');
+        params.push(sInterval.startCairo, eInterval.endCairo);
+      }
     } else if (date) {
       const interval = getCairoDateInterval(date as string);
-      conditions.push('created_at_source >= ? AND created_at_source < ?');
-      params.push(interval.startCairo, interval.endCairo);
+      if (status === 'Printed') {
+        conditions.push(`((printed_date >= ? AND printed_date < ?) OR EXISTS (SELECT 1 FROM canonical_activity_events c WHERE (c.order_code = orders.random_number OR c.order_id = orders.id) AND c.event_timestamp >= ? AND c.event_timestamp < ? AND c.to_status = 'Printed'))`);
+        params.push(interval.startCairo, interval.endCairo, interval.startCairo, interval.endCairo);
+      } else if (status === 'Canceled') {
+        conditions.push(`((canceling_date >= ? AND canceling_date < ?) OR EXISTS (SELECT 1 FROM canonical_activity_events c WHERE (c.order_code = orders.random_number OR c.order_id = orders.id) AND c.event_timestamp >= ? AND c.event_timestamp < ? AND c.to_status = 'Canceled'))`);
+        params.push(interval.startCairo, interval.endCairo, interval.startCairo, interval.endCairo);
+      } else {
+        conditions.push('created_at_source >= ? AND created_at_source < ?');
+        params.push(interval.startCairo, interval.endCairo);
+      }
     }
 
     if (multiMerchant === '1') {
@@ -474,34 +521,119 @@ apiRouter.get('/orders/:code', (req: Request, res: Response) => {
   }
 });
 
-// 5. Printed View
+// 5. Printed View (Scoped to date, backed by Vendoor logs & transitions)
 apiRouter.get('/printed', (req: Request, res: Response) => {
   try {
-    const { category = 'all' } = req.query;
+    const { category = 'all', date } = req.query;
+    const cairoToday = getCairoDateString();
+    const targetDate = typeof date === 'string' && date.trim() ? date.trim().slice(0, 10) : cairoToday;
+    const interval = getCairoDateInterval(targetDate);
 
-    let whereCondition = "current_status = 'Printed'";
+    let categorySql = '';
     if (category === 'no_extra_phone') {
-      whereCondition += " AND extra_phone_status = 'CONFIRMED_ABSENT'";
+      categorySql = " AND o.extra_phone_status = 'CONFIRMED_ABSENT'";
     } else if (category === 'multi_merchant') {
-      whereCondition += ' AND multi_merchant_flag = 1';
+      categorySql = ' AND o.multi_merchant_flag = 1';
     } else if (category === 'low_delivery') {
-      whereCondition += ' AND delivery_rate IS NOT NULL AND delivery_rate < 70';
+      categorySql = ' AND o.delivery_rate IS NOT NULL AND o.delivery_rate < 70';
     }
 
+    // Query orders that transitioned to Printed on targetDate (from log events or printed_date)
     const orders: any[] = db.prepare(`
       SELECT
-        id, vendoor_id, random_number, order_no, customer_name,
-        customer_phone, customer_phone_extra, extra_phone_valid, extra_phone_status,
-        governorate, address, total_order, printed_date,
-        distinct_merchant_count, multi_merchant_flag, delivery_rate,
-        delivery_rate_num, delivery_rate_denom, confirmation_age_category,
-        address_quality_status, last_observed_at
-      FROM orders
-      WHERE ${whereCondition}
-      ORDER BY id DESC
-    `).all();
+        o.id, o.vendoor_id, o.random_number, o.order_no, o.order_type, o.current_status,
+        o.customer_name, o.customer_phone, o.customer_phone_extra, o.extra_phone_valid, o.extra_phone_status,
+        o.governorate, o.address, o.total_order, o.total_price, o.shipping_cost,
+        COALESCE(c.event_timestamp, o.printed_date, o.state_entry_at) as printed_date,
+        COALESCE(c.actor_name, 'النظام') as printed_by,
+        CASE WHEN c.id IS NOT NULL THEN 'MATCHED' ELSE 'PENDING_LOG_MATCH' END as log_match_status,
+        o.distinct_merchant_count, o.multi_merchant_flag, o.delivery_rate,
+        o.delivery_rate_num, o.delivery_rate_denom, o.confirmation_age_category,
+        o.address_quality_status, o.last_observed_at
+      FROM orders o
+      LEFT JOIN (
+        SELECT order_code, actor_name, event_timestamp, id
+        FROM canonical_activity_events
+        WHERE event_timestamp >= ? AND event_timestamp < ?
+          AND (to_status = 'Printed' OR action_type = 'confirmation')
+        GROUP BY order_code
+      ) c ON c.order_code = o.random_number OR c.order_code = o.order_no OR c.order_code = CAST(o.vendoor_id AS TEXT)
+      WHERE (c.id IS NOT NULL OR (o.printed_date >= ? AND o.printed_date < ?))
+        ${categorySql}
+      ORDER BY printed_date DESC, o.id DESC
+    `).all(interval.startCairo, interval.endCairo, interval.startCairo, interval.endCairo);
 
-    res.json({ orders, total: orders.length });
+    // Enrich with associated warehouse names and codes
+    const orderIds = orders.map(o => o.id);
+    const warehouseCodeMap: Record<number, string[]> = {};
+    const warehouseNameMap: Record<number, string[]> = {};
+    if (orderIds.length > 0) {
+      try {
+        const placeholders = orderIds.map(() => '?').join(',');
+        const itemRows: any[] = db.prepare(`
+          SELECT order_id, warehouse_name, warehouse_code
+          FROM order_items
+          WHERE order_id IN (${placeholders})
+        `).all(...orderIds);
+        for (const row of itemRows) {
+          if (!warehouseCodeMap[row.order_id]) warehouseCodeMap[row.order_id] = [];
+          if (!warehouseNameMap[row.order_id]) warehouseNameMap[row.order_id] = [];
+          if (row.warehouse_code && !warehouseCodeMap[row.order_id].includes(row.warehouse_code)) {
+            warehouseCodeMap[row.order_id].push(row.warehouse_code);
+          }
+          if (row.warehouse_name && !warehouseNameMap[row.order_id].includes(row.warehouse_name)) {
+            warehouseNameMap[row.order_id].push(row.warehouse_name);
+          }
+        }
+      } catch {}
+    }
+
+    const enrichedOrders = orders.map(o => ({
+      ...o,
+      warehouseCodes: warehouseCodeMap[o.id] || [],
+      warehouseNames: warehouseNameMap[o.id] || [],
+    }));
+
+    res.json({
+      date: targetDate,
+      orders: enrichedOrders,
+      total: enrichedOrders.length,
+    });
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// 5b. Canceled Orders View (Strictly derived from Vendoor activity logs for target date)
+apiRouter.get('/canceled', (req: Request, res: Response) => {
+  try {
+    const { date } = req.query;
+    const cairoToday = getCairoDateString();
+    const targetDate = typeof date === 'string' && date.trim() ? date.trim().slice(0, 10) : cairoToday;
+    const interval = getCairoDateInterval(targetDate);
+
+    const logs: any[] = db.prepare(`
+      SELECT 
+        c.id, c.order_code, c.actor_name as canceled_by, c.event_timestamp as canceled_at,
+        c.action_type, c.from_status, c.to_status, c.field_name, c.old_value, c.new_value,
+        c.order_match_status,
+        COALESCE(r.raw_action_text, '') as raw_action_text,
+        o.id as order_id, o.random_number, o.order_no, o.current_status as order_current_status,
+        o.customer_name, o.customer_phone, o.governorate, o.address, o.total_order, o.delivery_rate
+      FROM canonical_activity_events c
+      LEFT JOIN raw_activity_events r ON c.raw_event_id = r.id
+      LEFT JOIN orders o ON c.order_id = o.id OR c.order_code = o.random_number OR c.order_code = o.order_no OR c.order_code = CAST(o.vendoor_id AS TEXT)
+      WHERE c.event_timestamp >= ? AND c.event_timestamp < ?
+        AND (c.to_status = 'Canceled' OR c.action_type = 'order_canceled')
+      GROUP BY COALESCE(c.order_code, c.id)
+      ORDER BY c.event_timestamp DESC
+    `).all(interval.startCairo, interval.endCairo);
+
+    res.json({
+      date: targetDate,
+      total: logs.length,
+      orders: logs,
+    });
   } catch (err: any) {
     res.status(500).json({ error: err.message });
   }
@@ -580,7 +712,7 @@ apiRouter.get('/team', async (req: Request, res: Response) => {
     if (effectiveDate) {
       dateLabel = effectiveDate;
       const interval = getCairoDateInterval(effectiveDate);
-      conditions.push('event_timestamp >= ? AND event_timestamp < ?');
+      conditions.push('c.event_timestamp >= ? AND c.event_timestamp < ?');
       params.push(interval.startCairo, interval.endCairo);
       if (syncIfMissing === '1') {
         await syncEngine.syncHistoricalDate('logs', effectiveDate);
@@ -589,13 +721,13 @@ apiRouter.get('/team', async (req: Request, res: Response) => {
       if (startDate === endDate) {
         dateLabel = String(startDate);
         const interval = getCairoDateInterval(String(startDate));
-        conditions.push('event_timestamp >= ? AND event_timestamp < ?');
+        conditions.push('c.event_timestamp >= ? AND c.event_timestamp < ?');
         params.push(interval.startCairo, interval.endCairo);
       } else {
         dateLabel = `${startDate} إلى ${endDate}`;
         const startInt = getCairoDateInterval(String(startDate));
         const endInt = getCairoDateInterval(String(endDate));
-        conditions.push('event_timestamp >= ? AND event_timestamp < ?');
+        conditions.push('c.event_timestamp >= ? AND c.event_timestamp < ?');
         params.push(startInt.startCairo, endInt.endCairo);
       }
     } else if (period === 'yesterday') {
@@ -604,7 +736,7 @@ apiRouter.get('/team', async (req: Request, res: Response) => {
       const yStr = getCairoDateString(y);
       dateLabel = yStr;
       const interval = getCairoDateInterval(yStr);
-      conditions.push('event_timestamp >= ? AND event_timestamp < ?');
+      conditions.push('c.event_timestamp >= ? AND c.event_timestamp < ?');
       params.push(interval.startCairo, interval.endCairo);
     } else if (period === 'all') {
       dateLabel = 'كل الفترات';
@@ -612,23 +744,59 @@ apiRouter.get('/team', async (req: Request, res: Response) => {
       const todayStr = getCairoDateString();
       dateLabel = todayStr;
       const interval = getCairoDateInterval(todayStr);
-      conditions.push('event_timestamp >= ? AND event_timestamp < ?');
+      conditions.push('c.event_timestamp >= ? AND c.event_timestamp < ?');
       params.push(interval.startCairo, interval.endCairo);
     }
 
-    conditions.push('is_system_actor = 0');
+    conditions.push('c.is_system_actor = 0');
     const whereClause = `WHERE ${conditions.join(' AND ')}`;
 
-    const events: any[] = db.prepare(`
+    const rawEvents: any[] = db.prepare(`
       SELECT
-        actor_name,
-        action_type,
-        to_status,
-        order_code,
-        event_timestamp
-      FROM canonical_activity_events
+        c.id,
+        c.actor_name,
+        c.action_type,
+        c.from_status,
+        c.to_status,
+        c.order_code,
+        c.event_timestamp,
+        c.is_system_actor,
+        c.raw_event_id,
+        COALESCE(r.raw_action_text, '') as raw_action_text
+      FROM canonical_activity_events c
+      LEFT JOIN raw_activity_events r ON c.raw_event_id = r.id
       ${whereClause}
+      ORDER BY c.event_timestamp ASC, c.id ASC
     `).all(...params);
+
+    // Condition 1 & 4: Seed prior statuses for orders before this period to avoid double-counting on boundaries
+    const priorStatusMap = new Map<string, string>();
+    const orderCodes = Array.from(new Set(rawEvents.map((e: any) => e.order_code).filter(Boolean)));
+    if (orderCodes.length > 0 && params.length >= 1) {
+      const minTimestamp = params[0];
+      const chunkSize = 200;
+      for (let i = 0; i < orderCodes.length; i += chunkSize) {
+        const slice = orderCodes.slice(i, i + chunkSize);
+        const placeholders = slice.map(() => '?').join(',');
+        const priors = db.prepare(`
+          SELECT order_code, to_status
+          FROM canonical_activity_events
+          WHERE order_code IN (${placeholders})
+            AND event_timestamp < ?
+            AND action_type = 'status_change'
+            AND to_status IS NOT NULL
+          ORDER BY event_timestamp DESC, id DESC
+        `).all(...slice, minTimestamp);
+        for (const p of priors as any[]) {
+          const k = p.order_code?.toLowerCase();
+          if (k && !priorStatusMap.has(k)) {
+            priorStatusMap.set(k, p.to_status);
+          }
+        }
+      }
+    }
+
+    const annotatedEvents = processAndDeduplicateTeamEvents(rawEvents as any, priorStatusMap);
 
     const userOrdersMap: Record<string, Set<string>> = {};
     const userStats: Record<string, {
@@ -640,10 +808,12 @@ apiRouter.get('/team', async (req: Request, res: Response) => {
       processing: number;
       cancel: number;
       other: number;
+      rawEventsCount: number;
+      duplicateEventsCount: number;
       lastActionAt: string | null;
     }> = {};
 
-    for (const e of events) {
+    for (const e of annotatedEvents) {
       const name = e.actor_name || 'غير معروف';
       if (!userStats[name]) {
         userStats[name] = {
@@ -655,12 +825,14 @@ apiRouter.get('/team', async (req: Request, res: Response) => {
           processing: 0,
           cancel: 0,
           other: 0,
+          rawEventsCount: 0,
+          duplicateEventsCount: 0,
           lastActionAt: null,
         };
         userOrdersMap[name] = new Set();
       }
 
-      userStats[name].actions++;
+      userStats[name].rawEventsCount++;
       if (e.order_code) {
         userOrdersMap[name].add(e.order_code);
       }
@@ -668,6 +840,13 @@ apiRouter.get('/team', async (req: Request, res: Response) => {
         userStats[name].lastActionAt = e.event_timestamp;
       }
 
+      // Condition 6: Count each actual status transition once in the total actions and status metrics
+      if (!e.is_counted) {
+        userStats[name].duplicateEventsCount++;
+        continue;
+      }
+
+      userStats[name].actions++;
       if (e.action_type === 'status_change') {
         if (e.to_status === 'Printed') userStats[name].printed++;
         else if (e.to_status === 'Pending') userStats[name].pending++;
@@ -697,8 +876,10 @@ apiRouter.get('/team', async (req: Request, res: Response) => {
     const teamList = isCsOnly ? csTeamList : allMembers;
     const csActionsTotal = csTeamList.reduce((acc, m) => acc + m.actions, 0);
     const csUniqueOrdersTotal = new Set(
-      events.filter(e => isCSEmployee(e.actor_name || '')).map(e => e.order_code).filter(Boolean)
+      annotatedEvents.filter(e => isCSEmployee(e.actor_name || '') && e.is_counted).map(e => e.order_code).filter(Boolean)
     ).size;
+
+    const countedEventsList = annotatedEvents.filter(e => e.is_counted);
 
     res.json({
       period: period || (date ? 'custom_date' : (startDate ? 'custom_range' : 'today')),
@@ -709,52 +890,58 @@ apiRouter.get('/team', async (req: Request, res: Response) => {
       nonCsStaffCount: nonCsStaff.length,
       csActionsTotal,
       csUniqueOrdersTotal,
-      totalActions: events.length,
-      totalUniqueOrders: new Set(events.map(e => e.order_code).filter(Boolean)).size,
+      totalActions: countedEventsList.length,
+      totalRawEvents: annotatedEvents.length,
+      totalDuplicatesExcluded: annotatedEvents.filter(e => e.is_duplicate_transition).length,
+      totalUniqueOrders: new Set(annotatedEvents.map(e => e.order_code).filter(Boolean)).size,
     });
   } catch (err: any) {
     res.status(500).json({ error: err.message });
   }
 });
 
-// 9. Employee Drill-down with period support
+// 9. Employee Drill-down with period support & transition deduplication annotations
 apiRouter.get('/team/:actorName/events', (req: Request, res: Response) => {
   try {
     const actorName = req.params.actorName;
     const { date, startDate, endDate, period } = req.query;
-    const conditions: string[] = ['c.actor_name = ?'];
-    const params: any[] = [actorName];
+    const dateConditions: string[] = [];
+    const dateParams: any[] = [];
 
     if (date && typeof date === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(date.trim())) {
       const interval = getCairoDateInterval(date.trim());
-      conditions.push('c.event_timestamp >= ? AND c.event_timestamp < ?');
-      params.push(interval.startCairo, interval.endCairo);
+      dateConditions.push('c.event_timestamp >= ? AND c.event_timestamp < ?');
+      dateParams.push(interval.startCairo, interval.endCairo);
     } else if (startDate && endDate) {
       if (startDate === endDate) {
         const interval = getCairoDateInterval(String(startDate));
-        conditions.push('c.event_timestamp >= ? AND c.event_timestamp < ?');
-        params.push(interval.startCairo, interval.endCairo);
+        dateConditions.push('c.event_timestamp >= ? AND c.event_timestamp < ?');
+        dateParams.push(interval.startCairo, interval.endCairo);
       } else {
         const startInt = getCairoDateInterval(String(startDate));
         const endInt = getCairoDateInterval(String(endDate));
-        conditions.push('c.event_timestamp >= ? AND c.event_timestamp < ?');
-        params.push(startInt.startCairo, endInt.endCairo);
+        dateConditions.push('c.event_timestamp >= ? AND c.event_timestamp < ?');
+        dateParams.push(startInt.startCairo, endInt.endCairo);
       }
     } else if (period === 'yesterday') {
       const now = new Date();
       const y = new Date(now.getTime() - 24 * 60 * 60 * 1000);
       const yStr = getCairoDateString(y);
       const interval = getCairoDateInterval(yStr);
-      conditions.push('c.event_timestamp >= ? AND c.event_timestamp < ?');
-      params.push(interval.startCairo, interval.endCairo);
+      dateConditions.push('c.event_timestamp >= ? AND c.event_timestamp < ?');
+      dateParams.push(interval.startCairo, interval.endCairo);
     } else if (period === 'today') {
       const todayStr = getCairoDateString();
       const interval = getCairoDateInterval(todayStr);
-      conditions.push('c.event_timestamp >= ? AND c.event_timestamp < ?');
-      params.push(interval.startCairo, interval.endCairo);
+      dateConditions.push('c.event_timestamp >= ? AND c.event_timestamp < ?');
+      dateParams.push(interval.startCairo, interval.endCairo);
     }
 
-    const events: any[] = db.prepare(`
+    // Condition 1 & 5: Retrieve events for the actor, and calculate deduplication across the orders touched
+    const actorQueryConditions = [...dateConditions, 'c.actor_name = ?'];
+    const actorQueryParams = [...dateParams, actorName];
+
+    const rawActorEvents: any[] = db.prepare(`
       SELECT 
         c.*, 
         COALESCE(r.raw_action_text, '') as raw_action_text,
@@ -770,12 +957,72 @@ apiRouter.get('/team/:actorName/events', (req: Request, res: Response) => {
       FROM canonical_activity_events c
       LEFT JOIN raw_activity_events r ON c.raw_event_id = r.id
       LEFT JOIN orders o ON c.order_id = o.id
-      WHERE ${conditions.join(' AND ')}
-      ORDER BY c.event_timestamp DESC, c.id DESC
-      LIMIT 250
-    `).all(...params);
+      WHERE ${actorQueryConditions.join(' AND ')}
+      ORDER BY c.event_timestamp ASC, c.id ASC
+    `).all(...actorQueryParams);
 
-    res.json({ actorName, events });
+    // Get all orders touched by this actor in this window
+    const touchedCodes = Array.from(new Set(rawActorEvents.map((e: any) => e.order_code).filter(Boolean)));
+    let allOrderEvents: any[] = rawActorEvents;
+
+    if (touchedCodes.length > 0) {
+      const placeholders = touchedCodes.map(() => '?').join(',');
+      const fullOrderEvents = db.prepare(`
+        SELECT 
+          c.*, 
+          COALESCE(r.raw_action_text, '') as raw_action_text,
+          r.observed_at as imported_at,
+          r.source_hash,
+          o.order_no,
+          o.current_status as order_current_status,
+          o.customer_name,
+          o.customer_phone,
+          o.governorate,
+          o.total_order,
+          o.distinct_merchant_count
+        FROM canonical_activity_events c
+        LEFT JOIN raw_activity_events r ON c.raw_event_id = r.id
+        LEFT JOIN orders o ON c.order_id = o.id
+        WHERE c.order_code IN (${placeholders})
+          ${dateConditions.length > 0 ? `AND ${dateConditions.join(' AND ')}` : ''}
+        ORDER BY c.event_timestamp ASC, c.id ASC
+      `).all(...touchedCodes, ...dateParams);
+      allOrderEvents = fullOrderEvents;
+    }
+
+    const annotatedAll = processAndDeduplicateTeamEvents(allOrderEvents as any);
+    const annotatedMap = new Map<number, any>();
+    for (const a of annotatedAll) {
+      annotatedMap.set(a.id, a);
+    }
+
+    // Condition 2, 6, 8: Return all original log rows for audit, annotated with is_counted and duplicate status
+    const finalEvents = rawActorEvents.map((ev: any) => {
+      const ann = annotatedMap.get(ev.id);
+      return {
+        ...ev,
+        is_counted: ann ? ann.is_counted : true,
+        is_duplicate_transition: ann ? ann.is_duplicate_transition : false,
+        exclusion_reason: ann ? ann.exclusion_reason : null,
+      };
+    }).sort((a, b) => {
+      if (b.event_timestamp !== a.event_timestamp) {
+        return b.event_timestamp.localeCompare(a.event_timestamp);
+      }
+      return (b.id || 0) - (a.id || 0);
+    });
+
+    const totalEvents = finalEvents.length;
+    const countedTransitions = finalEvents.filter(e => e.is_counted).length;
+    const duplicateEventsCount = finalEvents.filter(e => e.is_duplicate_transition).length;
+
+    res.json({
+      actorName,
+      totalEvents,
+      countedTransitions,
+      duplicateEventsCount,
+      events: finalEvents.slice(0, 300),
+    });
   } catch (err: any) {
     res.status(500).json({ error: err.message });
   }
@@ -987,7 +1234,61 @@ apiRouter.post('/reports/day-action', async (req: Request, res: Response) => {
   }
 });
 
-// Batch Logs Ingestion: Multi-day Excel & CSV logs upload with automatic date discovery
+// Chunked File Upload for Large Log Files (streaming, bounded memory, bypasses JSON body limit)
+apiRouter.post('/logs/upload-chunk', async (req: Request, res: Response) => {
+  try {
+    const uploadId = (req.headers['x-upload-id'] as string) || '';
+    const chunkIndex = parseInt((req.headers['x-chunk-index'] as string) || '0', 10);
+    const totalChunks = parseInt((req.headers['x-total-chunks'] as string) || '1', 10);
+    const fileName = decodeURIComponent((req.headers['x-file-name'] as string) || 'logs.xlsx');
+    const fileSize = parseInt((req.headers['x-file-size'] as string) || '0', 10);
+
+    if (!uploadId) {
+      res.status(400).json({ success: false, error: 'x-upload-id header is required' });
+      return;
+    }
+
+    const chunkBuffer = Buffer.isBuffer(req.body)
+      ? req.body
+      : Buffer.from(req.body || '');
+
+    if (chunkBuffer.length === 0) {
+      res.status(400).json({ success: false, error: 'Chunk buffer is empty' });
+      return;
+    }
+
+    const result = await handleLogUploadChunk({
+      uploadId,
+      chunkIndex,
+      totalChunks,
+      fileName,
+      fileSize,
+      chunkBuffer,
+    });
+
+    res.json({ success: true, ...result });
+  } catch (err: any) {
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// Poll active or recent import job
+apiRouter.get('/logs/import-job/active', (_req: Request, res: Response) => {
+  const job = getActiveOrRecentJob();
+  res.json({ success: true, job });
+});
+
+// Poll specific import job by ID
+apiRouter.get('/logs/import-job/:id', (req: Request, res: Response) => {
+  const job = getImportJob(req.params.id);
+  if (!job) {
+    res.status(404).json({ success: false, error: 'Job not found' });
+    return;
+  }
+  res.json({ success: true, job });
+});
+
+// Batch Logs Ingestion: Direct Multi-day Excel & CSV logs upload with automatic date discovery
 apiRouter.post('/logs/import-batch', async (req: Request, res: Response) => {
   try {
     const { files } = req.body;
@@ -997,7 +1298,8 @@ apiRouter.post('/logs/import-batch', async (req: Request, res: Response) => {
     }
 
     const result = await importBatchLogFiles(files);
-    res.json({ success: true, result });
+    // Explicitly convey genuine result status; do NOT fabricate success: true
+    res.json({ success: result.success, result });
   } catch (err: any) {
     res.status(500).json({ success: false, error: err.message });
   }

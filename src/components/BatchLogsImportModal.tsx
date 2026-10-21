@@ -32,6 +32,8 @@ export const BatchLogsImportModal: React.FC<BatchLogsImportModalProps> = ({
   const [selectedFiles, setSelectedFiles] = useState<File[]>([]);
   const [isUploading, setIsUploading] = useState(false);
   const [uploadProgress, setUploadProgress] = useState<string>('');
+  const [progressPercent, setProgressPercent] = useState<number>(0);
+  const [liveStats, setLiveStats] = useState<{ rowsRead: number; datesDiscovered: number; savedCount: number } | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [result, setResult] = useState<BatchImportResult | null>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
@@ -43,6 +45,8 @@ export const BatchLogsImportModal: React.FC<BatchLogsImportModalProps> = ({
       setSelectedFiles(Array.from(e.target.files));
       setError(null);
       setResult(null);
+      setProgressPercent(0);
+      setLiveStats(null);
     }
   }
 
@@ -52,6 +56,8 @@ export const BatchLogsImportModal: React.FC<BatchLogsImportModalProps> = ({
       setSelectedFiles(Array.from(e.dataTransfer.files));
       setError(null);
       setResult(null);
+      setProgressPercent(0);
+      setLiveStats(null);
     }
   }
 
@@ -60,12 +66,90 @@ export const BatchLogsImportModal: React.FC<BatchLogsImportModalProps> = ({
       const reader = new FileReader();
       reader.onload = () => {
         const res = reader.result as string;
-        // Strip data URL prefix
         const base64 = res.split(',')[1] || res;
         resolve(base64);
       };
       reader.onerror = (err) => reject(err);
       reader.readAsDataURL(file);
+    });
+  }
+
+  async function uploadChunkedFile(file: File): Promise<BatchImportResult> {
+    const CHUNK_SIZE = 2 * 1024 * 1024; // 2 MB
+    const totalChunks = Math.max(1, Math.ceil(file.size / CHUNK_SIZE));
+    const uploadId = `up_${Date.now()}_${Math.random().toString(36).substring(2, 9)}`;
+
+    for (let chunkIdx = 0; chunkIdx < totalChunks; chunkIdx++) {
+      const start = chunkIdx * CHUNK_SIZE;
+      const end = Math.min(file.size, start + CHUNK_SIZE);
+      const chunkBlob = file.slice(start, end);
+      const chunkArrayBuffer = await chunkBlob.arrayBuffer();
+
+      const pct = Math.round(((chunkIdx + 1) / totalChunks) * 45); // first 45% is upload
+      setProgressPercent(pct);
+      setUploadProgress(`جاري رفع الملف المجزأ (${chunkIdx + 1}/${totalChunks}) — ${(file.size / (1024 * 1024)).toFixed(1)}MB...`);
+
+      const res = await fetch('/api/logs/upload-chunk', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/octet-stream',
+          'x-upload-id': uploadId,
+          'x-chunk-index': String(chunkIdx),
+          'x-total-chunks': String(totalChunks),
+          'x-file-name': encodeURIComponent(file.name),
+          'x-file-size': String(file.size),
+        },
+        body: chunkArrayBuffer,
+      });
+
+      if (!res.ok) {
+        const errJson = await res.json().catch(() => ({}));
+        throw new Error(errJson.error || `فشل رفع الجزء ${chunkIdx + 1}`);
+      }
+    }
+
+    // Polling job progress
+    setUploadProgress('تم رفع الملف بنجاح، جاري قراءة الحركات وتحليل التواريخ...');
+    setProgressPercent(50);
+
+    return new Promise<BatchImportResult>((resolve, reject) => {
+      const intervalTimer = setInterval(async () => {
+        try {
+          const pollRes = await fetch(`/api/logs/import-job/${uploadId}`);
+          if (!pollRes.ok) return;
+          const pollData = await pollRes.json();
+          if (!pollData.success || !pollData.job) return;
+
+          const job = pollData.job;
+          setUploadProgress(job.stageLabelAr || 'جاري معالجة الحركات...');
+          if (job.rowsRead > 0) {
+            setLiveStats({
+              rowsRead: job.rowsRead,
+              datesDiscovered: job.discoveredDatesCount || 0,
+              savedCount: job.savedCount || 0,
+            });
+          }
+
+          if (job.status === 'PARSING') {
+            setProgressPercent(60);
+          } else if (job.status === 'SAVING_RECORDS') {
+            setProgressPercent(80);
+          } else if (job.status === 'COMPLETED') {
+            clearInterval(intervalTimer);
+            setProgressPercent(100);
+            if (job.result) {
+              resolve(job.result);
+            } else {
+              reject(new Error('اكتملت المهمة دون إرجاع نتيجة'));
+            }
+          } else if (job.status === 'FAILED') {
+            clearInterval(intervalTimer);
+            reject(new Error(job.errorMessage || 'فشلت معالجة الملف'));
+          }
+        } catch (e: any) {
+          // ignore transient poll errors
+        }
+      }, 1000);
     });
   }
 
@@ -78,36 +162,51 @@ export const BatchLogsImportModal: React.FC<BatchLogsImportModalProps> = ({
     setIsUploading(true);
     setError(null);
     setResult(null);
+    setProgressPercent(5);
+    setLiveStats(null);
     setUploadProgress('جاري تحضير الملفات وقراءتها...');
 
     try {
-      const payloadFiles: Array<{ fileName: string; base64: string }> = [];
+      // If single file or large file (> 2.5 MB), use chunked uploader with live polling
+      const isAnyLarge = selectedFiles.some(f => f.size > 2.5 * 1024 * 1024);
+      if (selectedFiles.length === 1 || isAnyLarge) {
+        let finalResult: BatchImportResult | null = null;
+        for (let i = 0; i < selectedFiles.length; i++) {
+          const f = selectedFiles[i];
+          finalResult = await uploadChunkedFile(f);
+        }
+        if (finalResult) {
+          setResult(finalResult);
+          onImportSuccess?.(finalResult);
+        }
+      } else {
+        // Direct batch upload for small files
+        const payloadFiles: Array<{ fileName: string; base64: string }> = [];
+        for (let i = 0; i < selectedFiles.length; i++) {
+          const f = selectedFiles[i];
+          setUploadProgress(`جاري قراءة ${f.name} (${i + 1}/${selectedFiles.length})...`);
+          const base64 = await fileToBase64(f);
+          payloadFiles.push({ fileName: f.name, base64 });
+        }
 
-      for (let i = 0; i < selectedFiles.length; i++) {
-        const f = selectedFiles[i];
-        setUploadProgress(`جاري قراءة ${f.name} (${i + 1}/${selectedFiles.length})...`);
-        const base64 = await fileToBase64(f);
-        payloadFiles.push({
-          fileName: f.name,
-          base64,
+        setUploadProgress('جاري إرسال البيانات وتقسيم الأيام وحفظها في SQLite...');
+        setProgressPercent(60);
+
+        const res = await fetch('/api/logs/import-batch', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ files: payloadFiles }),
         });
+
+        const data = await res.json();
+        if (!res.ok || !data.success) {
+          throw new Error(data.error || data.result?.statusMessageAr || 'فشل استيراد الملفات');
+        }
+
+        setProgressPercent(100);
+        setResult(data.result);
+        onImportSuccess?.(data.result);
       }
-
-      setUploadProgress('جاري إرسال البيانات وتقسيم الأيام وحفظها في SQLite وSupabase...');
-
-      const res = await fetch('/api/logs/import-batch', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ files: payloadFiles }),
-      });
-
-      const data = await res.json();
-      if (!res.ok || !data.success) {
-        throw new Error(data.error || 'فشل استيراد الملفات');
-      }
-
-      setResult(data.result);
-      onImportSuccess?.(data.result);
     } catch (err: any) {
       setError(err.message || 'حدث خطأ أثناء معالجة ملفات اللوجز');
     } finally {
@@ -120,6 +219,8 @@ export const BatchLogsImportModal: React.FC<BatchLogsImportModalProps> = ({
     setSelectedFiles([]);
     setResult(null);
     setError(null);
+    setProgressPercent(0);
+    setLiveStats(null);
     if (fileInputRef.current) fileInputRef.current.value = '';
   }
 
@@ -347,20 +448,41 @@ export const BatchLogsImportModal: React.FC<BatchLogsImportModalProps> = ({
         </div>
 
         {/* Footer */}
-        <div className="p-4 border-t border-slate-800 bg-slate-800/40 flex items-center justify-between">
+        <div className="p-4 border-t border-slate-800 bg-slate-800/40 flex flex-col md:flex-row items-center justify-between gap-4">
           {!result ? (
             <>
-              <div className="text-xs text-slate-400">
+              <div className="w-full md:w-auto flex-1 text-xs text-slate-400 space-y-1.5">
                 {uploadProgress ? (
-                  <span className="flex items-center gap-2 text-blue-400">
-                    <RefreshCw className="w-4 h-4 animate-spin" />
-                    {uploadProgress}
-                  </span>
+                  <>
+                    <div className="flex items-center justify-between">
+                      <span className="flex items-center gap-2 text-blue-400 font-medium">
+                        <RefreshCw className="w-4 h-4 animate-spin shrink-0" />
+                        {uploadProgress}
+                      </span>
+                      <span className="text-blue-300 font-mono font-semibold">{progressPercent}%</span>
+                    </div>
+                    {/* Visual Progress Bar */}
+                    <div className="w-full bg-slate-800 rounded-full h-1.5 overflow-hidden">
+                      <div
+                        className="bg-gradient-to-r from-blue-500 to-emerald-400 h-1.5 rounded-full transition-all duration-300"
+                        style={{ width: `${progressPercent}%` }}
+                      />
+                    </div>
+                    {liveStats && liveStats.rowsRead > 0 && (
+                      <div className="flex items-center gap-3 text-[11px] text-slate-400">
+                        <span>تمت قراءة: <strong className="text-white">{liveStats.rowsRead.toLocaleString()}</strong></span>
+                        <span>•</span>
+                        <span>أيام مكتشفة: <strong className="text-blue-300">{liveStats.datesDiscovered}</strong></span>
+                        <span>•</span>
+                        <span>حركات جديدة: <strong className="text-emerald-400">{liveStats.savedCount.toLocaleString()}</strong></span>
+                      </div>
+                    )}
+                  </>
                 ) : (
                   <span>جاهز للاستيراد</span>
                 )}
               </div>
-              <div className="flex items-center gap-3">
+              <div className="flex items-center gap-3 shrink-0">
                 <button
                   onClick={onClose}
                   disabled={isUploading}

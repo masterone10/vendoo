@@ -21,6 +21,11 @@ export const TeamView: React.FC<TeamViewProps> = ({ selectedDate, onSelectOrder 
   const [loading, setLoading] = useState(false);
   const [selectedMember, setSelectedMember] = useState<string | null>(null);
   const [memberEvents, setMemberEvents] = useState<any[]>([]);
+  const [eventsSummary, setEventsSummary] = useState<{
+    totalEvents: number;
+    countedTransitions: number;
+    duplicateEventsCount: number;
+  } | null>(null);
   const [eventsLoading, setEventsLoading] = useState(false);
 
   useEffect(() => {
@@ -82,6 +87,11 @@ export const TeamView: React.FC<TeamViewProps> = ({ selectedDate, onSelectOrder 
       const { ok, data } = await safeFetchJson<any>(url);
       if (ok && data) {
         setMemberEvents(data.events || []);
+        setEventsSummary({
+          totalEvents: data.totalEvents ?? (data.events?.length || 0),
+          countedTransitions: data.countedTransitions ?? (data.events?.filter((e: any) => e.is_counted).length || 0),
+          duplicateEventsCount: data.duplicateEventsCount ?? (data.events?.filter((e: any) => e.is_duplicate_transition).length || 0),
+        });
       }
     } catch (err) {
       console.error('Error fetching member events:', err);
@@ -293,14 +303,15 @@ export const TeamView: React.FC<TeamViewProps> = ({ selectedDate, onSelectOrder 
             {/* Modal Header */}
             <div className="p-5 border-b border-slate-800 flex items-center justify-between">
               <div>
-                <h3 className="text-base font-bold text-slate-100 flex items-center gap-2">
+                <h3 className="text-base font-bold text-slate-100 flex items-center gap-2 flex-wrap">
                   <span>سجل عمليات: {selectedMember}</span>
                   <span className="text-xs font-normal text-slate-400 font-mono">
-                    ({memberEvents.length} حدث)
+                    ({eventsSummary?.totalEvents ?? memberEvents.length} سجل باللوجز · {eventsSummary?.countedTransitions ?? memberEvents.filter(e => e.is_counted).length} حركة معتمدة
+                    {eventsSummary?.duplicateEventsCount ? ` · ${eventsSummary.duplicateEventsCount} مكرر مستبعد` : ''})
                   </span>
                 </h3>
                 <p className="text-xs text-slate-400 mt-0.5">
-                  التسلسل الزمني الدقيق للعمليات المنفذة من واقع السجلات
+                  التسلسل الزمني الدقيق للعمليات من واقع السجلات مع استبعاد التكرارات الناتجة عن تكرار اللوجز
                 </p>
               </div>
               <button
@@ -324,9 +335,16 @@ export const TeamView: React.FC<TeamViewProps> = ({ selectedDate, onSelectOrder 
               ) : (
                 <div className="divide-y divide-slate-800/60 border border-slate-800 rounded-xl overflow-hidden bg-slate-950/40">
                   {memberEvents.map((evt) => (
-                    <div key={evt.id} className="p-3.5 hover:bg-slate-800/30 flex items-start justify-between gap-4">
-                      <div className="space-y-1">
-                        <div className="flex items-center gap-2">
+                    <div
+                      key={evt.id}
+                      className={`p-3.5 flex items-start justify-between gap-4 transition-colors ${
+                        evt.is_duplicate_transition
+                          ? 'bg-slate-950/40 text-slate-400 opacity-80'
+                          : 'hover:bg-slate-800/30'
+                      }`}
+                    >
+                      <div className="space-y-1.5">
+                        <div className="flex items-center gap-2 flex-wrap">
                           {evt.order_code ? (
                             <button
                               onClick={() => {
@@ -342,6 +360,16 @@ export const TeamView: React.FC<TeamViewProps> = ({ selectedDate, onSelectOrder 
                           )}
                           <span className="text-slate-600">·</span>
                           <span className="text-slate-300 font-medium">{evt.raw_action_text}</span>
+
+                          {evt.is_duplicate_transition ? (
+                            <span className="inline-flex items-center gap-1 px-1.5 py-0.5 text-[10px] rounded bg-rose-950/40 text-rose-300/90 border border-rose-800/40 font-mono">
+                              سجل مكرر (مستبعد من الحساب)
+                            </span>
+                          ) : evt.is_counted ? (
+                            <span className="inline-flex items-center gap-1 px-1.5 py-0.5 text-[10px] rounded bg-emerald-950/40 text-emerald-300/90 border border-emerald-800/40 font-mono">
+                              حركة معتمدة
+                            </span>
+                          ) : null}
                         </div>
 
                         {evt.from_status && evt.to_status && (

@@ -1,4 +1,6 @@
 import crypto from 'node:crypto';
+import fs from 'node:fs';
+import readline from 'node:readline';
 import * as XLSX from 'xlsx';
 import { db, getCairoDateInterval, saveCoverageRecord } from './db.ts';
 import { persistLogEntries } from './historicalLogsService.ts';
@@ -6,6 +8,7 @@ import { isSupabaseConfigured, syncDayLogsToSupabase } from './supabaseClient.ts
 
 export interface BatchFilePayload {
   fileName: string;
+  filePath?: string;
   buffer?: Buffer;
   base64?: string;
   content?: string;
@@ -22,15 +25,29 @@ export interface DiscoveredDaySummary {
   remoteArchiveStatus: string;
 }
 
+export type BatchImportStatus =
+  | 'SUCCESS'
+  | 'ALL_DUPLICATES'
+  | 'PARTIAL'
+  | 'NO_VALID_RECORDS'
+  | 'UNRECOGNIZED_COLUMNS'
+  | 'INVALID_DATES'
+  | 'EMPTY_FILE'
+  | 'FAILED';
+
 export interface BatchImportResult {
   success: boolean;
+  status: BatchImportStatus;
+  statusMessageAr: string;
   batchId: string;
   filesProcessed: string[];
   sheetsProcessed: string[];
   totalRowsRead: number;
+  validRecordsCount: number;
   totalSaved: number;
   totalDuplicates: number;
   unparseableRows: number;
+  unmatchedOrdersCount: number;
   discoveredDates: DiscoveredDaySummary[];
   reviewRows: Array<{
     fileName: string;
@@ -42,40 +59,60 @@ export interface BatchImportResult {
   warnings: string[];
 }
 
-// Comprehensive aliases for column matching
-const HEADER_ALIASES = {
+// Aliases for header detection
+export const HEADER_ALIASES = {
   orderCode: [
     'كود الطلب', 'رقم الطلب', 'كود الاوردر', 'رقم الاوردر', 'كود', 'الطلب', 'الاوردر',
-    'رقم البوليصة', 'البوليصة', 'رقم الشحنة', 'كود الشحنة',
+    'رقم البوليصة', 'البوليصة', 'رقم الشحنة', 'كود الشحنة', 'رقم الفاتورة', 'الفاتورة',
+    'كود الشحنه', 'رقم الشحنه', 'كود طلب', 'رقم طلب', 'معرف الطلب', 'معرف الاوردر',
+    'الرقم العشوائي', 'رقم المرجع', 'كود المرجع',
     'order_code', 'order_no', 'random_number', 'order_id_code', 'order', 'code', 'ordercode',
+    'order_number', 'order id', 'order_id', 'tracking_number', 'tracking', 'order_reference',
   ],
   actorName: [
-    'اسم الموظف', 'الموظف', 'المنفذ', 'بواسطة', 'المستخدم', 'اسم المستخدم',
-    'القائم بالحركة', 'المسؤول', 'المسئول', 'منفذ الحركة',
+    'اسم الموظف', 'الموظف', 'المنفذ', 'اسم المنفذ', 'المستخدم المنفذ', 'بواسطة',
+    'المستخدم', 'اسم المستخدم', 'القائم بالحركة', 'المسؤول', 'المسئول', 'المسئول عن الحركة',
+    'مسؤول الحركة', 'منفذ الحركة', 'منفذ العملية', 'الادمن', 'المشرف',
+    'اسم المسؤول', 'اسم المسئول', 'خدمة العملاء', 'خدمه العملاء',
     'actor_name', 'actor', 'employee', 'user_name', 'user', 'staff', 'created_by', 'actorname',
+    'operator', 'admin', 'username',
   ],
   rawActionText: [
     'نص الحركة', 'تفاصيل الحركة', 'نص الحدث', 'تفاصيل الحدث', 'الإجراء', 'الاجراء',
     'الحدث', 'الحركة', 'التفاصيل', 'الوصف', 'بيان الحركة', 'نوع الحركة', 'العملية', 'نص العملية',
+    'بيانات الحركة', 'تفاصيل العملية', 'بيان', 'البيان', 'النشاط', 'نوع النشاط', 'نص النشاط',
+    'ملاحظات', 'تفاصيل الإجراء', 'تفاصيل الاجراء', 'شرح الحركة', 'بيان الإجراء', 'الحالة', 'تغيير الحالة',
     'action_text', 'raw_action_text', 'action', 'details', 'description', 'activity', 'event', 'operation',
+    'text', 'statement', 'log', 'message', 'action_name', 'action_type', 'action_details', 'notes', 'status_change',
+    'action_description', 'log_action',
   ],
   eventTimestamp: [
     'تاريخ ووقت الحركة', 'تاريخ ووقت', 'تاريخ و وقت الحركة', 'تاريخ و وقت', 'تاريخ و الوقت',
     'التاريخ والوقت', 'التاريخ و الوقت', 'تاريخ الحركة', 'وقت الحركة', 'تاريخ الحدث', 'وقت الحدث',
     'تاريخ الإجراء', 'تاريخ الاجراء', 'تاريخ العملية', 'وقت العملية', 'تاريخ الاضافة', 'تاريخ الإضافة',
     'تاريخ التسجيل', 'وقت التسجيل', 'تاريخ الإنشاء', 'تاريخ الانشاء', 'وقت الإنشاء',
-    'التاريخ', 'الوقت', 'تاريخ', 'وقت',
-    'timestamp', 'event_timestamp', 'action_timestamp', 'created_at', 'date', 'time',
-    'datetime', 'date_time', 'logged_at', 'action_date', 'action_time', 'operation_date',
-    'date & time', 'date time', 'event_time',
+    'تاريخ التحديث', 'وقت التحديث', 'تاريخ ووقت التحديث', 'تاريخ التعديل', 'وقت التعديل',
+    'وقت وتاريخ', 'وقت و تاريخ', 'الوقت والتاريخ', 'تاريخ الطلب', 'تاريخ الاوردر',
+    'timestamp', 'event_timestamp', 'action_timestamp', 'created_at',
+    'datetime', 'date_time', 'logged_at', 'action_date_time', 'date & time', 'date time', 'event_time',
+    'date_and_time', 'date/time', 'date_time_cairo',
+  ],
+  dateOnly: [
+    'التاريخ', 'تاريخ', 'تاريخ اليوم', 'اليوم', 'تاريخ العملية', 'تاريخ الحركة', 'تاريخ الإنشاء',
+    'تاريخ الطلب', 'تاريخ الاوردر',
+    'date', 'action_date', 'event_date', 'day', 'creation_date', 'order_date',
+  ],
+  timeOnly: [
+    'الوقت', 'وقت', 'الساعة', 'توقيت', 'وقت الحركة', 'وقت العملية', 'وقت الإنشاء', 'وقت التسجيل',
+    'time', 'action_time', 'event_time', 'hour',
   ],
   vendoorOrderId: [
-    'معرف الطلب', 'معرف الاوردر', 'معرف النظام', 'معرف الحركة',
-    'vendoor_order_id', 'order_id', 'id', 'system_id', 'orderid',
+    'معرف الطلب', 'معرف الاوردر', 'معرف النظام', 'معرف الحركة', 'id', 'معرف',
+    'vendoor_order_id', 'order_id', 'system_id', 'orderid',
   ],
 };
 
-function normalizeArabicText(str: string): string {
+export function normalizeArabicHeader(str: string): string {
   return (str || '')
     .toString()
     .trim()
@@ -88,24 +125,38 @@ function normalizeArabicText(str: string): string {
     .replace(/[\s_\-\/\\]+/g, '_');
 }
 
-function findMatchingField(headers: string[], aliases: string[]): string | null {
+export function findMatchingField(headers: string[], aliases: string[]): string | null {
+  if (!headers || headers.length === 0) return null;
+
   // Pass 1: Exact normalized match
   for (const h of headers) {
-    const normH = normalizeArabicText(h);
+    const normH = normalizeArabicHeader(h);
     if (!normH) continue;
     for (const a of aliases) {
-      const normA = normalizeArabicText(a);
+      const normA = normalizeArabicHeader(a);
       if (normH === normA) return h;
     }
   }
 
-  // Pass 2: Word boundary or prefix match
+  // Pass 2: Word boundary or prefix/suffix match (minimum 3 chars)
   for (const h of headers) {
-    const normH = normalizeArabicText(h);
+    const normH = normalizeArabicHeader(h);
     if (!normH) continue;
     for (const a of aliases) {
-      const normA = normalizeArabicText(a);
-      if (normA.length >= 3 && (normH.includes(normA) || normA.includes(normH))) {
+      const normA = normalizeArabicHeader(a);
+      if (normA.length >= 3 && (normH === normA || normH.startsWith(normA + '_') || normH.endsWith('_' + normA))) {
+        return h;
+      }
+    }
+  }
+
+  // Pass 3: Header contains multi-word alias (minimum 4 chars)
+  for (const h of headers) {
+    const normH = normalizeArabicHeader(h);
+    if (!normH) continue;
+    for (const a of aliases) {
+      const normA = normalizeArabicHeader(a);
+      if (normA.length >= 4 && normH.includes(normA)) {
         return h;
       }
     }
@@ -114,177 +165,336 @@ function findMatchingField(headers: string[], aliases: string[]): string | null 
   return null;
 }
 
-function toAsciiDigits(str: string): string {
-  return str.replace(/[٠-٩]/g, d => String('٠١٢٣٤٥٦٧٨٩'.indexOf(d)));
+export function toAsciiDigits(str: string): string {
+  return (str || '').replace(/[٠-٩]/g, d => String('٠١٢٣٤٥٦٧٨٩'.indexOf(d)));
 }
 
 /**
- * Normalizes different date representations:
- * - Native JavaScript Date instances
- * - Numeric Excel date codes (e.g. 45579.5 or '45579.5') via direct epoch calculation
+ * Converts a numeric day fraction or seconds from midnight to HH:mm:ss string.
+ */
+export function formatNumericTime(timeVal: number): string {
+  const totalSeconds = Math.round((timeVal < 1 ? timeVal * 86400 : timeVal) % 86400);
+  const h = Math.floor(totalSeconds / 3600);
+  const m = Math.floor((totalSeconds % 3600) / 60);
+  const s = totalSeconds % 60;
+  return `${String(h).padStart(2, '0')}:${String(m).padStart(2, '0')}:${String(s).padStart(2, '0')}`;
+}
+
+/**
+ * Fully RFC 4180 compliant CSV parser supporting:
+ * - Arbitrary delimiters (comma, semicolon, tab)
+ * - Quotes ("") with embedded delimiters, newlines, and escaped quotes ("" or \")
+ * - BOM stripping
+ * - Accurate field boundary extraction
+ */
+export function parseRFC4180Csv(text: string, delimiter: string = ','): string[][] {
+  const clean = text.replace(/^\uFEFF/, '');
+  const rows: string[][] = [];
+  let currentRow: string[] = [];
+  let currentField = '';
+  let inQuotes = false;
+  const len = clean.length;
+
+  for (let i = 0; i < len; i++) {
+    const ch = clean[i];
+
+    if (inQuotes) {
+      if (ch === '"') {
+        if (i + 1 < len && clean[i + 1] === '"') {
+          currentField += '"';
+          i++; // CSV doubled quote ""
+        } else {
+          inQuotes = false;
+        }
+      } else if (ch === '\\' && i + 1 < len && clean[i + 1] === '"') {
+        currentField += '"';
+        i++; // C-style escaped quote \"
+      } else {
+        currentField += ch;
+      }
+    } else {
+      if (ch === '"') {
+        inQuotes = true;
+      } else if (ch === delimiter) {
+        currentRow.push(currentField.trim());
+        currentField = '';
+      } else if (ch === '\r') {
+        if (i + 1 < len && clean[i + 1] === '\n') {
+          i++;
+        }
+        currentRow.push(currentField.trim());
+        currentField = '';
+        if (currentRow.some(c => c !== '')) {
+          rows.push(currentRow);
+        }
+        currentRow = [];
+      } else if (ch === '\n') {
+        currentRow.push(currentField.trim());
+        currentField = '';
+        if (currentRow.some(c => c !== '')) {
+          rows.push(currentRow);
+        }
+        currentRow = [];
+      } else {
+        currentField += ch;
+      }
+    }
+  }
+
+  if (currentField.length > 0 || currentRow.length > 0) {
+    currentRow.push(currentField.trim());
+    if (currentRow.some(c => c !== '')) {
+      rows.push(currentRow);
+    }
+  }
+
+  return rows;
+}
+
+/**
+ * Detects CSV delimiter automatically from raw text sample.
+ */
+export function detectCsvDelimiter(sampleText: string): string {
+  const lines = sampleText.split(/\r?\n/).slice(0, 20);
+  let commas = 0;
+  let semicolons = 0;
+  let tabs = 0;
+
+  for (const line of lines) {
+    if (!line.trim()) continue;
+    let inQuotes = false;
+    for (let i = 0; i < line.length; i++) {
+      const ch = line[i];
+      if (ch === '"') inQuotes = !inQuotes;
+      else if (!inQuotes) {
+        if (ch === ',') commas++;
+        else if (ch === ';') semicolons++;
+        else if (ch === '\t') tabs++;
+      }
+    }
+  }
+
+  if (semicolons > commas && semicolons >= tabs && semicolons > 0) return ';';
+  if (tabs > commas && tabs > semicolons && tabs > 0) return '\t';
+  return ',';
+}
+
+/**
+ * Normalizes different date representations into standard Africa/Cairo datetime string:
+ * - Excel numeric serial date via XLSX.SSF.parse_date_code
+ * - Condition 2: Checks if numeric date already has fractional time part. If so, DOES NOT add time twice!
+ *   If integer date, combines with separate numeric or string timeVal.
+ * - JavaScript Date objects
  * - Arabic-Indic numbers (١٤/١٠/٢٠٢٦)
  * - 12-hour AM/PM formats in Arabic (م / ص / مساءً / صباحاً) and English (PM / AM)
- * - DD/MM/YYYY and MM/DD/YYYY disambiguation
- * - ISO formats: YYYY-MM-DD HH:mm:ss
- * Output: standard Africa/Cairo datetime string: YYYY-MM-DD HH:mm:ss and YYYY-MM-DD
+ * - DD/MM/YYYY, MM/DD/YYYY, YYYY-MM-DD, YYYY/MM/DD, DD-MM-YYYY
  */
-export function normalizeDateStringToCairo(val: any): { timestampStr: string | null; dateStr: string | null } {
+export function normalizeDateStringToCairo(val: any, timeVal?: any): { timestampStr: string | null; dateStr: string | null } {
   if (val === null || val === undefined || val === '') {
     return { timestampStr: null, dateStr: null };
   }
 
-  // 1. JavaScript Date instance (e.g. from XLSX cellDates: true)
+  // 1. Excel numeric serial date (number or numeric string between 25000 and 80000)
+  if (typeof val === 'number' || (typeof val === 'string' && /^\d{4,6}(?:\.\d+)?$/.test(val.trim()))) {
+    let num = typeof val === 'number' ? val : parseFloat(val);
+    if (!isNaN(num) && num >= 25000 && num <= 80000) {
+      // Condition 2: Check if num already includes fractional time part
+      const frac = num % 1;
+      const hasFractionalTime = frac > 0.00005 && frac < 0.99995;
+
+      if (!hasFractionalTime && timeVal !== undefined && timeVal !== null && timeVal !== '') {
+        // Separate time provided: add it without duplicating
+        if (typeof timeVal === 'number' || /^\d+(?:\.\d+)?$/.test(String(timeVal).trim())) {
+          const tNum = typeof timeVal === 'number' ? timeVal : parseFloat(timeVal);
+          if (!isNaN(tNum)) {
+            if (tNum < 1) {
+              num += tNum; // day fraction
+            } else if (tNum <= 86400) {
+              num += tNum / 86400; // seconds from midnight
+            }
+          }
+        } else if (typeof timeVal === 'string') {
+          // Time string like "14:30:22" or "02:30 م"
+          const asciiTime = toAsciiDigits(timeVal.trim());
+          const timeMatch = asciiTime.match(/(\d{1,2}):(\d{1,2})(?::(\d{1,2}))?\s*(ص|م|am|pm|صباحاً|مساءً)?/i);
+          if (timeMatch) {
+            let h = parseInt(timeMatch[1], 10);
+            const m = parseInt(timeMatch[2], 10);
+            const s = parseInt(timeMatch[3] || '0', 10);
+            const ampm = (timeMatch[4] || '').toLowerCase();
+            if ((ampm === 'م' || ampm === 'pm' || ampm === 'مساءً') && h < 12) h += 12;
+            if ((ampm === 'ص' || ampm === 'am' || ampm === 'صباحاً') && h === 12) h = 0;
+            num += (h * 3600 + m * 60 + s) / 86400;
+          }
+        }
+      }
+
+      try {
+        const parsedCode = (XLSX.SSF || (XLSX as any).default?.SSF)?.parse_date_code?.(num) || (XLSX as any).parse_date_code?.(num);
+        if (parsedCode && parsedCode.y >= 1990 && parsedCode.y <= 2100) {
+          const yStr = String(parsedCode.y);
+          const mStr = String(parsedCode.m).padStart(2, '0');
+          const dStr = String(parsedCode.d).padStart(2, '0');
+          const hStr = String(parsedCode.H || 0).padStart(2, '0');
+          const minStr = String(parsedCode.M || 0).padStart(2, '0');
+          const sStr = String(Math.floor(parsedCode.S || 0)).padStart(2, '0');
+
+          const dateStr = `${yStr}-${mStr}-${dStr}`;
+          const timestampStr = `${dateStr} ${hStr}:${minStr}:${sStr}`;
+          return { timestampStr, dateStr };
+        }
+      } catch {}
+    }
+  }
+
+  // 2. JavaScript Date instance
   if (val instanceof Date) {
     if (isNaN(val.getTime())) return { timestampStr: null, dateStr: null };
+    const yStr = String(val.getUTCFullYear());
+    const mStr = String(val.getUTCMonth() + 1).padStart(2, '0');
+    const dStr = String(val.getUTCDate()).padStart(2, '0');
+    let hStr = String(val.getUTCHours()).padStart(2, '0');
+    let minStr = String(val.getUTCMinutes()).padStart(2, '0');
+    let sStr = String(val.getUTCSeconds()).padStart(2, '0');
+
+    // If time is 00:00:00 and separate timeVal is provided
+    if (hStr === '00' && minStr === '00' && sStr === '00' && timeVal) {
+      const asciiTime = toAsciiDigits(String(timeVal).trim());
+      const timeMatch = asciiTime.match(/(\d{1,2}):(\d{1,2})(?::(\d{1,2}))?\s*(ص|م|am|pm|صباحاً|مساءً)?/i);
+      if (timeMatch) {
+        let h = parseInt(timeMatch[1], 10);
+        const m = parseInt(timeMatch[2], 10);
+        const s = parseInt(timeMatch[3] || '0', 10);
+        const ampm = (timeMatch[4] || '').toLowerCase();
+        if ((ampm === 'م' || ampm === 'pm' || ampm === 'مساءً') && h < 12) h += 12;
+        if ((ampm === 'ص' || ampm === 'am' || ampm === 'صباحاً') && h === 12) h = 0;
+        hStr = String(h).padStart(2, '0');
+        minStr = String(m).padStart(2, '0');
+        sStr = String(s).padStart(2, '0');
+      }
+    }
+
+    const dateStr = `${yStr}-${mStr}-${dStr}`;
+    const timestampStr = `${dateStr} ${hStr}:${minStr}:${sStr}`;
+    return { timestampStr, dateStr };
+  }
+
+  // 3. String date handling
+  let rawDateVal = String(val).trim();
+  if (!rawDateVal) return { timestampStr: null, dateStr: null };
+
+  // If timeVal is provided and date string does not contain time
+  if (timeVal !== undefined && timeVal !== null && String(timeVal).trim() !== '') {
+    const hasColonInDate = rawDateVal.includes(':');
+    if (!hasColonInDate) {
+      let timeStr = String(timeVal).trim();
+      if (typeof timeVal === 'number' || /^\d+(?:\.\d+)?$/.test(timeStr)) {
+        const tNum = typeof timeVal === 'number' ? timeVal : parseFloat(timeStr);
+        if (!isNaN(tNum) && (tNum < 1 || tNum <= 86400)) {
+          timeStr = formatNumericTime(tNum);
+        }
+      }
+      rawDateVal = `${rawDateVal} ${timeStr}`;
+    }
+  }
+
+  let s = toAsciiDigits(rawDateVal);
+  if (!s) return { timestampStr: null, dateStr: null };
+
+  let isPM = false;
+  let isAM = false;
+  if (/[\s,]*(?:pm|مساءً|مساء|م)\b/i.test(s) || /[\s,]+م$/i.test(s)) {
+    isPM = true;
+  } else if (/[\s,]*(?:am|صباحاً|صباحا|صباح|ص)\b/i.test(s) || /[\s,]+ص$/i.test(s)) {
+    isAM = true;
+  }
+
+  const cleanTime = s.replace(/(?:pm|am|مساءً|مساء|صباحاً|صباحا|صباح|م|ص)/gi, '').trim();
+
+  // Format A: ISO: YYYY-MM-DD or YYYY/MM/DD
+  const isoMatch = cleanTime.match(/^(\d{4})[-/.](\d{1,2})[-/.](\d{1,2})(?:[T\s](\d{1,2}):(\d{1,2})(?::(\d{1,2}))?)?/);
+  if (isoMatch) {
+    const y = isoMatch[1];
+    const m = String(parseInt(isoMatch[2], 10)).padStart(2, '0');
+    const day = String(parseInt(isoMatch[3], 10)).padStart(2, '0');
+    let h = parseInt(isoMatch[4] || '0', 10);
+    const min = String(parseInt(isoMatch[5] || '0', 10)).padStart(2, '0');
+    const sec = String(parseInt(isoMatch[6] || '0', 10)).padStart(2, '0');
+    if (isPM && h < 12) h += 12;
+    if (isAM && h === 12) h = 0;
+    const hStr = String(h).padStart(2, '0');
+    const dateStr = `${y}-${m}-${day}`;
+    return {
+      timestampStr: `${dateStr} ${hStr}:${min}:${sec}`,
+      dateStr,
+    };
+  }
+
+  // Format B: Localized DD/MM/YYYY or MM/DD/YYYY or DD-MM-YYYY
+  const localMatch = cleanTime.match(/^(\d{1,2})[-/.](\d{1,2})[-/.](\d{4})(?:[T\s](\d{1,2}):(\d{1,2})(?::(\d{1,2}))?)?/);
+  if (localMatch) {
+    const p1 = parseInt(localMatch[1], 10);
+    const p2 = parseInt(localMatch[2], 10);
+    const y = localMatch[3];
+    let h = parseInt(localMatch[4] || '0', 10);
+    const min = String(parseInt(localMatch[5] || '0', 10)).padStart(2, '0');
+    const sec = String(parseInt(localMatch[6] || '0', 10)).padStart(2, '0');
+    if (isPM && h < 12) h += 12;
+    if (isAM && h === 12) h = 0;
+    const hStr = String(h).padStart(2, '0');
+
+    let day: number;
+    let m: number;
+    if (p1 > 12) {
+      day = p1;
+      m = p2;
+    } else if (p2 > 12) {
+      m = p1;
+      day = p2;
+    } else {
+      // Standard Middle East / Egyptian format is DD/MM/YYYY
+      day = p1;
+      m = p2;
+    }
+
+    const dayStr = String(day).padStart(2, '0');
+    const mStr = String(m).padStart(2, '0');
+    const dateStr = `${y}-${mStr}-${dayStr}`;
+    return {
+      timestampStr: `${dateStr} ${hStr}:${min}:${sec}`,
+      dateStr,
+    };
+  }
+
+  // Fallback: general Date.parse
+  const parsed = new Date(cleanTime);
+  if (!isNaN(parsed.getTime()) && parsed.getFullYear() > 1990 && parsed.getFullYear() < 2100) {
     const cairoDate = new Intl.DateTimeFormat('en-CA', {
       timeZone: 'Africa/Cairo',
       year: 'numeric',
       month: '2-digit',
       day: '2-digit',
-    }).format(val);
+    }).format(parsed);
     const cairoTime = new Intl.DateTimeFormat('en-GB', {
       timeZone: 'Africa/Cairo',
       hour: '2-digit',
       minute: '2-digit',
       second: '2-digit',
       hour12: false,
-    }).format(val);
+    }).format(parsed);
     return {
       timestampStr: `${cairoDate} ${cairoTime}`,
       dateStr: cairoDate,
     };
   }
 
-  // 2. Excel numeric serial date (e.g. 45579.5 or string number '45579.5')
-  if (typeof val === 'number' || (typeof val === 'string' && /^\d{4,6}(?:\.\d+)?$/.test(val.trim()))) {
-    const num = typeof val === 'number' ? val : parseFloat(val);
-    // Excel date range: 25000 (~1968) to 80000 (~2119)
-    if (!isNaN(num) && num >= 25000 && num <= 80000) {
-      const ms = Math.round((num - 25569) * 86400 * 1000);
-      const d = new Date(ms);
-      if (!isNaN(d.getTime())) {
-        const cairoDate = new Intl.DateTimeFormat('en-CA', {
-          timeZone: 'Africa/Cairo',
-          year: 'numeric',
-          month: '2-digit',
-          day: '2-digit',
-        }).format(d);
-        const cairoTime = new Intl.DateTimeFormat('en-GB', {
-          timeZone: 'Africa/Cairo',
-          hour: '2-digit',
-          minute: '2-digit',
-          second: '2-digit',
-          hour12: false,
-        }).format(d);
-        return {
-          timestampStr: `${cairoDate} ${cairoTime}`,
-          dateStr: cairoDate,
-        };
-      }
-    }
-  }
-
-  // 3. String date
-  if (typeof val === 'string') {
-    let s = toAsciiDigits(val.trim());
-    if (!s) return { timestampStr: null, dateStr: null };
-
-    // Check for AM / PM in English or Arabic
-    let isPM = false;
-    let isAM = false;
-    if (/[\s,]*(?:pm|مساءً|م)\b/i.test(s) || /[\s,]+م$/i.test(s)) {
-      isPM = true;
-    } else if (/[\s,]*(?:am|صباحاً|ص)\b/i.test(s) || /[\s,]+ص$/i.test(s)) {
-      isAM = true;
-    }
-
-    const cleanTime = s.replace(/(?:pm|am|مساءً|صباحاً|م|ص)/gi, '').trim();
-
-    // Standard YYYY-MM-DD or YYYY/MM/DD
-    const isoMatch = cleanTime.match(/^(\d{4})[-/](\d{1,2})[-/](\d{1,2})(?:[T\s](\d{1,2}):(\d{1,2})(?::(\d{1,2}))?)?/);
-    if (isoMatch) {
-      const y = isoMatch[1];
-      const m = String(parseInt(isoMatch[2], 10)).padStart(2, '0');
-      const day = String(parseInt(isoMatch[3], 10)).padStart(2, '0');
-      let h = parseInt(isoMatch[4] || '0', 10);
-      const min = String(parseInt(isoMatch[5] || '0', 10)).padStart(2, '0');
-      const sec = String(parseInt(isoMatch[6] || '0', 10)).padStart(2, '0');
-      if (isPM && h < 12) h += 12;
-      if (isAM && h === 12) h = 0;
-      const hStr = String(h).padStart(2, '0');
-      const dateStr = `${y}-${m}-${day}`;
-      return {
-        timestampStr: `${dateStr} ${hStr}:${min}:${sec}`,
-        dateStr,
-      };
-    }
-
-    // Localized DD/MM/YYYY or MM/DD/YYYY
-    const localMatch = cleanTime.match(/^(\d{1,2})[-/](\d{1,2})[-/](\d{4})(?:[T\s](\d{1,2}):(\d{1,2})(?::(\d{1,2}))?)?/);
-    if (localMatch) {
-      const p1 = parseInt(localMatch[1], 10);
-      const p2 = parseInt(localMatch[2], 10);
-      const y = localMatch[3];
-      let h = parseInt(localMatch[4] || '0', 10);
-      const min = String(parseInt(localMatch[5] || '0', 10)).padStart(2, '0');
-      const sec = String(parseInt(localMatch[6] || '0', 10)).padStart(2, '0');
-      if (isPM && h < 12) h += 12;
-      if (isAM && h === 12) h = 0;
-      const hStr = String(h).padStart(2, '0');
-
-      let day: number;
-      let m: number;
-      if (p1 > 12) {
-        day = p1;
-        m = p2;
-      } else if (p2 > 12) {
-        m = p1;
-        day = p2;
-      } else {
-        // Default Egyptian / Middle Eastern standard: DD/MM/YYYY
-        day = p1;
-        m = p2;
-      }
-
-      const dayStr = String(day).padStart(2, '0');
-      const mStr = String(m).padStart(2, '0');
-      const dateStr = `${y}-${mStr}-${dayStr}`;
-      return {
-        timestampStr: `${dateStr} ${hStr}:${min}:${sec}`,
-        dateStr,
-      };
-    }
-
-    // Fallback general Date parsing
-    const parsed = new Date(cleanTime);
-    if (!isNaN(parsed.getTime()) && parsed.getFullYear() > 1990 && parsed.getFullYear() < 2100) {
-      const cairoDate = new Intl.DateTimeFormat('en-CA', {
-        timeZone: 'Africa/Cairo',
-        year: 'numeric',
-        month: '2-digit',
-        day: '2-digit',
-      }).format(parsed);
-      const cairoTime = new Intl.DateTimeFormat('en-GB', {
-        timeZone: 'Africa/Cairo',
-        hour: '2-digit',
-        minute: '2-digit',
-        second: '2-digit',
-        hour12: false,
-      }).format(parsed);
-      return {
-        timestampStr: `${cairoDate} ${cairoTime}`,
-        dateStr: cairoDate,
-      };
-    }
-  }
-
   return { timestampStr: null, dateStr: null };
 }
 
 /**
- * Dynamically detects column names by sampling row content if header aliases fail
+ * Heuristically detects columns by inspecting actual cell content if header aliases fail
  */
-function autoDetectColumnsFromSample(
+export function autoDetectColumnsFromSample(
   rows: Record<string, any>[],
   headers: string[]
 ): {
@@ -292,6 +502,8 @@ function autoDetectColumnsFromSample(
   colActor: string | null;
   colAction: string | null;
   colTimestamp: string | null;
+  colDate: string | null;
+  colTime: string | null;
   colOrderId: string | null;
 } {
   const sample = rows.slice(0, 30);
@@ -324,26 +536,27 @@ function autoDetectColumnsFromSample(
       }
 
       const strVal = String(val).trim();
-      // 2. Action check: characteristic Arabic log phrases
+      // 2. Action text characteristics
       if (
         strVal.includes('حالة') || strVal.includes('طلب') || strVal.includes('أضاف') ||
         strVal.includes('عدل') || strVal.includes('انشاء') || strVal.includes('تم') ||
         strVal.includes('غير') || strVal.includes('شحن') || strVal.includes('طباعة') ||
         strVal.includes('إلغاء') || strVal.includes('الغاء') || strVal.includes('هاتف') ||
-        strVal.includes('Pending') || strVal.includes('Printed') || strVal.includes('Processing')
+        strVal.includes('Pending') || strVal.includes('Printed') || strVal.includes('Processing') ||
+        strVal.includes('Canceled') || strVal.includes('New')
       ) {
         actionMatches++;
       }
 
-      // 3. Order code check
-      if (/^(?:ORD_|\d{4,12}|[A-Za-z0-9_\-]{5,20})$/i.test(strVal)) {
+      // 3. Order code patterns (VND_123, ORD_123, 8-12 digits, alphanumeric codes)
+      if (/^(?:VND_|ORD_|\d{4,12}|[A-Za-z0-9_\-]{5,20})$/i.test(strVal)) {
         orderMatches++;
       }
 
-      // 4. Actor check: short staff names
+      // 4. Actor name
       if (
         strVal === 'النظام' || strVal.toLowerCase() === 'system' ||
-        (strVal.length > 2 && strVal.length < 30 && !strVal.includes('حالة') && !norm.dateStr)
+        (strVal.length >= 2 && strVal.length < 35 && !strVal.includes('حالة') && !norm.dateStr)
       ) {
         actorMatches++;
       }
@@ -372,23 +585,37 @@ function autoDetectColumnsFromSample(
     colAction: bestActionCol,
     colOrderCode: bestOrderCol,
     colActor: bestActorCol,
+    colDate: null,
+    colTime: null,
     colOrderId: null,
   };
 }
 
+export interface ProgressCallback {
+  (progress: {
+    stage: 'UPLOADING' | 'PARSING' | 'EXTRACTING_DATES' | 'SAVING_RECORDS' | 'COMPLETED' | 'FAILED';
+    stageLabelAr: string;
+    rowsRead: number;
+    rowsTotal: number;
+    datesDiscovered: number;
+    savedCount: number;
+    duplicatesCount: number;
+    unparseableRows: number;
+  }): void;
+}
+
 /**
- * Ingests one or more Excel/CSV log files covering multiple historical days.
- * - Robustly handles all Excel date formats (native Date, Excel serials, Arabic, PM/AM, DD/MM/YYYY).
- * - Identifies header row across title and metadata rows.
- * - Dynamically auto-detects column names if headers differ.
- * - Extracts and partitions rows by Cairo business date.
- * - Persists raw and canonical logs idempotently with chunked transactions.
- * - Updates unified historical coverage registry.
- * - Syncs to Supabase and verifies remote persistence when configured.
+ * High-performance, streaming-capable ingestion for large Excel & CSV log files.
+ * - Deep header discovery scanning top 15 rows.
+ * - Robust column aliasing with separate date and time column support.
+ * - Precision date parsing via XLSX.SSF (no timezone shifting past midnight).
+ * - Honest status reporting: guarantees success=false if 0 records saved and 0 duplicates found.
+ * - Idempotent, deduplicated chunked persistence in local SQLite & Supabase.
  */
 export async function importBatchLogFiles(
   files: BatchFilePayload[],
-  batchIdPrefix = 'batch'
+  batchIdPrefix = 'batch',
+  onProgress?: ProgressCallback
 ): Promise<BatchImportResult> {
   const batchId = `${batchIdPrefix}_${Date.now()}_${crypto.randomBytes(4).toString('hex')}`;
   const filesProcessed: string[] = [];
@@ -398,8 +625,13 @@ export async function importBatchLogFiles(
 
   let totalRowsRead = 0;
   let unparseableRows = 0;
+  let validRecordsCount = 0;
+  let totalSaved = 0;
+  let totalDuplicates = 0;
+  let unmatchedOrdersCount = 0;
+  let totalValidSheets = 0;
 
-  // Date -> Entries mapping
+  // Cairo date (YYYY-MM-DD) -> Array of log items
   const dateGroups = new Map<string, Array<{
     orderCode: string | null;
     actorName: string;
@@ -409,123 +641,214 @@ export async function importBatchLogFiles(
     rawHtml?: string | null;
   }>>();
 
-  // Source files for each date
   const dateSourceFiles = new Map<string, Set<string>>();
 
   for (const f of files) {
     const fileName = f.fileName || 'unknown.xlsx';
     filesProcessed.push(fileName);
 
-    let buffer: Buffer | null = null;
-    if (f.buffer && Buffer.isBuffer(f.buffer)) {
-      buffer = f.buffer;
-    } else if (f.base64) {
-      buffer = Buffer.from(f.base64, 'base64');
-    } else if (f.content) {
-      buffer = Buffer.from(f.content, 'utf-8');
-    }
+    const isCsvFile = fileName.toLowerCase().endsWith('.csv') || (f.filePath && f.filePath.toLowerCase().endsWith('.csv'));
+    const sheetsToProcess: Array<{ sheetName: string; sheetAoa: any[][] }> = [];
 
-    if (!buffer || buffer.length === 0) {
-      warnings.push(`File ${fileName} was empty or could not be buffered.`);
-      continue;
-    }
-
-    let workbook: XLSX.WorkBook;
-    try {
-      // Read with cellDates: true for automatic date parsing + raw: true for numeric preserving
-      workbook = XLSX.read(buffer, {
-        type: 'buffer',
-        cellDates: true,
-        raw: true,
-        codepage: 65001,
-      });
-    } catch (parseErr: any) {
-      warnings.push(`Could not parse workbook ${fileName}: ${parseErr.message}`);
-      continue;
-    }
-
-    for (const sheetName of workbook.SheetNames) {
-      sheetsProcessed.push(`${fileName}::${sheetName}`);
-      const worksheet = workbook.Sheets[sheetName];
-      if (!worksheet) continue;
-
-      // First check if worksheet has data
-      const rawRows: Record<string, any>[] = XLSX.utils.sheet_to_json(worksheet, {
-        defval: '',
-        raw: true,
-      });
-
-      if (rawRows.length === 0) continue;
-
-      // Locate header row: scan first 10 rows if row 0 does not contain valid headers
-      let candidateHeaders = Object.keys(rawRows[0] || {});
-      let colOrderCode = findMatchingField(candidateHeaders, HEADER_ALIASES.orderCode);
-      let colActor = findMatchingField(candidateHeaders, HEADER_ALIASES.actorName);
-      let colAction = findMatchingField(candidateHeaders, HEADER_ALIASES.rawActionText);
-      let colTimestamp = findMatchingField(candidateHeaders, HEADER_ALIASES.eventTimestamp);
-      let colOrderId = findMatchingField(candidateHeaders, HEADER_ALIASES.vendoorOrderId);
-
-      let effectiveRows = rawRows;
-
-      // If neither action nor timestamp header found, check if row 0 was a title or metadata row
-      if (!colAction || !colTimestamp) {
-        // Read as 2D array to inspect top rows for true header line
-        const sheetAoa: any[][] = XLSX.utils.sheet_to_json(worksheet, { header: 1, defval: '', raw: true });
-        for (let rIdx = 0; rIdx < Math.min(10, sheetAoa.length); rIdx++) {
-          const rowArray = (sheetAoa[rIdx] || []).map(cell => String(cell || '').trim());
-          const testAction = findMatchingField(rowArray, HEADER_ALIASES.rawActionText);
-          const testTimestamp = findMatchingField(rowArray, HEADER_ALIASES.eventTimestamp);
-          if (testAction || testTimestamp) {
-            // Found actual header row at rIdx!
-            const headerRow = rowArray;
-            colAction = testAction;
-            colTimestamp = testTimestamp;
-            colOrderCode = findMatchingField(headerRow, HEADER_ALIASES.orderCode);
-            colActor = findMatchingField(headerRow, HEADER_ALIASES.actorName);
-            colOrderId = findMatchingField(headerRow, HEADER_ALIASES.vendoorOrderId);
-
-            // Convert remaining rows into objects with these headers
-            effectiveRows = [];
-            for (let dataIdx = rIdx + 1; dataIdx < sheetAoa.length; dataIdx++) {
-              const dataRow = sheetAoa[dataIdx];
-              if (!dataRow || dataRow.length === 0) continue;
-              const obj: Record<string, any> = {};
-              let hasAnyData = false;
-              for (let c = 0; c < headerRow.length; c++) {
-                const hName = headerRow[c] || `col_${c}`;
-                obj[hName] = dataRow[c] !== undefined ? dataRow[c] : '';
-                if (dataRow[c] !== undefined && dataRow[c] !== '') hasAnyData = true;
-              }
-              if (hasAnyData) {
-                effectiveRows.push(obj);
-              }
-            }
-            break;
-          }
+    if (isCsvFile) {
+      // Robust RFC 4180 CSV parsing
+      let csvText = '';
+      if (f.filePath && fs.existsSync(f.filePath)) {
+        try {
+          csvText = fs.readFileSync(f.filePath, 'utf-8');
+        } catch (e: any) {
+          warnings.push(`Could not read CSV file ${fileName}: ${e.message}`);
+        }
+      } else if (f.content) {
+        csvText = f.content;
+      } else if (f.buffer && Buffer.isBuffer(f.buffer)) {
+        csvText = f.buffer.toString('utf-8');
+      } else if (f.base64) {
+        try {
+          csvText = Buffer.from(f.base64, 'base64').toString('utf-8');
+        } catch (e: any) {
+          warnings.push(`Could not decode Base64 CSV ${fileName}: ${e.message}`);
         }
       }
 
-      // If still missing colTimestamp or colAction, use content-based heuristic auto-detection
-      if (!colTimestamp || !colAction) {
-        const availableHeaders = Object.keys(effectiveRows[0] || {});
-        const detected = autoDetectColumnsFromSample(effectiveRows, availableHeaders);
-        if (!colTimestamp && detected.colTimestamp) colTimestamp = detected.colTimestamp;
-        if (!colAction && detected.colAction) colAction = detected.colAction;
-        if (!colOrderCode && detected.colOrderCode) colOrderCode = detected.colOrderCode;
-        if (!colActor && detected.colActor) colActor = detected.colActor;
-      }
-
-      if (!colAction && !colTimestamp) {
-        warnings.push(`Sheet ${sheetName} in ${fileName} does not contain recognizable log action or date columns; skipped.`);
+      if (!csvText || csvText.trim().length === 0) {
+        warnings.push(`File ${fileName} was empty.`);
         continue;
       }
 
-      for (let idx = 0; idx < effectiveRows.length; idx++) {
-        totalRowsRead++;
-        const row = effectiveRows[idx];
+      const delimiter = detectCsvDelimiter(csvText.slice(0, 4096));
+      const parsedAoa = parseRFC4180Csv(csvText, delimiter);
+      sheetsToProcess.push({ sheetName: fileName, sheetAoa: parsedAoa });
+    } else {
+      // Excel workbook parsing
+      let workbook: XLSX.WorkBook | null = null;
+      if (f.filePath && fs.existsSync(f.filePath)) {
+        try {
+          workbook = XLSX.readFile(f.filePath, {
+            cellDates: false,
+            raw: true,
+            codepage: 65001,
+          } as any);
+        } catch (fileErr: any) {
+          warnings.push(`Could not read file ${fileName} from path: ${fileErr.message}`);
+        }
+      }
 
-        const rawTimestampVal = colTimestamp ? row[colTimestamp] : null;
-        const normalized = normalizeDateStringToCairo(rawTimestampVal);
+      if (!workbook) {
+        let buffer: Buffer | null = null;
+        if (f.buffer && Buffer.isBuffer(f.buffer)) {
+          buffer = f.buffer;
+        } else if (f.base64) {
+          buffer = Buffer.from(f.base64, 'base64');
+        } else if (f.content) {
+          buffer = Buffer.from(f.content, 'utf-8');
+        }
+
+        if (!buffer || buffer.length === 0) {
+          warnings.push(`File ${fileName} was empty or could not be buffered.`);
+          continue;
+        }
+
+        try {
+          workbook = XLSX.read(buffer, {
+            type: 'buffer',
+            cellDates: false,
+            raw: true,
+            codepage: 65001,
+          } as any);
+        } catch (parseErr: any) {
+          warnings.push(`Could not parse workbook ${fileName}: ${parseErr.message}`);
+          continue;
+        }
+      }
+
+      if (!workbook || !workbook.SheetNames || workbook.SheetNames.length === 0) {
+        warnings.push(`Workbook ${fileName} has no sheets.`);
+        continue;
+      }
+
+      for (const sName of workbook.SheetNames) {
+        const worksheet = workbook.Sheets[sName];
+        if (!worksheet) continue;
+        const sheetAoa: any[][] = XLSX.utils.sheet_to_json(worksheet, {
+          header: 1,
+          defval: '',
+          raw: true,
+        });
+        sheetsToProcess.push({ sheetName: sName, sheetAoa });
+      }
+    }
+
+    for (const { sheetName, sheetAoa } of sheetsToProcess) {
+      sheetsProcessed.push(`${fileName}::${sheetName}`);
+
+      if (!sheetAoa || sheetAoa.length === 0) {
+        warnings.push(`Sheet "${sheetName}" in "${fileName}" is completely empty.`);
+        continue;
+      }
+
+      // 1. Locate the true header row across the first 35 rows
+      let headerRowIndex = -1;
+      let colOrderCode: string | null = null;
+      let colActor: string | null = null;
+      let colAction: string | null = null;
+      let colTimestamp: string | null = null;
+      let colDate: string | null = null;
+      let colTime: string | null = null;
+      let colOrderId: string | null = null;
+      let headerRowArray: string[] = [];
+
+      for (let rIdx = 0; rIdx < Math.min(35, sheetAoa.length); rIdx++) {
+        const rowArray = (sheetAoa[rIdx] || []).map(cell => String(cell || '').trim());
+        const testAction = findMatchingField(rowArray, HEADER_ALIASES.rawActionText);
+        const testTimestamp = findMatchingField(rowArray, HEADER_ALIASES.eventTimestamp);
+        const testDate = findMatchingField(rowArray, HEADER_ALIASES.dateOnly);
+
+        // Header row identified if it has an action column AND (a timestamp column OR a date column)
+        if (testAction && (testTimestamp || testDate)) {
+          headerRowIndex = rIdx;
+          headerRowArray = rowArray;
+          colAction = testAction;
+          colTimestamp = testTimestamp;
+          colDate = testDate;
+          colTime = findMatchingField(rowArray, HEADER_ALIASES.timeOnly);
+          colOrderCode = findMatchingField(rowArray, HEADER_ALIASES.orderCode);
+          colActor = findMatchingField(rowArray, HEADER_ALIASES.actorName);
+          colOrderId = findMatchingField(rowArray, HEADER_ALIASES.vendoorOrderId);
+          break;
+        }
+      }
+
+      // Fallback: heuristic auto-detection from row objects if header aliases not met in top 35
+      if (headerRowIndex === -1 && sheetAoa.length > 1) {
+        const candidateHeaders = (sheetAoa[0] || []).map((c, i) => String(c || '').trim() || `col_${i}`);
+        const sampleRows: Record<string, any>[] = [];
+        for (let r = 1; r < Math.min(30, sheetAoa.length); r++) {
+          const rowObj: Record<string, any> = {};
+          for (let c = 0; c < candidateHeaders.length; c++) {
+            rowObj[candidateHeaders[c]] = sheetAoa[r]?.[c] ?? '';
+          }
+          sampleRows.push(rowObj);
+        }
+
+        const detected = autoDetectColumnsFromSample(sampleRows, candidateHeaders);
+        if (detected.colAction && (detected.colTimestamp || detected.colDate)) {
+          headerRowIndex = 0;
+          headerRowArray = candidateHeaders;
+          colAction = detected.colAction;
+          colTimestamp = detected.colTimestamp;
+          colDate = detected.colDate;
+          colTime = detected.colTime;
+          colOrderCode = detected.colOrderCode;
+          colActor = detected.colActor;
+          colOrderId = detected.colOrderId;
+        }
+      }
+
+      // Condition 3: If this sheet does not contain required columns (e.g. Summary / Cover Sheet),
+      // skip it gracefully without failing the entire multi-sheet workbook!
+      if (!colAction || (!colTimestamp && !colDate) || headerRowIndex === -1) {
+        warnings.push(`تم تخطي ورقة "${sheetName}" في "${fileName}" (ورقة ملخص أو لا تحتوي على بنية أعمدة اللوجز المطلوبة: نص الحركة والتاريخ).`);
+        continue;
+      }
+
+      totalValidSheets++;
+
+      // Pre-resolve column indices for direct, high-speed array access without allocating row objects
+      const actionColIdx = colAction ? headerRowArray.indexOf(colAction) : -1;
+      const timestampColIdx = colTimestamp ? headerRowArray.indexOf(colTimestamp) : -1;
+      const dateColIdx = colDate ? headerRowArray.indexOf(colDate) : -1;
+      const timeColIdx = colTime ? headerRowArray.indexOf(colTime) : -1;
+      const orderCodeColIdx = colOrderCode ? headerRowArray.indexOf(colOrderCode) : -1;
+      const actorColIdx = colActor ? headerRowArray.indexOf(colActor) : -1;
+      const orderIdColIdx = colOrderId ? headerRowArray.indexOf(colOrderId) : -1;
+
+      // Process data rows starting immediately after the discovered header row
+      const dataStartIdx = headerRowIndex + 1;
+      for (let rIdx = dataStartIdx; rIdx < sheetAoa.length; rIdx++) {
+        const row = sheetAoa[rIdx];
+        if (!row || row.length === 0) continue;
+
+        const actionRaw = actionColIdx >= 0 ? row[actionColIdx] : '';
+        const actionText = actionRaw !== undefined && actionRaw !== null ? String(actionRaw).trim() : '';
+        const rawTimestampVal = timestampColIdx >= 0 ? row[timestampColIdx] : null;
+        const rawDateVal = dateColIdx >= 0 ? row[dateColIdx] : null;
+        const rawTimeVal = timeColIdx >= 0 ? row[timeColIdx] : null;
+
+        // Skip completely blank rows or intermediate subheaders between months without logging as unparseable
+        if (!actionText && (rawTimestampVal === null || rawTimestampVal === undefined || rawTimestampVal === '') &&
+            (rawDateVal === null || rawDateVal === undefined || rawDateVal === '')) {
+          continue;
+        }
+
+        totalRowsRead++;
+
+        const normalized = normalizeDateStringToCairo(
+          rawTimestampVal !== undefined && rawTimestampVal !== null && rawTimestampVal !== ''
+            ? rawTimestampVal
+            : rawDateVal,
+          rawTimeVal
+        );
 
         if (!normalized.dateStr || !normalized.timestampStr) {
           unparseableRows++;
@@ -533,33 +856,45 @@ export async function importBatchLogFiles(
             reviewRows.push({
               fileName,
               sheetName,
-              rowIndex: idx + 2,
-              reason: 'تاريخ الحدث مفقود أو غير قابل للتحليل',
-              sampleData: row,
+              rowIndex: rIdx + 1,
+              reason: 'تاريخ ووقت الحركة غير صالح أو مفقود في السطر',
+              sampleData: {
+                rowIndex: rIdx + 1,
+                date: rawDateVal,
+                time: rawTimeVal,
+                timestamp: rawTimestampVal,
+                action: actionText,
+              },
             });
           }
           continue;
         }
 
-        const dateStr = normalized.dateStr;
-        const actionText = colAction ? String(row[colAction] || '').trim() : '';
         if (!actionText) {
           unparseableRows++;
           if (reviewRows.length < 50) {
             reviewRows.push({
               fileName,
               sheetName,
-              rowIndex: idx + 2,
+              rowIndex: rIdx + 1,
               reason: 'نص حركة اللوج فارغ',
-              sampleData: row,
+              sampleData: {
+                rowIndex: rIdx + 1,
+                date: rawDateVal,
+                timestamp: rawTimestampVal,
+              },
             });
           }
           continue;
         }
 
-        const actorName = colActor && row[colActor] ? String(row[colActor]).trim() : 'النظام';
-        const orderCode = colOrderCode && row[colOrderCode] ? String(row[colOrderCode]).trim() : null;
-        const rawOrderId = colOrderId && row[colOrderId] ? parseInt(String(row[colOrderId]), 10) : null;
+        validRecordsCount++;
+        const dateStr = normalized.dateStr;
+        const rawActor = actorColIdx >= 0 ? row[actorColIdx] : null;
+        const actorName = rawActor ? String(rawActor).trim() : 'النظام';
+        const rawOrderCode = orderCodeColIdx >= 0 ? row[orderCodeColIdx] : null;
+        const orderCode = rawOrderCode ? String(rawOrderCode).trim() : null;
+        const rawOrderId = orderIdColIdx >= 0 ? parseInt(String(row[orderIdColIdx]), 10) : null;
         const vendoorOrderId = isNaN(rawOrderId as any) ? null : rawOrderId;
 
         if (!dateGroups.has(dateStr)) {
@@ -576,22 +911,110 @@ export async function importBatchLogFiles(
         });
 
         dateSourceFiles.get(dateStr)!.add(fileName);
+
+        // Progress notification every 2,500 rows
+        if (onProgress && totalRowsRead % 2500 === 0) {
+          onProgress({
+            stage: 'PARSING',
+            stageLabelAr: `جاري قراءة وتحليل الحركات (${totalRowsRead.toLocaleString()} حركة)...`,
+            rowsRead: totalRowsRead,
+            rowsTotal: totalRowsRead,
+            datesDiscovered: dateGroups.size,
+            savedCount: totalSaved,
+            duplicatesCount: totalDuplicates,
+            unparseableRows,
+          });
+        }
       }
     }
   }
 
-  // Ingest grouped records by date into SQLite & Supabase
-  let totalSaved = 0;
-  let totalDuplicates = 0;
-  const discoveredDates: DiscoveredDaySummary[] = [];
+  // Condition 3 & 6: Evaluate outcomes honestly
+  if (totalValidSheets === 0) {
+    return {
+      success: false,
+      status: 'UNRECOGNIZED_COLUMNS',
+      statusMessageAr: 'لم يتم العثور على أي ورقة عمل تحتوي على أعمدة اللوجز المطلوبة (نص الحركة وعمود التاريخ/الوقت)',
+      batchId,
+      filesProcessed,
+      sheetsProcessed,
+      totalRowsRead: 0,
+      validRecordsCount: 0,
+      totalSaved: 0,
+      totalDuplicates: 0,
+      unparseableRows: 0,
+      unmatchedOrdersCount: 0,
+      discoveredDates: [],
+      reviewRows: [],
+      warnings,
+    };
+  }
 
-  for (const [dateStr, entries] of dateGroups.entries()) {
+  if (totalRowsRead > 0 && validRecordsCount === 0) {
+    return {
+      success: false,
+      status: 'INVALID_DATES',
+      statusMessageAr: 'تمت قراءة الصفوف لكن جميع التواريخ غير قابلة للتحليل',
+      batchId,
+      filesProcessed,
+      sheetsProcessed,
+      totalRowsRead,
+      validRecordsCount: 0,
+      totalSaved: 0,
+      totalDuplicates: 0,
+      unparseableRows,
+      unmatchedOrdersCount: 0,
+      discoveredDates: [],
+      reviewRows: reviewRows.slice(0, 50),
+      warnings,
+    };
+  }
+
+  if (totalRowsRead === 0) {
+    return {
+      success: false,
+      status: 'EMPTY_FILE',
+      statusMessageAr: 'الملفات المرفوعة فارغة أو لا تحتوي على صفوف بيانات صالحة',
+      batchId,
+      filesProcessed,
+      sheetsProcessed,
+      totalRowsRead: 0,
+      validRecordsCount: 0,
+      totalSaved: 0,
+      totalDuplicates: 0,
+      unparseableRows: 0,
+      unmatchedOrdersCount: 0,
+      discoveredDates: [],
+      reviewRows: [],
+      warnings,
+    };
+  }
+
+  // Ingest grouped records by date into SQLite
+  const discoveredDates: DiscoveredDaySummary[] = [];
+  const sortedDates = Array.from(dateGroups.keys()).sort();
+
+  for (let dIdx = 0; dIdx < sortedDates.length; dIdx++) {
+    const dateStr = sortedDates[dIdx];
+    const entries = dateGroups.get(dateStr)!;
     const interval = getCairoDateInterval(dateStr);
     const filesList = Array.from(dateSourceFiles.get(dateStr) || []);
     const isCsv = filesList.some(f => f.toLowerCase().endsWith('.csv'));
     const dataSource = isCsv ? 'CSV_IMPORT' : 'EXCEL_IMPORT';
 
-    // Persist logs with explicit dataSource and batchId
+    if (onProgress) {
+      onProgress({
+        stage: 'SAVING_RECORDS',
+        stageLabelAr: `جاري حفظ حركات يوم ${dateStr} (${dIdx + 1}/${sortedDates.length})...`,
+        rowsRead: totalRowsRead,
+        rowsTotal: totalRowsRead,
+        datesDiscovered: dateGroups.size,
+        savedCount: totalSaved,
+        duplicatesCount: totalDuplicates,
+        unparseableRows,
+      });
+    }
+
     const persistResult = persistLogEntries(entries, interval, {
       dataSource,
       batchId,
@@ -601,7 +1024,13 @@ export async function importBatchLogFiles(
     totalSaved += persistResult.saved;
     totalDuplicates += persistResult.duplicates;
 
-    // Count total canonical records for this day
+    // Check unmatched count in this date
+    const unmatchedForDay = (db.prepare(`
+      SELECT COUNT(*) as c FROM canonical_activity_events
+      WHERE event_timestamp >= ? AND event_timestamp < ? AND order_match_status = 'UNRESOLVED'
+    `).get(interval.startCairo, interval.endCairo) as any)?.c || 0;
+    unmatchedOrdersCount += unmatchedForDay;
+
     const canonicalCount = (db.prepare(`
       SELECT COUNT(*) as c FROM canonical_activity_events
       WHERE event_timestamp >= ? AND event_timestamp < ?
@@ -615,7 +1044,7 @@ export async function importBatchLogFiles(
     const nowIso = new Date().toISOString();
     const filesString = filesList.join(', ');
 
-    // Update the Day Registry (historical_coverage)
+    // Update historical coverage registry
     saveCoverageRecord({
       accountId: 'primary',
       sourceDomain: 'logs',
@@ -641,7 +1070,7 @@ export async function importBatchLogFiles(
       notes: `Batch import: ${entries.length} rows processed from [${filesString}]`,
     });
 
-    // Attempt direct Supabase sync and verification if configured
+    // Remote Supabase verification if configured
     let remoteStatus = 'NONE';
     if (isSupabaseConfigured()) {
       try {
@@ -670,20 +1099,41 @@ export async function importBatchLogFiles(
     });
   }
 
-  // Sort discovered dates chronologically
-  discoveredDates.sort((a, b) => a.date.localeCompare(b.date));
+  // Determine final status
+  let finalStatus: BatchImportStatus = 'SUCCESS';
+  let statusMessageAr = '';
+
+  if (totalSaved > 0 && unparseableRows === 0) {
+    finalStatus = 'SUCCESS';
+    statusMessageAr = `تم استيراد ${totalSaved} حركة جديدة بنجاح عبر ${discoveredDates.length} يوماً.`;
+  } else if (totalSaved > 0 && unparseableRows > 0) {
+    finalStatus = 'PARTIAL';
+    statusMessageAr = `تم استيراد ${totalSaved} حركة جديدة جزئياً مع استبعاد ${unparseableRows} صفاً غير قابل للتحليل.`;
+  } else if (totalSaved === 0 && totalDuplicates > 0) {
+    finalStatus = 'ALL_DUPLICATES';
+    statusMessageAr = `جميع الحركات في الملف (${totalDuplicates} حركة) مسجلة ومحفوظة مسبقاً في قاعدة البيانات.`;
+  } else {
+    finalStatus = 'NO_VALID_RECORDS';
+    statusMessageAr = 'لم يتم حفظ أي حركات جديدة ولم توجد حركات مكررة صالحة في الملف.';
+  }
+
+  const isOverallSuccess = (finalStatus === 'SUCCESS' || finalStatus === 'ALL_DUPLICATES' || (finalStatus === 'PARTIAL' && totalSaved > 0));
 
   return {
-    success: true,
+    success: isOverallSuccess,
+    status: finalStatus,
+    statusMessageAr,
     batchId,
     filesProcessed,
     sheetsProcessed,
     totalRowsRead,
+    validRecordsCount,
     totalSaved,
     totalDuplicates,
     unparseableRows,
+    unmatchedOrdersCount,
     discoveredDates,
-    reviewRows: reviewRows.slice(0, 100),
+    reviewRows: reviewRows.slice(0, 50),
     warnings,
   };
 }

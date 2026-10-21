@@ -1,20 +1,27 @@
 import React, { useState, useEffect } from 'react';
-import { AlertTriangle, PhoneCall, ShoppingBag, CheckCircle, Search, Eye } from 'lucide-react';
+import { AlertTriangle, PhoneCall, CheckCircle, Search, Eye, Calendar, ShieldCheck, Clock } from 'lucide-react';
 import { Order } from '../types';
 import { isLowDeliveryRate } from '../utils/delivery';
 import { safeFetchJson } from '../utils/api';
 
+interface PrintedOrderWithAudit extends Order {
+  printed_by?: string;
+  log_match_status?: 'MATCHED' | 'PENDING_LOG_MATCH' | 'PENDING_ORDER_PULL';
+}
+
 interface PrintedViewProps {
   initialSubTab?: 'all' | 'no_extra_phone' | 'multi_merchant' | 'low_delivery';
+  selectedDate?: string;
   onSelectOrder: (orderCode: string) => void;
 }
 
 export const PrintedView: React.FC<PrintedViewProps> = ({
   initialSubTab = 'all',
+  selectedDate,
   onSelectOrder,
 }) => {
   const [subTab, setSubTab] = useState<'all' | 'no_extra_phone' | 'multi_merchant' | 'low_delivery'>(initialSubTab);
-  const [orders, setOrders] = useState<Order[]>([]);
+  const [orders, setOrders] = useState<PrintedOrderWithAudit[]>([]);
   const [loading, setLoading] = useState(false);
   const [search, setSearch] = useState('');
 
@@ -24,12 +31,15 @@ export const PrintedView: React.FC<PrintedViewProps> = ({
 
   useEffect(() => {
     fetchPrintedOrders();
-  }, [subTab]);
+  }, [subTab, selectedDate]);
 
   async function fetchPrintedOrders() {
     setLoading(true);
     try {
-      const { ok, data } = await safeFetchJson<{ orders: Order[] }>(`/api/printed?category=${subTab}`);
+      const dateParam = selectedDate ? `&date=${encodeURIComponent(selectedDate)}` : '';
+      const { ok, data } = await safeFetchJson<{ orders: PrintedOrderWithAudit[]; total: number; date?: string }>(
+        `/api/printed?category=${subTab}${dateParam}`
+      );
       if (ok && data) {
         setOrders(data.orders || []);
       }
@@ -44,9 +54,11 @@ export const PrintedView: React.FC<PrintedViewProps> = ({
     if (!search) return true;
     const q = search.toLowerCase();
     return (
-      o.random_number.toLowerCase().includes(q) ||
-      o.customer_phone.includes(q) ||
-      (o.customer_name && o.customer_name.toLowerCase().includes(q))
+      (o.random_number && o.random_number.toLowerCase().includes(q)) ||
+      (o.order_no && o.order_no.toLowerCase().includes(q)) ||
+      (o.customer_phone && o.customer_phone.includes(q)) ||
+      (o.customer_name && o.customer_name.toLowerCase().includes(q)) ||
+      (o.printed_by && o.printed_by.toLowerCase().includes(q))
     );
   });
 
@@ -61,9 +73,13 @@ export const PrintedView: React.FC<PrintedViewProps> = ({
               {orders.length} طلب
             </span>
           </h2>
-          <p className="text-xs text-slate-400 mt-1">
-            مراقبة شاملة لكفاءة وجودة الطلبات التي دخلت حالة الطباعة والتأكيد
-          </p>
+          <div className="flex items-center gap-2 mt-1 text-xs text-slate-400">
+            <Calendar className="w-3.5 h-3.5 text-amber-400" />
+            <span>نطاق يوم العمل المختار:</span>
+            <span className="font-mono text-amber-300 font-semibold">{selectedDate || 'اليوم الحالي'}</span>
+            <span className="text-slate-600">•</span>
+            <span>مقيدة باليوم ومطابقة بسجلات تحركات فيندور</span>
+          </div>
         </div>
 
         {/* Category Tabs */}
@@ -87,7 +103,7 @@ export const PrintedView: React.FC<PrintedViewProps> = ({
             }`}
           >
             <AlertTriangle className="w-3.5 h-3.5 text-rose-400" />
-            <span>فئة ب: تعدد أكواد المخازن</span>
+            <span>تعدد أكواد المخازن</span>
           </button>
           <button
             onClick={() => setSubTab('no_extra_phone')}
@@ -98,31 +114,32 @@ export const PrintedView: React.FC<PrintedViewProps> = ({
             }`}
           >
             <PhoneCall className="w-3.5 h-3.5 text-amber-400" />
-            <span>فئة أ: دون هاتف إضافي</span>
+            <span>دون هاتف إضافي</span>
           </button>
           <button
             onClick={() => setSubTab('low_delivery')}
             className={`px-3 py-1.5 rounded-md transition-all flex items-center gap-1.5 cursor-pointer ${
               subTab === 'low_delivery'
                 ? 'bg-rose-500/20 text-rose-300 border border-rose-500/30 shadow-sm'
-                : 'text-slate-400 hover:text-slate-200'
+                : 'text-slate-400 hover:text-rose-400'
             }`}
           >
-            <span>فئة ج: نسبة تسليم &lt; 70%</span>
+            <AlertTriangle className="w-3.5 h-3.5 text-rose-400" />
+            <span>نسبة تسليم حرجة &lt; 70%</span>
           </button>
         </div>
       </div>
 
-      {/* Search Input */}
+      {/* Filter and Search Bar */}
       <div className="flex items-center gap-3">
-        <div className="relative flex-1 max-w-md">
-          <Search className="w-4 h-4 absolute right-3 top-3 text-slate-500" />
+        <div className="relative flex-1">
+          <Search className="w-4 h-4 text-slate-500 absolute right-3 top-1/2 -translate-y-1/2" />
           <input
             type="text"
-            placeholder="بحث بالكود العشوائي (tc7328)، الهاتف، أو اسم العميل..."
             value={search}
             onChange={(e) => setSearch(e.target.value)}
-            className="w-full bg-slate-900 border border-slate-800 rounded-lg pr-9 pl-4 py-2 text-xs text-slate-200 placeholder-slate-500 focus:outline-none focus:border-amber-500/50"
+            placeholder="بحث بالكود، رقم الهاتف، اسم العميل، أو الموظف المنفذ..."
+            className="w-full bg-slate-900 border border-slate-800 rounded-lg pl-3 pr-9 py-2 text-xs text-slate-200 placeholder:text-slate-500 focus:outline-none focus:border-amber-500/50"
           />
         </div>
       </div>
@@ -141,28 +158,34 @@ export const PrintedView: React.FC<PrintedViewProps> = ({
                 <th className="py-3 px-4 font-semibold">أكواد المخازن</th>
                 <th className="py-3 px-4 font-semibold">نسبة التسليم</th>
                 <th className="py-3 px-4 font-semibold">الإجمالي</th>
-                <th className="py-3 px-4 font-semibold">تاريخ الطباعة</th>
+                <th className="py-3 px-4 font-semibold">توقيت التأكيد</th>
+                <th className="py-3 px-4 font-semibold">الموظف المنفذ</th>
+                <th className="py-3 px-4 font-semibold">مطابقة اللوجز</th>
                 <th className="py-3 px-4 font-semibold text-center">إجراء</th>
               </tr>
             </thead>
             <tbody className="divide-y divide-slate-800/60">
               {loading ? (
                 <tr>
-                  <td colSpan={10} className="py-12 text-center text-slate-500">
-                    جاري تحميل الطلبات المطبوعة...
+                  <td colSpan={12} className="py-12 text-center text-slate-500">
+                    جاري تحميل وفحص الطلبات المطبوعة لليوم المختار...
                   </td>
                 </tr>
               ) : filtered.length === 0 ? (
                 <tr>
-                  <td colSpan={10} className="py-12 text-center text-slate-500">
-                    لا توجد طلبات مطابقة للفئة المحددة حاليًا
+                  <td colSpan={12} className="py-12 text-center text-slate-500">
+                    لا توجد طلبات مطابقة للفئة المحددة في هذا التاريخ
                   </td>
                 </tr>
               ) : (
                 filtered.map((order) => {
                   const isMulti = order.multi_merchant_flag === 1;
-                  const hasLowDelivery = isLowDeliveryRate(order.delivery_rate, order.cancel_rate, order.total_customer_orders, order.delivery_rate_denom);
-                  const noExtraPhone = !order.customer_phone_extra || order.extra_phone_valid === 0;
+                  const hasLowDelivery = isLowDeliveryRate(
+                    order.delivery_rate,
+                    order.cancel_rate,
+                    order.total_customer_orders,
+                    order.delivery_rate_denom
+                  );
 
                   return (
                     <tr
@@ -194,7 +217,7 @@ export const PrintedView: React.FC<PrintedViewProps> = ({
                         {order.customer_phone}
                       </td>
 
-                      {/* Extra Phone with Validation */}
+                      {/* Extra Phone */}
                       <td className="py-3 px-4">
                         {order.customer_phone_extra ? (
                           <span
@@ -218,7 +241,7 @@ export const PrintedView: React.FC<PrintedViewProps> = ({
                         {order.governorate || '—'}
                       </td>
 
-                      {/* Warehouse & Merchant Codes */}
+                      {/* Warehouse Codes */}
                       <td className="py-3 px-4">
                         <div className="flex flex-col gap-1 items-start">
                           {isMulti ? (
@@ -228,12 +251,7 @@ export const PrintedView: React.FC<PrintedViewProps> = ({
                             </span>
                           ) : (
                             <span className="text-slate-400 text-xs">
-                              {order.warehouseCodes?.[0] ? `مخزن ${order.warehouseCodes[0]}` : `مخزن واحد (${order.distinct_merchant_count})`}
-                            </span>
-                          )}
-                          {order.merchantCodes && order.merchantCodes.length > 0 && (
-                            <span className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded bg-amber-950/60 border border-amber-500/40 text-amber-300 text-[10px] font-mono">
-                              تاجر: {order.merchantCodes.join(', ')}
+                              {order.warehouseCodes?.[0] ? `مخزن ${order.warehouseCodes[0]}` : `مخزن واحد (${order.distinct_merchant_count || 1})`}
                             </span>
                           )}
                         </div>
@@ -266,9 +284,41 @@ export const PrintedView: React.FC<PrintedViewProps> = ({
                         {order.total_order} ج.م
                       </td>
 
-                      {/* Printed Date */}
-                      <td className="py-3 px-4 text-slate-400 font-mono text-[11px]">
-                        {order.printed_date || '—'}
+                      {/* Printed / Confirmed Time */}
+                      <td className="py-3 px-4 text-slate-300 font-mono text-[11px] whitespace-nowrap">
+                        <div className="flex items-center gap-1">
+                          <Clock className="w-3 h-3 text-slate-500" />
+                          <span>{order.printed_date ? order.printed_date.slice(11, 19) || order.printed_date.slice(0, 10) : '—'}</span>
+                        </div>
+                        <div className="text-[10px] text-slate-500 font-mono">
+                          {order.printed_date ? order.printed_date.slice(0, 10) : ''}
+                        </div>
+                      </td>
+
+                      {/* Employee who printed it */}
+                      <td className="py-3 px-4 text-slate-300 font-medium text-xs">
+                        {order.printed_by ? (
+                          <span className="px-2 py-0.5 rounded bg-slate-800 text-slate-200 border border-slate-700/60 font-medium text-[11px]">
+                            {order.printed_by}
+                          </span>
+                        ) : (
+                          <span className="text-slate-500 text-[11px]">غير متوفر</span>
+                        )}
+                      </td>
+
+                      {/* Log match status */}
+                      <td className="py-3 px-4">
+                        {order.log_match_status === 'MATCHED' ? (
+                          <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded bg-emerald-500/10 border border-emerald-500/30 text-emerald-300 text-[11px] font-medium">
+                            <ShieldCheck className="w-3 h-3 text-emerald-400" />
+                            <span>مؤكد باللوجز</span>
+                          </span>
+                        ) : (
+                          <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded bg-amber-500/10 border border-amber-500/30 text-amber-300 text-[11px] font-medium">
+                            <Clock className="w-3 h-3 text-amber-400" />
+                            <span>في انتظار اللوج</span>
+                          </span>
+                        )}
                       </td>
 
                       {/* Action */}

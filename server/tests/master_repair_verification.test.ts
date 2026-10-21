@@ -463,6 +463,7 @@ async function runMasterVerification() {
   });
 
   console.log(`\n🎉 ALL ${passedTests} / ${totalTests} MASTER REPAIR TESTS PASSED! 🎉\n`);
+  process.exit(0);
 }
 
 runMasterVerification().catch((err) => {

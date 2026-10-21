@@ -154,6 +154,7 @@ export default function App() {
           {currentTab === 'printed' && (
             <PrintedView
               initialSubTab={printedSubTab}
+              selectedDate={selectedBusinessDate}
               onSelectOrder={(code) => setSelectedOrderCode(code)}
             />
           )}

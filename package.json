@@ -10,7 +10,7 @@
     "db:import-sqlite": "tsx server/importSqliteToSupabase.ts",
     "clean": "rm -rf dist dist-server",
     "lint": "tsc --noEmit",
-    "test": "tsx server/tests/acceptance.test.ts && tsx server/tests/requirements_verification.test.ts && tsx server/tests/sync_reconciliation_regression.test.ts && tsx server/tests/master_repair_verification.test.ts && tsx server/tests/comprehensive_master_system_verification.test.ts && tsx server/tests/merchant_code_reconciliation_integrity.test.ts && tsx server/tests/logs_intelligence_report_acceptance.test.ts && tsx server/tests/live_pipeline_characterization.test.ts && tsx server/tests/comprehensive_logs_audit_verification.ts && tsx server/tests/unified_historical_ingestion_and_smart_fetch.test.ts && tsx server/tests/followup_engineering_verification.test.ts && tsx server/tests/excel_large_multi_month_import_verification.test.ts"
+    "test": "tsx server/tests/acceptance.test.ts && tsx server/tests/requirements_verification.test.ts && tsx server/tests/sync_reconciliation_regression.test.ts && tsx server/tests/master_repair_verification.test.ts && tsx server/tests/comprehensive_master_system_verification.test.ts && tsx server/tests/merchant_code_reconciliation_integrity.test.ts && tsx server/tests/logs_intelligence_report_acceptance.test.ts && tsx server/tests/live_pipeline_characterization.test.ts && tsx server/tests/comprehensive_logs_audit_verification.ts && tsx server/tests/unified_historical_ingestion_and_smart_fetch.test.ts && tsx server/tests/followup_engineering_verification.test.ts && tsx server/tests/excel_large_multi_month_import_verification.test.ts && tsx server/tests/team_status_transition_dedup.test.ts"
   },
   "dependencies": {
     "@google/genai": "^2.4.0",

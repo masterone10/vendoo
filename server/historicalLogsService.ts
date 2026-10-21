@@ -104,6 +104,9 @@ export function persistLogEntries(
     UPDATE orders
     SET current_status = ?,
         validation_status = 'RESOLVED_VIA_AUDIT_LOGS',
+        printed_date = CASE WHEN ? = 'Printed' THEN COALESCE(printed_date, ?) ELSE printed_date END,
+        canceling_date = CASE WHEN ? = 'Canceled' THEN COALESCE(canceling_date, ?) ELSE canceling_date END,
+        state_entry_at = ?,
         last_observed_at = ?
     WHERE id = ? AND (state_entry_at IS NULL OR state_entry_at <= ?)
   `);
@@ -233,8 +236,8 @@ export function persistLogEntries(
                 nowIso
               );
 
-              // Update order current status if event is newer than state_entry_at
-              updateOrderStatusStmt.run(parsed.toStatus, nowIso, ord.id, eventTime);
+              // Update order current status and transition timestamps if event is newer than state_entry_at
+              updateOrderStatusStmt.run(parsed.toStatus, parsed.toStatus, eventTime, parsed.toStatus, eventTime, eventTime, nowIso, ord.id, eventTime);
             }
           }
         } catch {

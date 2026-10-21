@@ -28,6 +28,7 @@ const portArgIndex = process.argv.indexOf('--port');
 const cliPort = portArgIndex !== -1 && process.argv[portArgIndex + 1] ? parseInt(process.argv[portArgIndex + 1], 10) : null;
 const port = cliPort || (process.env.PORT ? parseInt(process.env.PORT, 10) : 3000);
 
+app.use('/api/logs/upload-chunk', express.raw({ type: 'application/octet-stream', limit: '20mb' }));
 app.use(express.json({ limit: '50mb' }));
 app.use(express.urlencoded({ extended: true, limit: '50mb' }));
 
