@@ -2,8 +2,9 @@ import crypto from 'node:crypto';
 import { db, getCairoDateInterval, getCairoDateString, isDateInHot } from './db.ts';
 import { vendoorClient } from './vendoorClient.ts';
 import { parseLogActionDetails } from './logDetailsParser.ts';
-import { persistLogEntries } from './historicalLogsService.ts';
+import { persistLogEntries, repairRawWithoutCanonical } from './historicalLogsService.ts';
 import { importBatchLogFiles } from './batchLogsImporter.ts';
+import { isSupabaseConfigured, fetchDayLogsFromSupabase } from './supabaseClient.ts';
 
 export type FetchStage =
   | 'IDLE'
@@ -161,10 +162,38 @@ export async function ensureCoverageForRange(
     }
   }
 
-  // If all dates are complete or already recorded, finish immediately with cache indication
+  let totalSaved = 0;
+
+  // Step 1b: Check Supabase archive for any missing dates before attempting Vendoor fetch
+  if (missingDates.length > 0 && isSupabaseConfigured()) {
+    for (let i = missingDates.length - 1; i >= 0; i--) {
+      const d = missingDates[i];
+      job.stage = 'CHECKING_STORAGE';
+      job.stageLabelAr = `جاري استرجاع اللوجز من Supabase (${d})`;
+      onProgress?.(job);
+
+      try {
+        const restoreRes = await fetchDayLogsFromSupabase(d);
+        if (restoreRes.success && (restoreRes.rawRestored > 0 || restoreRes.canonicalRestored > 0)) {
+          totalSaved += restoreRes.rawRestored;
+          job.eventsSaved = totalSaved;
+          missingDates.splice(i, 1);
+        }
+      } catch (supaErr: any) {
+        console.warn(`[ensureCoverageForRange] Supabase restore check skipped for ${d}:`, supaErr.message);
+      }
+    }
+  }
+
+  // Ensure any raw records without canonical records are converted
+  try {
+    repairRawWithoutCanonical();
+  } catch {}
+
+  // If all dates are complete or were restored from Supabase/cache, finish immediately
   if (missingDates.length === 0) {
     job.stage = 'COMPLETE';
-    job.stageLabelAr = 'مكتمل باستخدام البيانات المخزنة';
+    job.stageLabelAr = 'مكتمل باستخدام البيانات المخزنة والأرشيف';
     job.completedAt = new Date().toISOString();
     job.loadedFromCache = true;
     onProgress?.(job);
@@ -173,9 +202,8 @@ export async function ensureCoverageForRange(
 
   job.loadedFromCache = false;
 
-  // Step 2: Fetch missing dates from Vendoor
+  // Step 2: Fetch any remaining missing dates from Vendoor
   let hasFailedPage = false;
-  let totalSaved = 0;
   let totalPagesDiscovered = 0;
   let totalPagesRead = 0;
   let lastError: string | null = null;

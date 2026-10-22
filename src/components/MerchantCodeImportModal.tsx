@@ -14,7 +14,7 @@ export const MerchantCodeImportModal: React.FC<MerchantCodeImportModalProps> = (
   onImportSuccess,
 }) => {
   const [pastedText, setPastedText] = useState('');
-  const [sourceSheetName, setSourceSheetName] = useState('ملف التجار المعتمد');
+  const [sourceSheetName, setSourceSheetName] = useState('ملف المخازن المعتمد');
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [report, setReport] = useState<MerchantCodeImportReport | null>(null);
@@ -157,8 +157,8 @@ export const MerchantCodeImportModal: React.FC<MerchantCodeImportModalProps> = (
               <FileSpreadsheet className="w-5 h-5" />
             </div>
             <div>
-              <h3 className="font-bold text-slate-100 text-base">استيراد وتوفيق أكواد التجار (Excel / CSV)</h3>
-              <p className="text-xs text-slate-400">ربط كود التاجر الحقيقي بسطور الأصناف والطلبات دون المساس بأسماء المخازن أو الحالات</p>
+              <h3 className="font-bold text-slate-100 text-base">استيراد وتوفيق أكواد المخازن (Excel / CSV)</h3>
+              <p className="text-xs text-slate-400">ربط كود المخزن المعتمد بسطور الأصناف والطلبات بدقة دون المساس بأسماء المخازن أو الحالات</p>
             </div>
           </div>
           <button
@@ -182,13 +182,13 @@ export const MerchantCodeImportModal: React.FC<MerchantCodeImportModalProps> = (
           <div className="p-4 rounded-xl bg-slate-950/50 border border-slate-800 text-xs text-slate-300 space-y-2">
             <div className="flex items-center gap-2 font-bold text-slate-200">
               <HelpCircle className="w-4 h-4 text-sky-400" />
-              <span>ضوابط استيراد أكواد التجار:</span>
+              <span>ضوابط توفيق واستيراد أكواد المخازن:</span>
             </div>
             <ul className="list-disc list-inside space-y-1 text-slate-400 pr-1">
-              <li>يتم حفظ كود التاجر كنص نقي مع الحفاظ الصارم على الأصفار البادئة (مثال: <code className="text-amber-300 font-mono">00123456</code>).</li>
+              <li>يتم حفظ كود المخزن المعتمد كنص نقي مع الحفاظ الصارم على الأصفار البادئة (مثال: <code className="text-amber-300 font-mono">00123456</code>).</li>
               <li>الربط يتم عبر معرف الطلب أو كود الطلب مع SKU للصنف لضمان دقة السطر.</li>
-              <li>أسماء المخازن (مثل «مخزن Y 21») مستقلة تمامًا ولا يتم خلطها بكود التاجر.</li>
-              <li>الترويسيات المعتمدة لكود التاجر: <code className="text-slate-300">كود التاجر</code>، <code className="text-slate-300">كود المورد</code>، <code className="text-slate-300">merchant_code</code>.</li>
+              <li>أسماء المخازن (مثل «مخزن Y 21») مستقلة تمامًا وموثقة في سجلات النظام.</li>
+              <li>الترويسيات المعتمدة لكود المخزن: <code className="text-slate-300">كود المخزن</code>، <code className="text-slate-300">المخزن</code>، <code className="text-slate-300">merchant_code</code>.</li>
             </ul>
           </div>
 
@@ -205,7 +205,7 @@ export const MerchantCodeImportModal: React.FC<MerchantCodeImportModalProps> = (
               value={sourceSheetName}
               onChange={(e) => setSourceSheetName(e.target.value)}
               className="w-full px-3.5 py-2 rounded-xl bg-slate-950 border border-slate-800 text-slate-200 text-xs focus:outline-none focus:border-amber-500/50"
-              placeholder="مثال: شيت تجار أكتوبر 2026"
+              placeholder="مثال: شيت المخازن أكتوبر 2026"
             />
           </div>
 
@@ -229,7 +229,7 @@ export const MerchantCodeImportModal: React.FC<MerchantCodeImportModalProps> = (
               rows={6}
               value={pastedText}
               onChange={(e) => setPastedText(e.target.value)}
-              placeholder={`انسخ الصفوف من Excel والصقها هنا، بحيث يتضمن السطر الأول العناوين، مثال:\nكود التاجر\tرقم الطلب\tكود الصنف (SKU)\tاسم التاجر\n00123456\ted6309\tPAN4-#FF0000-M\tتاجر الملابس`}
+              placeholder={`انسخ الصفوف من Excel والصقها هنا، بحيث يتضمن السطر الأول العناوين، مثال:\nكود المخزن\tرقم الطلب\tكود الصنف (SKU)\tاسم المخزن\n00123456\ted6309\tPAN4-#FF0000-M\tمخزن الملابس`}
               className="w-full px-3.5 py-2.5 rounded-xl bg-slate-950 border border-slate-800 text-slate-200 font-mono text-xs focus:outline-none focus:border-amber-500/50 resize-y leading-relaxed"
             />
           </div>
@@ -239,7 +239,7 @@ export const MerchantCodeImportModal: React.FC<MerchantCodeImportModalProps> = (
             <div className="p-4 rounded-xl bg-emerald-500/10 border border-emerald-500/20 text-xs space-y-2.5 animate-in fade-in">
               <div className="flex items-center gap-2 font-bold text-emerald-400">
                 <CheckCircle2 className="w-4 h-4" />
-                <span>تقرير اكتمال توفيق أكواد التجار بنجاح:</span>
+                <span>تقرير اكتمال توفيق أكواد المخازن بنجاح:</span>
               </div>
               <div className="grid grid-cols-2 sm:grid-cols-3 gap-2 font-mono text-slate-200 pt-1">
                 <div className="p-2 rounded bg-slate-900/80 border border-slate-800">

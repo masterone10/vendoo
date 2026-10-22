@@ -169,8 +169,14 @@ export function persistLogEntries(
           rawEventId = existingRow?.id ? Number(existingRow.id) : null;
           duplicates++;
         }
-      } catch {
-        duplicates++;
+      } catch (insertErr: any) {
+        if (insertErr?.code === 'SQLITE_CONSTRAINT' || insertErr?.message?.includes('UNIQUE')) {
+          const existingRow: any = findRawByHashStmt.get(sourceHash);
+          rawEventId = existingRow?.id ? Number(existingRow.id) : null;
+          duplicates++;
+        } else {
+          console.warn('[HistoricalLogs] Write error on raw event:', insertErr.message);
+        }
       }
 
       const isSystem = (
@@ -183,7 +189,9 @@ export function persistLogEntries(
       // Check if canonical event already exists for this exact raw_event_id or order, actor, action, timestamp
       const existingCanon: any = checkCanonStmt.get(rawEventId, orderCode, actorName, parsed.actionType, eventTime);
 
-      if (!existingCanon && isNewRaw) {
+      // CRITICAL FIX: Convert and create canonical event whenever it is missing,
+      // regardless of whether raw was just inserted or was already present from a previous pass!
+      if (!existingCanon) {
         try {
           let matchedOrderId: number | null = null;
           let matchStatus = 'UNRESOLVED';
@@ -605,4 +613,141 @@ export async function fetchAndPersistLogsForPeriod(
 
 export function getActiveJobStatus(targetDate: string): LogBackfillState | null {
   return activeJobs.get(targetDate) || null;
+}
+
+/**
+ * Detects raw activity logs that lack a corresponding canonical activity event
+ * and repairs them idempotently without needing to re-download from Vendoor.
+ */
+export function repairRawWithoutCanonical(dateStr?: string): {
+  examined: number;
+  repaired: number;
+  alreadyMatched: number;
+  errors: number;
+} {
+  const nowIso = new Date().toISOString();
+  let dateClause = '';
+  const params: any[] = [];
+
+  if (dateStr && typeof dateStr === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(dateStr.trim())) {
+    const interval = getCairoDateInterval(dateStr.trim());
+    dateClause = 'AND r.event_timestamp >= ? AND r.event_timestamp < ?';
+    params.push(interval.startCairo, interval.endCairo);
+  }
+
+  // Find raw events that have no canonical event linked by raw_event_id or natural key
+  const uncanonicalRows: any[] = db.prepare(`
+    SELECT r.id, r.order_code, r.actor_name, r.raw_action_text, r.event_timestamp,
+           r.storage_tier, r.page_source, r.data_source, r.import_id
+    FROM raw_activity_events r
+    WHERE NOT EXISTS (
+      SELECT 1 FROM canonical_activity_events c WHERE c.raw_event_id = r.id
+    ) ${dateClause}
+    ORDER BY r.id ASC
+    LIMIT 20000
+  `).all(...params);
+
+  if (uncanonicalRows.length === 0) {
+    return { examined: 0, repaired: 0, alreadyMatched: 0, errors: 0 };
+  }
+
+  const orderMap = new Map<string, number>();
+  const allOrders = db.prepare('SELECT id, random_number, order_no, vendoor_id FROM orders').all() as any[];
+  for (const o of allOrders) {
+    if (o.random_number) orderMap.set(o.random_number.trim(), o.id);
+    if (o.order_no) orderMap.set(o.order_no.trim(), o.id);
+    if (o.vendoor_id) orderMap.set(String(o.vendoor_id).trim(), o.id);
+  }
+
+  const checkCanon = db.prepare(`
+    SELECT id, raw_event_id FROM canonical_activity_events
+    WHERE raw_event_id = ?
+       OR (raw_event_id IS NULL AND order_code IS ? AND actor_name = ? AND action_type = ? AND event_timestamp = ?)
+    LIMIT 1
+  `);
+
+  const updateCanonRawId = db.prepare(`
+    UPDATE canonical_activity_events SET raw_event_id = ? WHERE id = ? AND raw_event_id IS NULL
+  `);
+
+  const insertCanon = db.prepare(`
+    INSERT INTO canonical_activity_events (
+      raw_event_id, order_code, actor_name, action_type, from_status, to_status,
+      event_timestamp, storage_tier, is_system_actor, created_at,
+      order_id, order_match_status, is_administrative, field_name, old_value, new_value, details_json,
+      data_source, import_id
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `);
+
+  let repaired = 0;
+  let alreadyMatched = 0;
+  let errors = 0;
+
+  db.exec('BEGIN TRANSACTION;');
+  try {
+    for (const r of uncanonicalRows) {
+      const parsed = parseLogActionDetails(r.raw_action_text || '', r.actor_name || '', r.order_code || '');
+      const detailsJson = JSON.stringify(parsed);
+
+      const exists: any = checkCanon.get(r.id, r.order_code, r.actor_name, parsed.actionType, r.event_timestamp);
+      if (exists) {
+        alreadyMatched++;
+        if (exists.raw_event_id === null || exists.raw_event_id === undefined) {
+          updateCanonRawId.run(r.id, exists.id);
+          repaired++;
+        }
+        continue;
+      }
+
+      const isSystem = (
+        (r.actor_name || '').toLowerCase().includes('system') ||
+        (r.actor_name || '').includes('النظام')
+      ) ? 1 : 0;
+
+      let matchedOrderId: number | null = null;
+      let matchStatus = 'UNRESOLVED';
+      if (!r.order_code) {
+        matchStatus = 'GENERAL_LOG';
+      } else {
+        const foundId = orderMap.get((r.order_code || '').trim());
+        if (foundId) {
+          matchedOrderId = foundId;
+          matchStatus = 'MATCHED';
+        }
+      }
+
+      try {
+        insertCanon.run(
+          r.id,
+          r.order_code,
+          r.actor_name || 'النظام',
+          parsed.actionType,
+          parsed.fromStatus,
+          parsed.toStatus,
+          r.event_timestamp,
+          r.storage_tier || 'HOT',
+          isSystem,
+          nowIso,
+          matchedOrderId,
+          matchStatus,
+          parsed.isAdministrative ? 1 : 0,
+          parsed.fieldName,
+          parsed.oldValue,
+          parsed.newValue,
+          detailsJson,
+          r.data_source || 'REPAIR_SERVICE',
+          r.import_id || null
+        );
+        repaired++;
+      } catch (err: any) {
+        errors++;
+      }
+    }
+    db.exec('COMMIT;');
+  } catch (txErr) {
+    try { db.exec('ROLLBACK;'); } catch {}
+    throw txErr;
+  }
+
+  return { examined: uncanonicalRows.length, repaired, alreadyMatched, errors };
 }

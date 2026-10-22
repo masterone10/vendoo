@@ -1,6 +1,6 @@
 import { db, getCairoDateInterval, saveCoverageRecord, type HistoricalCoverageRecord } from './db.ts';
 import { vendoorClient } from './vendoorClient.ts';
-import { persistLogEntries } from './historicalLogsService.ts';
+import { persistLogEntries, repairRawWithoutCanonical } from './historicalLogsService.ts';
 import { importBatchLogFiles } from './batchLogsImporter.ts';
 import {
   isSupabaseConfigured,
@@ -45,7 +45,7 @@ const activeDayResolutions = new Map<string, Promise<ResolvedDayResult>>();
  * Central Decision Policy Engine: resolveHistoricalDay()
  * Evaluates whether a requested date has historical data in any recorded source.
  * Strict Rule: Existing historical records PREVENT automatic full day re-downloads.
- * Only completely un-recorded days trigger automatic Vendoor fetching.
+ * Automatically restores missing logs from Supabase and repairs raw-to-canonical gaps.
  */
 export async function resolveHistoricalDay(
   dateStr: string,
@@ -63,6 +63,19 @@ export async function resolveHistoricalDay(
   const promise = (async (): Promise<ResolvedDayResult> => {
     const interval = getCairoDateInterval(cleanDate);
 
+    // 0. Only repair raw-to-canonical gaps if uncanonical records exist locally
+    const uncanonicalCount = (db.prepare(`
+      SELECT COUNT(*) as c FROM raw_activity_events r
+      WHERE r.event_timestamp >= ? AND r.event_timestamp < ?
+        AND NOT EXISTS (SELECT 1 FROM canonical_activity_events c WHERE c.raw_event_id = r.id)
+    `).get(interval.startCairo, interval.endCairo) as any)?.c || 0;
+
+    if (uncanonicalCount > 0) {
+      try {
+        repairRawWithoutCanonical(cleanDate);
+      } catch {}
+    }
+
     // 1. Inspect local coverage registry
     const cov: any = db.prepare(`
       SELECT * FROM historical_coverage
@@ -70,17 +83,17 @@ export async function resolveHistoricalDay(
     `).get(cleanDate);
 
     // 2. Count existing records in local SQLite
-    const rawCount = (db.prepare(`
+    let rawCount = (db.prepare(`
       SELECT COUNT(*) as c FROM raw_activity_events
       WHERE event_timestamp >= ? AND event_timestamp < ?
     `).get(interval.startCairo, interval.endCairo) as any)?.c || 0;
 
-    const canonCount = (db.prepare(`
+    let canonCount = (db.prepare(`
       SELECT COUNT(*) as c FROM canonical_activity_events
       WHERE event_timestamp >= ? AND event_timestamp < ?
     `).get(interval.startCairo, interval.endCairo) as any)?.c || 0;
 
-    const hasLocalData = rawCount > 0 || canonCount > 0;
+    let hasLocalData = rawCount > 0 || canonCount > 0;
 
     // -------------------------------------------------------------------------
     // Case H: Day verified complete with zero movements
@@ -101,23 +114,38 @@ export async function resolveHistoricalDay(
     }
 
     // -------------------------------------------------------------------------
-    // Case A: Missing locally, but verified in Supabase PostgreSQL Archive
+    // Case A & B: Check Supabase PostgreSQL Archive
+    // If local has 0 records, OR if Supabase is known/checked to have more records
     // -------------------------------------------------------------------------
-    if (!forceRefetch && !hasLocalData && isSupabaseConfigured()) {
+    if (!forceRefetch && isSupabaseConfigured() && (!hasLocalData || cov?.completion_status === 'PARTIAL' || !cov)) {
       options.onProgress?.('CHECKING_STORAGE', 'جاري فحص أرشيف Supabase البعيد...', 0, 1, 0);
       try {
         const restoreRes = await fetchDayLogsFromSupabase(cleanDate);
-        if (restoreRes.success && restoreRes.recordsRestored > 0) {
+        if (restoreRes.success && (restoreRes.rawRestored > 0 || restoreRes.canonicalRestored > 0)) {
           // Re-query local counts after restoration
-          const newCanonCount = (db.prepare(`
+          canonCount = (db.prepare(`
             SELECT COUNT(*) as c FROM canonical_activity_events
             WHERE event_timestamp >= ? AND event_timestamp < ?
           `).get(interval.startCairo, interval.endCairo) as any)?.c || 0;
 
-          const newRawCount = (db.prepare(`
+          rawCount = (db.prepare(`
             SELECT COUNT(*) as c FROM raw_activity_events
             WHERE event_timestamp >= ? AND event_timestamp < ?
           `).get(interval.startCairo, interval.endCairo) as any)?.c || 0;
+
+          hasLocalData = rawCount > 0 || canonCount > 0;
+
+          let remoteCovStatus: 'COMPLETE' | 'PARTIAL' = 'COMPLETE';
+          try {
+            const { pgQuery } = await import('./supabaseClient.ts');
+            const covRes = await pgQuery<{ completion_status: string }>(
+              `SELECT completion_status FROM historical_coverage WHERE period_date = $1 LIMIT 1`,
+              [cleanDate]
+            );
+            if (covRes.rows[0]?.completion_status === 'PARTIAL') {
+              remoteCovStatus = 'PARTIAL';
+            }
+          } catch {}
 
           // Update day registry
           const nowIso = new Date().toISOString();
@@ -128,31 +156,33 @@ export async function resolveHistoricalDay(
             storageTier: 'HOT',
             pagesDiscovered: 1,
             pagesRead: 1,
-            recordsExtracted: newRawCount,
-            recordsSaved: newRawCount,
-            completionStatus: 'COMPLETE',
+            recordsExtracted: rawCount,
+            recordsSaved: rawCount,
+            completionStatus: remoteCovStatus,
             dataSource: 'SUPABASE_ARCHIVE',
-            canonicalEventsCount: newCanonCount,
+            canonicalEventsCount: canonCount,
             localStorageStatus: 'LOCAL_SAVED',
             remoteArchiveStatus: 'REMOTE_VERIFIED',
             lastAttemptedAt: nowIso,
             completedAt: nowIso,
             verifiedAt: nowIso,
             lastSupabaseVerifiedAt: nowIso,
-            notes: 'Restored cleanly from Supabase PostgreSQL Archive',
+            notes: `Restored cleanly from Supabase PostgreSQL Archive (${remoteCovStatus})`,
           });
 
           return {
             date: cleanDate,
             decision: 'USE_SUPABASE_ARCHIVE',
             dataSource: 'SUPABASE_ARCHIVE',
-            completionStatus: 'COMPLETE',
+            completionStatus: remoteCovStatus,
             localStorageStatus: 'LOCAL_SAVED',
             remoteArchiveStatus: 'REMOTE_VERIFIED',
-            rawRecordsCount: newRawCount,
-            canonicalEventsCount: newCanonCount,
+            rawRecordsCount: rawCount,
+            canonicalEventsCount: canonCount,
             loadedFromCache: true,
-            messageAr: 'تم استرجاع بيانات اليوم من أرشيف Supabase البعيد بنجاح',
+            messageAr: remoteCovStatus === 'COMPLETE'
+              ? 'تم استرجاع ومطابقة بيانات اليوم من أرشيف Supabase السحابي بنجاح'
+              : 'تم استرجاع سجلات اليوم المتاحة من أرشيف Supabase (تغطية جزئية)',
           };
         }
       } catch (supaErr: any) {
@@ -200,7 +230,7 @@ export async function resolveHistoricalDay(
 
       return {
         date: cleanDate,
-        decision: 'USE_LOCAL_STORAGE',
+        decision: cov?.data_source === 'SUPABASE_ARCHIVE' ? 'USE_SUPABASE_ARCHIVE' : 'USE_LOCAL_STORAGE',
         dataSource: (cov?.data_source as any) || 'VENDOOR_FETCH',
         completionStatus: 'COMPLETE',
         localStorageStatus: 'LOCAL_SAVED',
@@ -208,7 +238,9 @@ export async function resolveHistoricalDay(
         rawRecordsCount: rawCount,
         canonicalEventsCount: canonCount,
         loadedFromCache: true,
-        messageAr: 'البيانات محفوظة ومكتملة محلياً',
+        messageAr: cov?.data_source === 'SUPABASE_ARCHIVE'
+          ? 'تم استرجاع ومطابقة بيانات اليوم من أرشيف Supabase السحابي بنجاح'
+          : 'البيانات محفوظة ومكتملة محلياً',
       };
     }
 

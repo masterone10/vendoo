@@ -398,8 +398,14 @@ export class SyncEngine {
   };
 
   public getStatus(): SyncEngineStatus {
-    const ordersCount = (db.prepare('SELECT COUNT(*) as count FROM orders').get() as any)?.count || 0;
-    const alertsCount = (db.prepare("SELECT COUNT(*) as count FROM alerts WHERE status != 'RESOLVED'").get() as any)?.count || 0;
+    let ordersCount = this.status.totalOrdersInDb;
+    let alertsCount = this.status.totalAlertsOpen;
+    try {
+      ordersCount = (db.prepare('SELECT COUNT(*) as count FROM orders').get() as any)?.count || ordersCount;
+      alertsCount = (db.prepare("SELECT COUNT(*) as count FROM alerts WHERE status != 'RESOLVED'").get() as any)?.count || alertsCount;
+    } catch {
+      // Return cached metrics if DB is momentarily locked by background writes
+    }
     return {
       ...this.status,
       totalOrdersInDb: ordersCount,
@@ -431,10 +437,12 @@ export class SyncEngine {
     this.status.isRunning = true;
     console.log(`[SyncEngine] Starting background sync worker (interval: ${intervalSeconds}s)...`);
 
-    // Run initial sync cycle
-    this.runFullSyncCycle('INITIAL').catch(err => {
-      console.error('[SyncEngine] Initial sync error:', err.message);
-    });
+    // Defer initial sync cycle by 3s so the Express server finishes binding and passing health checks
+    setTimeout(() => {
+      this.runFullSyncCycle('INITIAL').catch(err => {
+        console.error('[SyncEngine] Initial sync error:', err.message);
+      });
+    }, 3000);
 
     this.intervalTimer = setInterval(() => {
       if (this.isSyncing) {

@@ -39,6 +39,7 @@ import { getArchiveWorkerStatus, triggerArchivePass } from './supabaseArchiveWor
 import { importBatchLogFiles } from './batchLogsImporter.ts';
 import { handleLogUploadChunk, getImportJob, getActiveOrRecentJob } from './importJobManager.ts';
 import { resolveHistoricalDay } from './historicalDayResolver.ts';
+import { reconcileHistoricalRange } from './historicalReconciliationService.ts';
 
 export function isCSEmployee(actorName: string): boolean {
   if (!actorName) return false;
@@ -1223,12 +1224,56 @@ apiRouter.post('/reports/day-action', async (req: Request, res: Response) => {
     } else if (action === 'sync_supabase') {
       await syncDayLogsToSupabase(cleanDate);
       result = await resolveHistoricalDay(cleanDate, { autoFetchMissing: false });
+    } else if (action === 'reconcile') {
+      const rec = await reconcileHistoricalRange(cleanDate, cleanDate, { autoRepair: true });
+      result = await resolveHistoricalDay(cleanDate, { autoFetchMissing: false });
+      res.json({ success: true, dayStatus: result, reconciliation: rec });
+      return;
     } else {
       res.status(400).json({ success: false, error: `Unknown action: ${action}` });
       return;
     }
 
     res.json({ success: true, dayStatus: result });
+  } catch (err: any) {
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// Comprehensive Historical Reconciliation Diagnostic Report
+apiRouter.get('/historical/reconciliation', async (req: Request, res: Response) => {
+  try {
+    const rawDate = typeof req.query.date === 'string' ? req.query.date.trim().slice(0, 10) : '';
+    const rawStart = typeof req.query.startDate === 'string' ? req.query.startDate.trim().slice(0, 10) : '';
+    const rawEnd = typeof req.query.endDate === 'string' ? req.query.endDate.trim().slice(0, 10) : '';
+    const autoRepair = req.query.autoRepair !== 'false';
+    const fetchFromVendoor = req.query.fetchVendoor === 'true';
+
+    const sDate = rawStart || rawDate || getCairoDateString();
+    const eDate = rawEnd || rawDate || sDate;
+
+    const report = await reconcileHistoricalRange(sDate, eDate, {
+      autoRepair,
+      fetchFromVendoorIfMissing: fetchFromVendoor,
+    });
+    res.json({ success: true, report });
+  } catch (err: any) {
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// Idempotent Historical Repair Endpoint (Repairs gaps, converts raw->canonical, links orders)
+apiRouter.post('/historical/repair', async (req: Request, res: Response) => {
+  try {
+    const { date, startDate, endDate, actions } = req.body || {};
+    const sDate = (startDate || date || getCairoDateString()).slice(0, 10);
+    const eDate = (endDate || date || sDate).slice(0, 10);
+
+    const report = await reconcileHistoricalRange(sDate, eDate, {
+      autoRepair: true,
+      fetchFromVendoorIfMissing: Array.isArray(actions) && actions.includes('fetch_vendoor'),
+    });
+    res.json({ success: true, report });
   } catch (err: any) {
     res.status(500).json({ success: false, error: err.message });
   }

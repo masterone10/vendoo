@@ -266,7 +266,7 @@ export const OrderDetailsModal: React.FC<OrderDetailsModalProps> = ({ orderCode,
                 <div className="flex items-center justify-between">
                   <h4 className="font-bold text-slate-200 flex items-center gap-2">
                     <ShoppingBag className="w-4 h-4 text-amber-400" />
-                    <span>أصناف الطلب وتوزيع المخازن والتجار ({items.length} صنف)</span>
+                    <span>أصناف الطلب وتوزيع المخازن ({items.length} صنف)</span>
                   </h4>
                   <span className="text-slate-400 text-xs">
                     عدد المخازن المميزة: <strong className="text-amber-400 font-mono">{order.distinct_merchant_count}</strong>
@@ -280,9 +280,9 @@ export const OrderDetailsModal: React.FC<OrderDetailsModalProps> = ({ orderCode,
                         <th className="py-2.5 px-3">م</th>
                         <th className="py-2.5 px-3">اسم الصنف</th>
                         <th className="py-2.5 px-3">كود الصنف / SKU</th>
-                        <th className="py-2.5 px-3">كود التاجر (Merchant Code)</th>
-                        <th className="py-2.5 px-3">كود المستودع</th>
-                        <th className="py-2.5 px-3">اسم المستودع</th>
+                        <th className="py-2.5 px-3">كود المخزن المعتمد</th>
+                        <th className="py-2.5 px-3">كود المخزن</th>
+                        <th className="py-2.5 px-3">اسم المخزن</th>
                         <th className="py-2.5 px-3">اللون</th>
                         <th className="py-2.5 px-3">المقاس</th>
                         <th className="py-2.5 px-3">الكمية</th>
@@ -318,7 +318,7 @@ export const OrderDetailsModal: React.FC<OrderDetailsModalProps> = ({ orderCode,
                                   <div className="flex flex-col items-start gap-0.5">
                                     <span
                                       className="inline-flex items-center gap-1 px-2 py-0.5 rounded bg-amber-950/70 border border-amber-500/60 text-amber-300 text-xs shadow-xs"
-                                      title={`كود تاجر حقيقي (${sourceLabel})`}
+                                      title={`كود مخزن معتمد (${sourceLabel})`}
                                     >
                                       {rawCode}
                                     </span>
@@ -333,8 +333,8 @@ export const OrderDetailsModal: React.FC<OrderDetailsModalProps> = ({ orderCode,
 
                               return (
                                 <span
-                                  className="inline-flex items-center gap-1 px-2 py-0.5 rounded bg-slate-900 border border-slate-700/60 text-slate-400 font-sans text-[11px]"
-                                  title="كود التاجر غير متوفر في مصدر الطلب الأصلي - بانتظار استيراد ملف أكواد التجار المعتمد"
+                                  className="inline-flex items-center gap-1 px-2 py-0.5 rounded bg-slate-950 border border-slate-700/60 text-slate-400 font-sans text-[11px]"
+                                  title="كود المخزن غير متوفر في مصدر الطلب الأصلي - بانتظار توفيق ملف المخازن المعتمد"
                                 >
                                   <span className="w-1.5 h-1.5 rounded-full bg-slate-500"></span>
                                   غير متوفر
@@ -377,12 +377,12 @@ export const OrderDetailsModal: React.FC<OrderDetailsModalProps> = ({ orderCode,
                   <div className="flex items-center gap-3">
                     <span className="inline-flex items-center gap-1 text-sky-400">
                       <span className="w-1.5 h-1.5 rounded-full bg-sky-400"></span>
-                      <strong>اسم وكود المستودع:</strong> موثقان من بيانات الأصناف الأصلية
+                      <strong>اسم وكود المخزن:</strong> موثقان من بيانات الأصناف الأصلية
                     </span>
                     <span>·</span>
                     <span className="inline-flex items-center gap-1 text-amber-400">
                       <span className="w-1.5 h-1.5 rounded-full bg-amber-400"></span>
-                      <strong>كود التاجر (Merchant Code):</strong> خاص بالتاجر المعتمد (لا يُشتق من اسم المخزن أو الصنف)
+                      <strong>كود المخزن المعتمد:</strong> خاص بالمخزن المعتمد (لا يُشتق تلقائياً)
                     </span>
                   </div>
                 </div>

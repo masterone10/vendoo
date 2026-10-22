@@ -116,6 +116,8 @@ export interface HistoricalCoverageRecord {
 // Initialize database pragmas, tables, and migrations
 export function initDatabase() {
   db.exec('PRAGMA journal_mode = WAL;');
+  db.exec('PRAGMA synchronous = NORMAL;');
+  db.exec('PRAGMA busy_timeout = 10000;');
   db.exec('PRAGMA foreign_keys = ON;');
 
   // 1. Create tables if they do not exist
@@ -511,6 +513,8 @@ export function initDatabase() {
     CREATE INDEX IF NOT EXISTS idx_canonical_timestamp ON canonical_activity_events(event_timestamp);
     CREATE INDEX IF NOT EXISTS idx_canonical_action_type ON canonical_activity_events(action_type);
     CREATE INDEX IF NOT EXISTS idx_canonical_tier ON canonical_activity_events(storage_tier);
+    CREATE INDEX IF NOT EXISTS idx_canonical_raw_event_id ON canonical_activity_events(raw_event_id);
+    CREATE INDEX IF NOT EXISTS idx_canonical_dedup ON canonical_activity_events(order_code, actor_name, action_type, event_timestamp);
 
     CREATE INDEX IF NOT EXISTS idx_cust_hist_phone ON customer_history_observations(phone);
     CREATE INDEX IF NOT EXISTS idx_cust_hist_tier ON customer_history_observations(storage_tier);
@@ -536,16 +540,16 @@ export function initDatabase() {
     console.warn('[DB] Warning populating initial coverage:', err.message);
   }
 
-  // Backfill order links and administrative flags for existing log events
+  // Backfill order links with bounded batch on startup to prevent blocking event loop
   try {
-    backfillOrderLinksForEvents();
+    backfillOrderLinksForEvents(500);
   } catch (err: any) {
     console.warn('[DB] Warning backfilling log order links:', err.message);
   }
 
-  // Segregate warehouse names and clean merchant codes in order_items
+  // Segregate warehouse names and clean merchant codes in order_items if needed
   try {
-    repairMerchantAndWarehouseData();
+    repairMerchantAndWarehouseData(true);
   } catch (err: any) {
     console.warn('[DB] Warning repairing merchant/warehouse data:', err.message);
   }
@@ -555,7 +559,7 @@ export function initDatabase() {
     db.exec(`
       UPDATE canonical_activity_events
       SET action_type = 'waybill_edit', to_status = NULL, is_administrative = 1, field_name = 'رقم البوليصة'
-      WHERE raw_event_id IN (
+      WHERE action_type != 'waybill_edit' AND raw_event_id IN (
         SELECT id FROM raw_activity_events WHERE raw_action_text LIKE '%البوليصة%'
       );
     `);
@@ -568,8 +572,19 @@ export function initDatabase() {
  * Automatically resolves order_id, order_match_status, and parses rich details for log events
  * by looking up random_number, order_no, or vendoor_id in orders.
  */
-export function backfillOrderLinksForEvents() {
+export function backfillOrderLinksForEvents(maxBatch?: number) {
   try {
+    const limitClause = typeof maxBatch === 'number' && maxBatch > 0 ? `LIMIT ${maxBatch}` : '';
+    const events: any[] = db.prepare(`
+      SELECT c.id, c.order_code, c.actor_name, c.action_type, r.raw_action_text
+      FROM canonical_activity_events c
+      LEFT JOIN raw_activity_events r ON c.raw_event_id = r.id
+      WHERE c.order_match_status IS NULL OR c.order_match_status = 'UNRESOLVED' OR c.field_name IS NULL
+      ${limitClause}
+    `).all();
+
+    if (events.length === 0) return;
+
     const orderRows: any[] = db.prepare('SELECT id, random_number, order_no, vendoor_id FROM orders').all();
     const orderMap = new Map<string, number>();
     for (const o of orderRows) {
@@ -577,16 +592,6 @@ export function backfillOrderLinksForEvents() {
       if (o.order_no) orderMap.set(String(o.order_no).toLowerCase(), o.id);
       if (o.vendoor_id) orderMap.set(String(o.vendoor_id).toLowerCase(), o.id);
     }
-
-    const events: any[] = db.prepare(`
-      SELECT c.id, c.order_code, c.actor_name, c.action_type, r.raw_action_text
-      FROM canonical_activity_events c
-      LEFT JOIN raw_activity_events r ON c.raw_event_id = r.id
-      WHERE c.order_match_status IS NULL OR c.order_match_status = 'UNRESOLVED' OR c.field_name IS NULL
-    `).all();
-
-    if (events.length === 0) return;
-
 
     const updateStmt = db.prepare(`
       UPDATE canonical_activity_events
@@ -647,8 +652,17 @@ export function backfillOrderLinksForEvents() {
  * - Preserves authentic merchant codes (from Excel imports or vendor mappings).
  * - Never invents merchant codes or treats SKU/warehouse as merchant code.
  */
-export function repairMerchantAndWarehouseData() {
+export function repairMerchantAndWarehouseData(onlyIfUnrepaired = false) {
   try {
+    if (onlyIfUnrepaired) {
+      const needs = db.prepare(`
+        SELECT 1 FROM order_items
+        WHERE (warehouse_name IS NULL OR warehouse_name = '' OR warehouse_name = 'غير محدد')
+           OR merchant_code LIKE 'مخزن%'
+        LIMIT 1
+      `).get();
+      if (!needs) return;
+    }
     // 0. Drop NOT NULL constraint on merchant_code if present in SQLite schema
     const pragma: any[] = db.prepare('PRAGMA table_info(order_items)').all();
     const mcCol = pragma.find(c => c.name === 'merchant_code');

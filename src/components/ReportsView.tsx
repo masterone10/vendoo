@@ -114,7 +114,7 @@ export const ReportsView: React.FC<ReportsViewProps> = ({ onSelectOrder }) => {
     }
   }
 
-  async function handleDayAction(action: 'recheck' | 'complete_missing' | 'force_refetch' | 'sync_supabase') {
+  async function handleDayAction(action: 'recheck' | 'complete_missing' | 'force_refetch' | 'sync_supabase' | 'reconcile') {
     if (!effectiveStart) return;
     if (action === 'force_refetch') {
       const ok = window.confirm('هل تريد بالتأكيد إعادة جلب هذا اليوم بالكامل من Vendoor وتحديث الحركات؟');
@@ -662,6 +662,16 @@ export const ReportsView: React.FC<ReportsViewProps> = ({ onSelectOrder }) => {
                   title="إعادة فحص حالة اليوم"
                 >
                   <span>إعادة فحص</span>
+                </button>
+
+                <button
+                  onClick={() => handleDayAction('reconcile')}
+                  disabled={dayActionLoading}
+                  className="flex items-center gap-1 px-2.5 py-1.5 rounded-lg bg-indigo-500/10 hover:bg-indigo-500/20 text-indigo-300 border border-indigo-500/30 text-xs font-semibold transition disabled:opacity-50"
+                  title="مطابقة السجلات مع أرشيف Supabase واسترجاع أي سجلات ناقصة تلقائياً"
+                >
+                  <RefreshCw className={`w-3.5 h-3.5 ${dayActionLoading ? 'animate-spin' : ''}`} />
+                  <span>مطابقة واسترجاع الأرشيف</span>
                 </button>
 
                 {dayStatus.remoteArchiveStatus !== 'REMOTE_VERIFIED' && (

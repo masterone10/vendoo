@@ -357,35 +357,103 @@ export async function syncDayLogsToSupabase(dateStr: string): Promise<{
 
 /**
  * Fetch logs for a given business date from Supabase archive back into local SQLite.
+ * Uses strict Africa/Cairo timezone boundaries, streaming pagination for large datasets,
+ * and guarantees canonical conversion even when raw records were pre-existing.
  */
-export async function fetchDayLogsFromSupabase(dateStr: string): Promise<{
+export async function fetchDayLogsFromSupabase(
+  dateStr: string,
+  options?: {
+    batchSize?: number;
+    maxRecords?: number;
+    onProgress?: (restored: number, total: number) => void;
+  }
+): Promise<{
   success: boolean;
   recordsRestored: number;
+  rawRestored: number;
+  canonicalRestored: number;
+  duplicates: number;
+  failedWrites: number;
   error?: string;
 }> {
   if (!isSupabaseConfigured()) {
-    return { success: false, recordsRestored: 0, error: 'Supabase is not configured' };
+    return {
+      success: false,
+      recordsRestored: 0,
+      rawRestored: 0,
+      canonicalRestored: 0,
+      duplicates: 0,
+      failedWrites: 0,
+      error: 'Supabase is not configured',
+    };
   }
 
-  const { db, getCairoDateInterval } = await import('./db.ts');
+  const { db, getCairoDateInterval, saveCoverageRecord } = await import('./db.ts');
   const { parseLogActionDetails } = await import('./logDetailsParser.ts');
-  const interval = getCairoDateInterval(dateStr);
+  const cleanDate = dateStr.trim().slice(0, 10);
+  const interval = getCairoDateInterval(cleanDate);
+  const batchSize = Math.max(100, Math.min(2000, options?.batchSize || 1000));
+  const maxRecords = options?.maxRecords || 100000;
+
+  let totalRawRestored = 0;
+  let totalCanonicalRestored = 0;
+  let duplicates = 0;
+  let failedWrites = 0;
+  const nowIso = new Date().toISOString();
+
+  const startTz = `${cleanDate} 00:00:00+03`;
+  const endTz = `${interval.nextDateStr} 00:00:00+03`;
 
   try {
-    // 1. Fetch raw logs from Supabase
-    const rawRes = await pgQuery(`
-      SELECT source_hash, order_code, actor_name, raw_action_text, event_timestamp,
-             storage_tier, page_source, is_duplicate
+    // 1. Get total count of raw events for this Cairo business date in Supabase
+    const countRes = await pgQuery<{ count: string }>(`
+      SELECT COUNT(*) as count
       FROM raw_activity_events
-      WHERE event_timestamp >= $1 AND event_timestamp < $2
-    `, [interval.startCairo, interval.endCairo]);
+      WHERE event_timestamp >= $1::timestamptz AND event_timestamp < $2::timestamptz
+    `, [startTz, endTz]);
 
-    if (!rawRes.rows || rawRes.rows.length === 0) {
-      return { success: true, recordsRestored: 0 };
+    const totalInRemote = parseInt(countRes.rows[0]?.count || '0', 10);
+    if (totalInRemote === 0) {
+      return {
+        success: true,
+        recordsRestored: 0,
+        rawRestored: 0,
+        canonicalRestored: 0,
+        duplicates: 0,
+        failedWrites: 0,
+      };
     }
 
-    let restored = 0;
-    const nowIso = new Date().toISOString();
+    // Pre-cache orders into memory for lightning-fast O(1) order linking
+    const orderMap = new Map<string, number>();
+    const allOrders = db.prepare('SELECT id, random_number, order_no, vendoor_id FROM orders').all() as any[];
+    for (const o of allOrders) {
+      if (o.random_number) orderMap.set(o.random_number.trim(), o.id);
+      if (o.order_no) orderMap.set(o.order_no.trim(), o.id);
+      if (o.vendoor_id) orderMap.set(String(o.vendoor_id).trim(), o.id);
+    }
+
+    // Pre-cache existing local raw events and canonical keys for this interval
+    const existingRawHashes = new Map<string, number>();
+    const localRaws = db.prepare(`
+      SELECT id, source_hash FROM raw_activity_events
+      WHERE event_timestamp >= ? AND event_timestamp < ?
+    `).all(interval.startCairo, interval.endCairo) as any[];
+    for (const r of localRaws) {
+      existingRawHashes.set(r.source_hash, r.id);
+    }
+
+    const existingCanonByRaw = new Set<number>();
+    const existingCanonKeys = new Set<string>();
+    const localCanons = db.prepare(`
+      SELECT raw_event_id, order_code, actor_name, action_type, event_timestamp
+      FROM canonical_activity_events
+      WHERE event_timestamp >= ? AND event_timestamp < ?
+    `).all(interval.startCairo, interval.endCairo) as any[];
+    for (const c of localCanons) {
+      if (c.raw_event_id) existingCanonByRaw.add(c.raw_event_id);
+      existingCanonKeys.add(`${c.order_code || ''}::${c.actor_name}::${c.action_type}::${c.event_timestamp}`);
+    }
 
     const insertRaw = db.prepare(`
       INSERT INTO raw_activity_events (
@@ -399,77 +467,338 @@ export async function fetchDayLogsFromSupabase(dateStr: string): Promise<{
       INSERT INTO canonical_activity_events (
         raw_event_id, order_code, actor_name, action_type, from_status, to_status,
         event_timestamp, storage_tier, is_system_actor, created_at,
-        order_match_status, is_administrative, field_name, old_value, new_value, details_json,
+        order_id, order_match_status, is_administrative, field_name, old_value, new_value, details_json,
         data_source
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'SUPABASE_ARCHIVE')
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'SUPABASE_ARCHIVE')
     `);
 
-    db.exec('BEGIN TRANSACTION;');
-    try {
-      for (const r of rawRes.rows) {
-        const rawResRun = insertRaw.run(
-          r.source_hash,
-          r.order_code,
-          r.actor_name,
-          r.raw_action_text,
-          r.event_timestamp,
-          r.storage_tier || 'HOT',
-          nowIso,
-          r.page_source || 'supabase_archive'
-        );
+    // Stream/paginate in batches using fast index scan on event_timestamp
+    let offset = 0;
+    let fetchedTotal = 0;
+    const fetchLimit = Math.min(totalInRemote, maxRecords);
 
-        let rawId: number | null = null;
-        if (rawResRun.changes > 0) {
-          rawId = Number(rawResRun.lastInsertRowid);
-        } else {
-          const ex = db.prepare('SELECT id FROM raw_activity_events WHERE source_hash = ?').get(r.source_hash) as any;
-          rawId = ex?.id || null;
+    while (fetchedTotal < fetchLimit) {
+      const currentBatchLimit = Math.min(batchSize, fetchLimit - fetchedTotal);
+      const rawRes = await pgQuery(`
+        SELECT id, source_hash, order_code, actor_name, raw_action_text,
+               to_char(event_timestamp AT TIME ZONE 'Africa/Cairo', 'YYYY-MM-DD HH24:MI:SS') as cairo_event_time,
+               storage_tier, page_source, is_duplicate
+        FROM raw_activity_events
+        WHERE event_timestamp >= $1::timestamptz 
+          AND event_timestamp < $2::timestamptz
+        ORDER BY event_timestamp ASC
+        OFFSET $3 LIMIT $4
+      `, [startTz, endTz, offset, currentBatchLimit]);
+
+      if (!rawRes.rows || rawRes.rows.length === 0) break;
+
+      db.exec('BEGIN TRANSACTION;');
+      try {
+        for (const r of rawRes.rows) {
+          const eventTime = r.cairo_event_time || interval.startCairo;
+          let rawId: number | null = existingRawHashes.get(r.source_hash) || null;
+
+          if (rawId) {
+            duplicates++;
+          } else {
+            try {
+              const rawRun = insertRaw.run(
+                r.source_hash,
+                r.order_code,
+                r.actor_name,
+                r.raw_action_text,
+                eventTime,
+                r.storage_tier || 'HOT',
+                nowIso,
+                r.page_source || 'supabase_archive'
+              );
+
+              if (rawRun.changes > 0) {
+                rawId = Number(rawRun.lastInsertRowid);
+                existingRawHashes.set(r.source_hash, rawId);
+                totalRawRestored++;
+              } else {
+                duplicates++;
+              }
+            } catch (insertErr: any) {
+              if (insertErr?.code === 'SQLITE_CONSTRAINT' || insertErr?.message?.includes('UNIQUE')) {
+                duplicates++;
+              } else {
+                failedWrites++;
+                continue;
+              }
+            }
+          }
+
+          // Parse action details
+          const parsed = parseLogActionDetails(r.raw_action_text || '', r.actor_name || '', r.order_code || '');
+          const detailsJson = JSON.stringify(parsed);
+          const canonKey = `${r.order_code || ''}::${r.actor_name || ''}::${parsed.actionType}::${eventTime}`;
+
+          // Check canonical existence in memory (O(1))
+          const alreadyHasCanon = (rawId !== null && existingCanonByRaw.has(rawId)) || existingCanonKeys.has(canonKey);
+
+          if (!alreadyHasCanon) {
+            const isSystem = (r.actor_name || '').toLowerCase().includes('system') || (r.actor_name || '').includes('النظام') ? 1 : 0;
+            let matchedOrderId: number | null = null;
+            let matchStatus = 'UNRESOLVED';
+
+            if (!r.order_code) {
+              matchStatus = 'GENERAL_LOG';
+            } else {
+              const trimmedCode = (r.order_code || '').trim();
+              const foundId = orderMap.get(trimmedCode);
+              if (foundId) {
+                matchedOrderId = foundId;
+                matchStatus = 'MATCHED';
+              }
+            }
+
+            try {
+              insertCanon.run(
+                rawId,
+                r.order_code,
+                r.actor_name,
+                parsed.actionType,
+                parsed.fromStatus,
+                parsed.toStatus,
+                eventTime,
+                r.storage_tier || 'HOT',
+                isSystem,
+                nowIso,
+                matchedOrderId,
+                matchStatus,
+                parsed.isAdministrative ? 1 : 0,
+                parsed.fieldName,
+                parsed.oldValue,
+                parsed.newValue,
+                detailsJson
+              );
+              if (rawId !== null) existingCanonByRaw.add(rawId);
+              existingCanonKeys.add(canonKey);
+              totalCanonicalRestored++;
+            } catch (canonErr: any) {
+              if (canonErr?.code !== 'SQLITE_CONSTRAINT' && !canonErr?.message?.includes('UNIQUE')) {
+                failedWrites++;
+              }
+            }
+          }
         }
-
-        const parsed = parseLogActionDetails(r.raw_action_text || '', r.actor_name || '', r.order_code || '');
-        const detailsJson = JSON.stringify(parsed);
-
-        // Check if canonical exists
-        const exists = db.prepare(`
-          SELECT id FROM canonical_activity_events
-          WHERE (raw_event_id IS NOT NULL AND raw_event_id = ?)
-             OR (order_code IS ? AND actor_name = ? AND action_type = ? AND event_timestamp = ?)
-        `).get(rawId, r.order_code, r.actor_name, parsed.actionType, r.event_timestamp);
-
-        if (!exists && rawResRun.changes > 0) {
-          const isSystem = (r.actor_name || '').toLowerCase().includes('system') || (r.actor_name || '').includes('النظام') ? 1 : 0;
-          insertCanon.run(
-            rawId,
-            r.order_code,
-            r.actor_name,
-            parsed.actionType,
-            parsed.fromStatus,
-            parsed.toStatus,
-            r.event_timestamp,
-            r.storage_tier || 'HOT',
-            isSystem,
-            nowIso,
-            r.order_code ? 'MATCHED' : 'GENERAL_LOG',
-            parsed.isAdministrative ? 1 : 0,
-            parsed.fieldName,
-            parsed.oldValue,
-            parsed.newValue,
-            detailsJson
-          );
-          restored++;
-        }
+        db.exec('COMMIT;');
+      } catch (txErr) {
+        try { db.exec('ROLLBACK;'); } catch {}
+        throw txErr;
       }
-      db.exec('COMMIT;');
-    } catch (txErr) {
-      db.exec('ROLLBACK;');
-      throw txErr;
+
+      offset += rawRes.rows.length;
+      fetchedTotal += rawRes.rows.length;
+      options?.onProgress?.(fetchedTotal, totalInRemote);
     }
+
+    // Update historical_coverage registry
+    const finalRawCount = (db.prepare(`
+      SELECT COUNT(*) as c FROM raw_activity_events
+      WHERE event_timestamp >= ? AND event_timestamp < ?
+    `).get(interval.startCairo, interval.endCairo) as any)?.c || 0;
+
+    const finalCanonCount = (db.prepare(`
+      SELECT COUNT(*) as c FROM canonical_activity_events
+      WHERE event_timestamp >= ? AND event_timestamp < ?
+    `).get(interval.startCairo, interval.endCairo) as any)?.c || 0;
+
+    saveCoverageRecord({
+      accountId: 'primary',
+      sourceDomain: 'logs',
+      periodDate: cleanDate,
+      storageTier: 'HOT',
+      pagesDiscovered: 1,
+      pagesRead: 1,
+      recordsExtracted: totalInRemote,
+      recordsSaved: finalRawCount,
+      completionStatus: 'COMPLETE',
+      dataSource: 'SUPABASE_ARCHIVE',
+      canonicalEventsCount: finalCanonCount,
+      duplicatesCount: duplicates,
+      localStorageStatus: 'LOCAL_SAVED',
+      remoteArchiveStatus: 'REMOTE_VERIFIED',
+      lastAttemptedAt: nowIso,
+      completedAt: nowIso,
+      verifiedAt: nowIso,
+      lastSupabaseVerifiedAt: nowIso,
+      notes: `Restored ${totalRawRestored} raw, ${totalCanonicalRestored} canonical from Supabase`,
+    });
 
     return {
       success: true,
-      recordsRestored: restored > 0 ? restored : rawRes.rows.length,
+      recordsRestored: totalRawRestored + totalCanonicalRestored,
+      rawRestored: totalRawRestored,
+      canonicalRestored: totalCanonicalRestored,
+      duplicates,
+      failedWrites,
     };
   } catch (err: any) {
-    return { success: false, recordsRestored: 0, error: err.message };
+    console.error(`[SupabaseClient] Error restoring day ${cleanDate}:`, err.message);
+    return {
+      success: false,
+      recordsRestored: 0,
+      rawRestored: totalRawRestored,
+      canonicalRestored: totalCanonicalRestored,
+      duplicates,
+      failedWrites,
+      error: err.message,
+    };
   }
 }
+
+/**
+ * Restores missing orders from Supabase archive for a list of order codes.
+ * Ensures all historical log events link to full order records and metadata.
+ */
+export async function restoreMissingOrdersFromSupabase(
+  orderCodes: string[]
+): Promise<{ restored: number; failed: number }> {
+  if (!isSupabaseConfigured() || !orderCodes || orderCodes.length === 0) {
+    return { restored: 0, failed: 0 };
+  }
+
+  const { db } = await import('./db.ts');
+
+  // Filter unique non-empty codes
+  const uniqueCodes = Array.from(new Set(orderCodes.map(c => (c || '').trim()).filter(Boolean)));
+  if (uniqueCodes.length === 0) return { restored: 0, failed: 0 };
+
+  // Check which ones are already in local SQLite
+  const existingSet = new Set<string>();
+  for (let i = 0; i < uniqueCodes.length; i += 500) {
+    const chunk = uniqueCodes.slice(i, i + 500);
+    const existingRows = db.prepare(`
+      SELECT random_number FROM orders WHERE random_number IN (${chunk.map(() => '?').join(',')})
+    `).all(...chunk) as any[];
+    for (const r of existingRows) {
+      if (r.random_number) existingSet.add(r.random_number);
+    }
+  }
+
+  const missingCodes = uniqueCodes.filter(c => !existingSet.has(c));
+  if (missingCodes.length === 0) return { restored: 0, failed: 0 };
+
+  const insertOrder = db.prepare(`
+    INSERT INTO orders (
+      vendoor_id, random_number, order_no, order_type, current_status, status_raw,
+      affiliate_code, affiliate_name, affiliate_id, customer_name, customer_phone,
+      customer_phone_extra, extra_phone_status, extra_phone_valid, governorate,
+      address, address_word_count, address_is_latin, address_quality_status,
+      total_price, shipping_cost, total_order, created_at_source, shipping_date,
+      printed_date, canceling_date, last_updated_source, distinct_merchant_count,
+      multi_merchant_flag, distinct_warehouse_count, multi_warehouse_flag,
+      delivery_rate, delivery_rate_num, delivery_rate_denom, cancel_rate,
+      cancel_rate_num, cancel_rate_denom, total_customer_orders,
+      customer_last_order_status, customer_last_order_elapsed,
+      phone_repetition_count, customer_delivery_warning,
+      confirmation_age_category, state_entry_at, validation_status,
+      storage_tier, last_observed_at, created_at, updated_at
+    ) VALUES (
+      ?, ?, ?, ?, ?, ?,
+      ?, ?, ?, ?, ?,
+      ?, ?, ?, ?,
+      ?, ?, ?, ?,
+      ?, ?, ?, ?, ?,
+      ?, ?, ?, ?,
+      ?, ?, ?,
+      ?, ?, ?, ?,
+      ?, ?, ?,
+      ?, ?,
+      ?, ?,
+      ?, ?, ?,
+      ?, ?, ?, ?
+    )
+    ON CONFLICT(random_number) DO UPDATE SET
+      current_status = excluded.current_status,
+      printed_date = COALESCE(orders.printed_date, excluded.printed_date),
+      canceling_date = COALESCE(orders.canceling_date, excluded.canceling_date),
+      updated_at = excluded.updated_at
+  `);
+
+  let restored = 0;
+  let failed = 0;
+  const CHUNK_SIZE = 400;
+
+  for (let i = 0; i < missingCodes.length; i += CHUNK_SIZE) {
+    const chunk = missingCodes.slice(i, i + CHUNK_SIZE);
+    try {
+      const res = await pgQuery(`
+        SELECT * FROM orders
+        WHERE random_number = ANY($1) OR order_no = ANY($1)
+      `, [chunk]);
+
+      if (res.rows && res.rows.length > 0) {
+        db.exec('BEGIN TRANSACTION;');
+        for (const row of res.rows) {
+          try {
+            insertOrder.run(
+              row.vendoor_id,
+              row.random_number,
+              row.order_no,
+              row.order_type || 'regular',
+              row.current_status || 'New',
+              row.status_raw,
+              row.affiliate_code,
+              row.affiliate_name,
+              row.affiliate_id,
+              row.customer_name,
+              row.customer_phone,
+              row.customer_phone_extra,
+              row.extra_phone_status || 'NOT_RETRIEVED',
+              row.extra_phone_valid || 0,
+              row.governorate,
+              row.address,
+              row.address_word_count,
+              row.address_is_latin || 0,
+              row.address_quality_status || 'NOT_RETRIEVED',
+              row.total_price || 0,
+              row.shipping_cost || 0,
+              row.total_order || 0,
+              row.created_at_source,
+              row.shipping_date,
+              row.printed_date,
+              row.canceling_date,
+              row.last_updated_source,
+              row.distinct_merchant_count || 1,
+              row.multi_merchant_flag || 0,
+              row.distinct_warehouse_count || 1,
+              row.multi_warehouse_flag || 0,
+              row.delivery_rate,
+              row.delivery_rate_num,
+              row.delivery_rate_denom,
+              row.cancel_rate,
+              row.cancel_rate_num,
+              row.cancel_rate_denom,
+              row.total_customer_orders,
+              row.customer_last_order_status,
+              row.customer_last_order_elapsed,
+              row.phone_repetition_count,
+              row.customer_delivery_warning,
+              row.confirmation_age_category,
+              row.state_entry_at,
+              row.validation_status || 'VALIDATED_FROM_ARCHIVE',
+              row.storage_tier || 'HOT',
+              row.last_observed_at || new Date().toISOString(),
+              row.created_at || new Date().toISOString(),
+              row.updated_at || new Date().toISOString()
+            );
+            restored++;
+          } catch {
+            failed++;
+          }
+        }
+        db.exec('COMMIT;');
+      }
+    } catch (chunkErr) {
+      console.warn('[SupabaseClient] Error fetching missing orders chunk:', chunkErr);
+      failed += chunk.length;
+    }
+  }
+
+  return { restored, failed };
+}
+
