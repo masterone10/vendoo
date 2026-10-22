@@ -97,6 +97,7 @@ interface RiskDetailsModalProps {
   isOpen: boolean;
   riskType: RiskType | null;
   selectedDate?: string;
+  initialTab?: string;
   onClose: () => void;
 }
 
@@ -113,9 +114,10 @@ export const RiskDetailsModal: React.FC<RiskDetailsModalProps> = ({
   isOpen,
   riskType,
   selectedDate,
+  initialTab = 'all',
   onClose,
 }) => {
-  const [activeTab, setActiveTab] = useState<string>('all');
+  const [activeTab, setActiveTab] = useState<string>(initialTab);
   const [searchInput, setSearchInput] = useState<string>('');
   const [debouncedSearch, setDebouncedSearch] = useState<string>('');
   const [page, setPage] = useState<number>(0);
@@ -140,12 +142,12 @@ export const RiskDetailsModal: React.FC<RiskDetailsModalProps> = ({
   // Reset tab and page when modal opens or riskType changes
   useEffect(() => {
     if (isOpen) {
-      setActiveTab('all');
+      setActiveTab(initialTab || 'all');
       setSearchInput('');
       setDebouncedSearch('');
       setPage(0);
     }
-  }, [isOpen, riskType]);
+  }, [isOpen, riskType, initialTab]);
 
   const fetchData = useCallback(async () => {
     if (!riskType) return;

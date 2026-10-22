@@ -11,6 +11,8 @@ import {
   Calendar,
   Layers,
   ChevronLeft,
+  ChevronDown,
+  Check,
 } from 'lucide-react';
 import { DashboardStats } from '../types';
 import { RiskDetailsModal, RiskType } from './RiskDetailsModal';
@@ -59,6 +61,8 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
   } = stats;
 
   const [selectedRiskType, setSelectedRiskType] = useState<RiskType | null>(null);
+  const [riskScope, setRiskScope] = useState<'today' | 'all'>('today');
+  const [isRiskScopeOpen, setIsRiskScopeOpen] = useState(false);
 
   return (
     <div className="p-6 space-y-6 max-w-7xl mx-auto">
@@ -235,14 +239,111 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
 
       {/* 2. Critical Risk Indicators Section */}
       <section className="space-y-3">
-        <div className="flex items-center justify-between">
-          <h3 className="text-xs font-semibold uppercase tracking-wider text-rose-400 flex items-center gap-1.5">
-            <AlertTriangle className="w-3.5 h-3.5 text-rose-400" />
-            <span>مؤشرات المخاطر التشغيلية (فحص شامل لكامل النظام)</span>
-          </h3>
-          <span className="text-[11px] text-slate-500">
-            الرقم الرئيسي: إجمالي النظام المطابق • السطر التوضيحي: طلبات {selectedDate || 'اليوم'} المؤكدة (Printed)
-          </span>
+        <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2.5">
+          <div>
+            <h3 className="text-xs font-semibold uppercase tracking-wider text-rose-400 flex items-center gap-1.5">
+              <AlertTriangle className="w-3.5 h-3.5 text-rose-400" />
+              <span>مؤشرات المخاطر التشغيلية</span>
+            </h3>
+            <span className="text-[11px] text-slate-400">
+              {riskScope === 'today'
+                ? `عرض طلبات ${selectedDate || 'اليوم'} المؤكدة (Printed) فقط من منتصف الليل 00:00`
+                : 'فحص شامل لكامل رصيد طلبات النظام المتراكمة في قاعدة البيانات'}
+            </span>
+          </div>
+
+          {/* Quick Scope Dropdown List */}
+          <div className="flex items-center gap-2 self-start sm:self-auto relative">
+            <span className="text-xs text-slate-400 font-medium">نطاق المؤشرات:</span>
+            <div className="relative">
+              <button
+                type="button"
+                onClick={() => setIsRiskScopeOpen(!isRiskScopeOpen)}
+                className={`flex items-center justify-between gap-3 px-3 py-1.5 rounded-lg bg-slate-900 border text-xs font-semibold shadow-sm transition-all cursor-pointer min-w-[210px] ${
+                  isRiskScopeOpen
+                    ? 'border-amber-500/70 ring-1 ring-amber-500/30 text-amber-300'
+                    : 'border-slate-700 hover:border-slate-600 text-slate-200'
+                }`}
+              >
+                <div className="flex items-center gap-2">
+                  {riskScope === 'today' ? (
+                    <Clock className="w-3.5 h-3.5 text-amber-400" />
+                  ) : (
+                    <Layers className="w-3.5 h-3.5 text-slate-400" />
+                  )}
+                  <span>{riskScope === 'today' ? `طلبات اليوم (${selectedDate || 'اليوم'})` : 'إجمالي النظام الشامل'}</span>
+                </div>
+                <ChevronDown className={`w-3.5 h-3.5 transition-transform duration-200 ${isRiskScopeOpen ? 'rotate-180 text-amber-400' : 'text-slate-400'}`} />
+              </button>
+
+              {/* Dropdown Menu Popup */}
+              {isRiskScopeOpen && (
+                <>
+                  <div
+                    className="fixed inset-0 z-40"
+                    onClick={() => setIsRiskScopeOpen(false)}
+                  />
+                  <div className="absolute left-0 sm:right-auto sm:left-0 top-full mt-1.5 z-50 w-72 bg-slate-900 border border-slate-700 rounded-xl shadow-2xl overflow-hidden py-1 divide-y divide-slate-800/80 animate-in fade-in-0 zoom-in-95 duration-150">
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setRiskScope('today');
+                        setIsRiskScopeOpen(false);
+                      }}
+                      className={`w-full text-right p-2.5 flex items-start justify-between gap-3 transition-colors cursor-pointer ${
+                        riskScope === 'today'
+                          ? 'bg-amber-500/10 text-amber-300'
+                          : 'hover:bg-slate-800/80 text-slate-300'
+                      }`}
+                    >
+                      <div className="flex items-start gap-2.5">
+                        <div className="mt-0.5 p-1 rounded bg-amber-500/20 text-amber-400 flex-shrink-0">
+                          <Clock className="w-3.5 h-3.5" />
+                        </div>
+                        <div>
+                          <div className="text-xs font-bold text-slate-100">
+                            طلبات اليوم ({selectedDate || 'اليوم'})
+                          </div>
+                          <div className="text-[11px] text-slate-400 mt-0.5">
+                            حصر الطلبات المؤكدة (Printed) اليوم من 00:00
+                          </div>
+                        </div>
+                      </div>
+                      {riskScope === 'today' && <Check className="w-4 h-4 text-amber-400 flex-shrink-0 mt-1" />}
+                    </button>
+
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setRiskScope('all');
+                        setIsRiskScopeOpen(false);
+                      }}
+                      className={`w-full text-right p-2.5 flex items-start justify-between gap-3 transition-colors cursor-pointer ${
+                        riskScope === 'all'
+                          ? 'bg-slate-800 text-slate-100'
+                          : 'hover:bg-slate-800/80 text-slate-300'
+                      }`}
+                    >
+                      <div className="flex items-start gap-2.5">
+                        <div className="mt-0.5 p-1 rounded bg-slate-800 text-slate-300 border border-slate-700 flex-shrink-0">
+                          <Layers className="w-3.5 h-3.5" />
+                        </div>
+                        <div>
+                          <div className="text-xs font-bold text-slate-100">
+                            إجمالي النظام الشامل
+                          </div>
+                          <div className="text-[11px] text-slate-400 mt-0.5">
+                            كافة طلبات النظام المتراكمة في قاعدة البيانات
+                          </div>
+                        </div>
+                      </div>
+                      {riskScope === 'all' && <Check className="w-4 h-4 text-slate-300 flex-shrink-0 mt-1" />}
+                    </button>
+                  </div>
+                </>
+              )}
+            </div>
+          </div>
         </div>
 
         <div className="grid grid-cols-1 md:grid-cols-4 gap-3">
@@ -250,7 +351,7 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
           <div
             onClick={() => setSelectedRiskType('multi_merchant')}
             className={`p-4 rounded-xl border transition-all cursor-pointer group ${
-              (riskIndicators.multiMerchantTotal ?? riskIndicators.multiMerchantPrinted) > 0
+              (riskScope === 'today' ? riskIndicators.multiMerchantPrinted : (riskIndicators.multiMerchantTotal ?? 0)) > 0
                 ? 'bg-rose-500/10 border-rose-500/40 hover:bg-rose-500/20 shadow-md shadow-rose-950/40'
                 : 'bg-slate-900 border-slate-800 hover:border-slate-700'
             }`}
@@ -263,13 +364,17 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
               <span className="text-[10px] text-rose-400 uppercase tracking-widest font-mono group-hover:underline">تفاصيل ↗</span>
             </div>
             <div className="text-2xl font-bold font-mono text-rose-400 tabular-nums">
-              {riskIndicators.multiMerchantTotal ?? riskIndicators.multiMerchantCount ?? 0}
+              {riskScope === 'today'
+                ? (riskIndicators.multiMerchantPrinted ?? 0)
+                : (riskIndicators.multiMerchantTotal ?? riskIndicators.multiMerchantCount ?? 0)}
             </div>
-            <div className="mt-1 text-[11px] font-mono text-emerald-400/90 font-medium">
-              اليوم: {riskIndicators.multiMerchantPrinted} مؤكد (Printed)
+            <div className="mt-1 text-[11px] font-mono text-slate-400 font-medium">
+              {riskScope === 'today'
+                ? `إجمالي النظام: ${riskIndicators.multiMerchantTotal ?? 0} طلب`
+                : `اليوم: ${riskIndicators.multiMerchantPrinted ?? 0} مؤكد (Printed)`}
             </div>
             <p className="mt-1 text-[11px] text-slate-400 leading-relaxed">
-              طلبات النظام التي تحوي سلعًا من عدة مخازن أو تجار • اضغط للتفاصيل
+              طلبات تحوي سلعًا من عدة مخازن وتتطلب تقسيم شحن • اضغط للتفاصيل
             </p>
           </div>
 
@@ -283,13 +388,19 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
               <span className="text-[10px] text-amber-400/80 font-mono group-hover:underline">تفاصيل ↗</span>
             </div>
             <div className="text-2xl font-bold font-mono text-amber-400 tabular-nums">
-              {riskIndicators.missingExtraPhoneTotal ?? riskIndicators.missingPhoneCount ?? 0}
+              {riskScope === 'today'
+                ? (riskIndicators.missingExtraPhonePrinted ?? 0)
+                : (riskIndicators.missingExtraPhoneTotal ?? riskIndicators.missingPhoneCount ?? 0)}
             </div>
-            <div className="mt-1 text-[11px] font-mono text-emerald-400/90 font-medium">
-              اليوم: {riskIndicators.missingExtraPhonePrinted} مؤكد (Printed)
+            <div className="mt-1 text-[11px] font-mono text-slate-400 font-medium">
+              {riskScope === 'today'
+                ? `إجمالي النظام: ${riskIndicators.missingExtraPhoneTotal ?? 0} طلب`
+                : `اليوم: ${riskIndicators.missingExtraPhonePrinted ?? 0} مؤكد (Printed)`}
             </div>
             <p className="mt-1 text-[11px] text-slate-400 leading-relaxed">
-              طلبات دون هاتف بديل أو مكرر أو صيغته غير صالحة • اضغط للتفاصيل
+              {riskScope === 'today'
+                ? 'طلبات تم تأكيدها اليوم دون تدوين هاتف بديل صالح'
+                : 'إجمالي طلبات النظام المتراكمة دون هاتف إضافي صالح'} • اضغط للتفاصيل
             </p>
           </div>
 
@@ -303,10 +414,14 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
               <span className="text-[10px] text-rose-400/80 font-mono group-hover:underline">تفاصيل ↗</span>
             </div>
             <div className="text-2xl font-bold font-mono text-rose-400 tabular-nums">
-              {riskIndicators.lowDeliveryRateTotal ?? riskIndicators.lowDeliveryCount ?? 0}
+              {riskScope === 'today'
+                ? (riskIndicators.lowDeliveryRatePrinted ?? 0)
+                : (riskIndicators.lowDeliveryRateTotal ?? riskIndicators.lowDeliveryCount ?? 0)}
             </div>
-            <div className="mt-1 text-[11px] font-mono text-emerald-400/90 font-medium">
-              اليوم: {riskIndicators.lowDeliveryRatePrinted} مؤكد (Printed)
+            <div className="mt-1 text-[11px] font-mono text-slate-400 font-medium">
+              {riskScope === 'today'
+                ? `إجمالي النظام: ${riskIndicators.lowDeliveryRateTotal ?? 0} طلب`
+                : `اليوم: ${riskIndicators.lowDeliveryRatePrinted ?? 0} مؤكد (Printed)`}
             </div>
             <p className="mt-1 text-[11px] text-slate-400 leading-relaxed">
               عملاء لديهم سجل تاريخي بنسبة استلام &lt; 70% • اضغط للتفاصيل
@@ -574,6 +689,7 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
           isOpen={!!selectedRiskType}
           riskType={selectedRiskType}
           selectedDate={selectedDate}
+          initialTab={riskScope === 'today' ? 'today_printed' : 'all'}
           onClose={() => setSelectedRiskType(null)}
         />
       )}

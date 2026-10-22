@@ -1046,7 +1046,26 @@ export class SyncEngine {
 
       // 1. Scan Orders: First page to get total and initial batch
       const tOrdersStart = Date.now();
-      const firstBatch = await vendoorClient.fetchOrdersBatch(0, 100);
+      let firstBatch: { recordsTotal: number; recordsFiltered: number; data: VendoorRawOrder[] } | null = null;
+      let firstBatchError: any = null;
+
+      for (let attempt = 1; attempt <= 3; attempt++) {
+        try {
+          firstBatch = await vendoorClient.fetchOrdersBatch(0, 100);
+          break;
+        } catch (fbErr: any) {
+          firstBatchError = fbErr;
+          console.warn(`[SyncEngine] Attempt ${attempt}/3 fetching initial orders batch failed: ${fbErr.message}`);
+          if (attempt < 3) {
+            await new Promise(r => setTimeout(r, 1200 * attempt));
+          }
+        }
+      }
+
+      if (!firstBatch) {
+        throw new Error(`Failed to fetch initial orders batch after 3 attempts: ${firstBatchError?.message || 'Unknown error'}`);
+      }
+
       const totalOrdersInSource = firstBatch.recordsTotal;
       const hotThreshold = getHotThresholdDate();
       const existingOrdersCount = (db.prepare('SELECT count(*) as c FROM orders').get() as any)?.c || 0;
@@ -1476,8 +1495,17 @@ export class SyncEngine {
 
       this.broadcast('sync_completed', this.getStatus());
     } catch (err: any) {
+      const isTransientAbort =
+        err?.name === 'AbortError' ||
+        err?.message?.includes('aborted') ||
+        err?.message?.includes('fetch failed') ||
+        err?.message?.includes('ETIMEDOUT') ||
+        err?.message?.includes('ECONNRESET');
+
       if (err.message?.includes('VENDOOR_EMAIL') || err.message?.includes('VENDOOR_PASSWORD')) {
         console.warn('[SyncEngine] Authentication credentials missing:', err.message);
+      } else if (isTransientAbort) {
+        console.warn(`[SyncEngine] Transient network or timeout condition during ${runType} sync (${err.message}). Safe retry scheduled for next tick.`);
       } else {
         console.error('[SyncEngine Detailed Error]:', err);
       }
@@ -2100,7 +2128,10 @@ export class SyncEngine {
     const printedNeedingPhone: any[] = db.prepare(`
       SELECT id, vendoor_id, random_number
       FROM orders
-      WHERE current_status = 'Printed' AND (extra_phone_status = 'NOT_RETRIEVED' OR extra_phone_status IS NULL)
+      WHERE current_status = 'Printed' 
+        AND (extra_phone_status = 'NOT_RETRIEVED' OR extra_phone_status IS NULL)
+        AND (last_enrichment_at IS NULL OR last_enrichment_at < datetime('now', '-2 hours'))
+      ORDER BY id ASC
       LIMIT 6
     `).all();
 
@@ -2160,6 +2191,15 @@ export class SyncEngine {
         } catch (err: any) {
           failedEnrichments++;
           console.warn(`[SyncEngine] Non-blocking order detail enrichment failure for ${ord.vendoor_id}:`, err.message);
+          try {
+            db.prepare(`
+              UPDATE orders SET
+                extra_phone_status = 'RETRIEVAL_FAILED',
+                last_enrichment_at = ?,
+                last_enrichment_status = 'DEFERRED'
+              WHERE id = ?
+            `).run(nowIso, ord.id);
+          } catch {}
         }
       }));
     }

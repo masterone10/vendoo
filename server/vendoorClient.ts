@@ -204,7 +204,9 @@ class VendoorClient {
           errMsg.includes('ECONNRESET') ||
           errMsg.includes('ETIMEDOUT') ||
           errMsg.includes('EAI_AGAIN') ||
-          errMsg.includes('socket hang up');
+          errMsg.includes('socket hang up') ||
+          errMsg.includes('This operation was aborted') ||
+          errMsg.includes('aborted');
 
         if (isNetworkOrTimeout && attempt < maxRetries) {
           const delay = 600 * Math.pow(2, attempt - 1);
@@ -281,10 +283,12 @@ class VendoorClient {
           errMsg.includes('ECONNRESET') ||
           errMsg.includes('ETIMEDOUT') ||
           errMsg.includes('EAI_AGAIN') ||
-          errMsg.includes('socket hang up');
+          errMsg.includes('socket hang up') ||
+          errMsg.includes('This operation was aborted') ||
+          errMsg.includes('aborted');
 
         if (isNetworkOrTimeout && attempt < maxRetries) {
-          const delay = 500 * Math.pow(2, attempt - 1);
+          const delay = 600 * Math.pow(2, attempt - 1);
           await new Promise(r => setTimeout(r, delay));
           continue;
         }
@@ -434,7 +438,7 @@ class VendoorClient {
         'Cookie': this.getCookieHeader(),
         'Referer': `${this.baseUrl}/dashboard/orders`,
       },
-    }, 18000, 2);
+    }, 35000, 3);
 
     if (!result.ok) {
       throw new Error(`Failed to fetch orders from Vendoor: HTTP ${result.status}`);
@@ -731,24 +735,10 @@ class VendoorClient {
     vendorIds: string[];
     warehouseNames: string[];
   }> {
-    await this.ensureAuthenticated();
+    try {
+      await this.ensureAuthenticated();
 
-    const res = await this.fetchWithTimeout(
-      `${this.baseUrl}/dashboard/super-admin/orders/${vendoorOrderId}/edit?type=refactor`,
-      {
-        headers: {
-          'User-Agent': this.userAgent,
-          'Cookie': this.getCookieHeader(),
-        },
-      },
-      10000
-    );
-
-    let activeRes = res;
-    if (activeRes.status === 400 || activeRes.status === 401 || activeRes.status === 419 || activeRes.url.includes('/login')) {
-      this.isAuthenticated = false;
-      await this.login();
-      activeRes = await this.fetchWithTimeout(
+      const result = await this.fetchTextWithRetry(
         `${this.baseUrl}/dashboard/super-admin/orders/${vendoorOrderId}/edit?type=refactor`,
         {
           headers: {
@@ -756,44 +746,46 @@ class VendoorClient {
             'Cookie': this.getCookieHeader(),
           },
         },
-        10000
+        12000,
+        2
       );
-      this.updateCookies(activeRes);
-    }
 
-    if (!activeRes.ok) {
+      if (!result.ok) {
+        return { success: false, anotherPhone: '', extraPhoneValid: false, merchantCodes: [], vendorIds: [], warehouseNames: [] };
+      }
+
+      const html = result.text;
+
+      // Extract another_phone
+      const phoneMatch = html.match(/name="another_phone"[^>]*value="([^"]*)"/i) || html.match(/value="([^"]*)"[^>]*name="another_phone"/i);
+      const anotherPhone = phoneMatch ? phoneMatch[1].trim() : '';
+
+      // Validate extra phone: Egyptian mobile numbers must match 01[0125][0-9]{8}
+      const cleanPhone = anotherPhone.replace(/[\s\-\+]/g, '');
+      const extraPhoneValid = /^(01[0125]\d{8}|201[0125]\d{8})$/.test(cleanPhone);
+
+      // Extract vendor IDs from data-vendor-id or vendor-id
+      const vendorIds = [...html.matchAll(/(?:data-vendor-id|vendor-id|name="vendor_id(?:\[\])?")[^>]*value="([^"]+)"/gi)].map(m => m[1].trim());
+
+      // Extract warehouse/vendor strings from product names (e.g. "مخزن Y2", "مخزن Te1")
+      const warehouseMatches = [...html.matchAll(/\(\s*مخزن\s*([^)]+)\s*\)/gi)].map(m =>
+        `مخزن ${m[1].trim()}`
+      );
+
+      // Distinct actual merchant identifiers (vendor IDs if present, otherwise explicit merchant codes)
+      const distinctMerchantCodes = vendorIds.length > 0 ? [...new Set(vendorIds)] : [];
+
+      return {
+        success: true,
+        anotherPhone,
+        extraPhoneValid,
+        merchantCodes: distinctMerchantCodes,
+        vendorIds: [...new Set(vendorIds)],
+        warehouseNames: [...new Set(warehouseMatches)],
+      };
+    } catch {
       return { success: false, anotherPhone: '', extraPhoneValid: false, merchantCodes: [], vendorIds: [], warehouseNames: [] };
     }
-
-    const html = await activeRes.text();
-
-    // Extract another_phone
-    const phoneMatch = html.match(/name="another_phone"[^>]*value="([^"]*)"/i) || html.match(/value="([^"]*)"[^>]*name="another_phone"/i);
-    const anotherPhone = phoneMatch ? phoneMatch[1].trim() : '';
-
-    // Validate extra phone: Egyptian mobile numbers must match 01[0125][0-9]{8}
-    const cleanPhone = anotherPhone.replace(/[\s\-\+]/g, '');
-    const extraPhoneValid = /^(01[0125]\d{8}|201[0125]\d{8})$/.test(cleanPhone);
-
-    // Extract vendor IDs from data-vendor-id or vendor-id
-    const vendorIds = [...html.matchAll(/(?:data-vendor-id|vendor-id|name="vendor_id(?:\[\])?")[^>]*value="([^"]+)"/gi)].map(m => m[1].trim());
-
-    // Extract warehouse/vendor strings from product names (e.g. "مخزن Y2", "مخزن Te1")
-    const warehouseMatches = [...html.matchAll(/\(\s*مخزن\s*([^)]+)\s*\)/gi)].map(m =>
-      `مخزن ${m[1].trim()}`
-    );
-
-    // Distinct actual merchant identifiers (vendor IDs if present, otherwise explicit merchant codes)
-    const distinctMerchantCodes = vendorIds.length > 0 ? [...new Set(vendorIds)] : [];
-
-    return {
-      success: true,
-      anotherPhone,
-      extraPhoneValid,
-      merchantCodes: distinctMerchantCodes,
-      vendorIds: [...new Set(vendorIds)],
-      warehouseNames: [...new Set(warehouseMatches)],
-    };
   }
 }
 
