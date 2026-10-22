@@ -296,6 +296,14 @@ export async function ensureCoverageForRange(
               totalPagesRead += 1;
               job.pagesFetched = totalPagesRead;
 
+              // Dynamic discovery: expand dayPagesTotal if Vendoor pagination reveals higher page numbers
+              if (nextP.totalPages > dayPagesTotal) {
+                const diff = nextP.totalPages - dayPagesTotal;
+                dayPagesTotal = nextP.totalPages;
+                totalPagesDiscovered += diff;
+                job.pagesTotal = Math.max(job.pagesTotal, totalPagesDiscovered);
+              }
+
               job.stage = 'SAVING_RECORDS';
               job.stageLabelAr = `جاري حفظ السجلات (صفحة ${p}/${dayPagesTotal})`;
               onProgress?.(job);
@@ -599,9 +607,11 @@ export function generateLogsIntelligenceReport(startDateStr: string, endDateStr:
   // 2. Base Counts from canonical_activity_events using permanent order identity
   const orderIdentitySql = `COALESCE(
     CASE WHEN c.order_id IS NOT NULL THEN 'ORD_ID_' || c.order_id END,
-    CASE WHEN r.vendoor_order_id IS NOT NULL THEN 'VEND_ID_' || r.vendoor_order_id END,
+    CASE WHEN r.vendoor_order_id IS NOT NULL AND r.vendoor_order_id > 0 THEN 'VEND_ID_' || r.vendoor_order_id END,
     CASE WHEN c.order_code IS NOT NULL AND TRIM(c.order_code) != '' THEN 'CODE_' || LOWER(TRIM(c.order_code)) END
   )`;
+
+  const orderHasIdentitySql = `((c.order_code IS NOT NULL AND TRIM(c.order_code) != '') OR c.order_id IS NOT NULL OR (r.vendoor_order_id IS NOT NULL AND r.vendoor_order_id > 0))`;
 
   const totalLogs = (db.prepare(`
     SELECT COUNT(*) as c FROM canonical_activity_events
@@ -613,7 +623,7 @@ export function generateLogsIntelligenceReport(startDateStr: string, endDateStr:
     FROM canonical_activity_events c
     LEFT JOIN raw_activity_events r ON c.raw_event_id = r.id
     WHERE c.event_timestamp >= ? AND c.event_timestamp < ?
-      AND (c.order_code IS NOT NULL AND TRIM(c.order_code) != '' OR c.order_id IS NOT NULL)
+      AND ${orderHasIdentitySql}
   `).get(startTime, endTime) as any)?.c || 0;
 
   // Confirmed Orders (Rule: Printed = Confirmation)
@@ -624,7 +634,7 @@ export function generateLogsIntelligenceReport(startDateStr: string, endDateStr:
     FROM canonical_activity_events c
     LEFT JOIN raw_activity_events r ON c.raw_event_id = r.id
     WHERE c.event_timestamp >= ? AND c.event_timestamp < ?
-      AND (c.order_code IS NOT NULL AND TRIM(c.order_code) != '' OR c.order_id IS NOT NULL)
+      AND ${orderHasIdentitySql}
       AND c.to_status = 'Printed'
   `).get(startTime, endTime);
 
@@ -639,7 +649,7 @@ export function generateLogsIntelligenceReport(startDateStr: string, endDateStr:
     FROM canonical_activity_events c
     LEFT JOIN raw_activity_events r ON c.raw_event_id = r.id
     WHERE c.event_timestamp >= ? AND c.event_timestamp < ?
-      AND (c.order_code IS NOT NULL AND TRIM(c.order_code) != '' OR c.order_id IS NOT NULL)
+      AND ${orderHasIdentitySql}
       AND c.to_status = 'Canceled'
   `).get(startTime, endTime);
 
@@ -654,7 +664,7 @@ export function generateLogsIntelligenceReport(startDateStr: string, endDateStr:
     FROM canonical_activity_events c
     LEFT JOIN raw_activity_events r ON c.raw_event_id = r.id
     WHERE c.event_timestamp >= ? AND c.event_timestamp < ?
-      AND (c.order_code IS NOT NULL AND TRIM(c.order_code) != '' OR c.order_id IS NOT NULL)
+      AND ${orderHasIdentitySql}
       AND c.to_status = 'Canceling'
   `).get(startTime, endTime);
 
@@ -669,7 +679,7 @@ export function generateLogsIntelligenceReport(startDateStr: string, endDateStr:
     FROM canonical_activity_events c
     LEFT JOIN raw_activity_events r ON c.raw_event_id = r.id
     WHERE c.event_timestamp >= ? AND c.event_timestamp < ?
-      AND (c.order_code IS NOT NULL AND TRIM(c.order_code) != '' OR c.order_id IS NOT NULL)
+      AND ${orderHasIdentitySql}
       AND c.action_type = 'order_created'
   `).get(startTime, endTime);
 
@@ -684,7 +694,7 @@ export function generateLogsIntelligenceReport(startDateStr: string, endDateStr:
     FROM canonical_activity_events c
     LEFT JOIN raw_activity_events r ON c.raw_event_id = r.id
     WHERE c.event_timestamp >= ? AND c.event_timestamp < ?
-      AND (c.order_code IS NOT NULL AND TRIM(c.order_code) != '' OR c.order_id IS NOT NULL)
+      AND ${orderHasIdentitySql}
       AND (
         c.action_type = 'extra_phone_added'
         OR c.details_json LIKE '%"extraPhoneOperation":"ADDITION"%'
@@ -1186,7 +1196,7 @@ export function getDrilldownLogs(params: {
   }
 
   if (effectiveViewType === 'orders') {
-    conditions.push("(c.order_code IS NOT NULL AND TRIM(c.order_code) != '' OR c.order_id IS NOT NULL)");
+    conditions.push("((c.order_code IS NOT NULL AND TRIM(c.order_code) != '') OR c.order_id IS NOT NULL OR (r.vendoor_order_id IS NOT NULL AND r.vendoor_order_id > 0))");
   }
 
   if (search && search.trim()) {
@@ -1199,7 +1209,7 @@ export function getDrilldownLogs(params: {
 
   const orderIdentitySql = `COALESCE(
     CASE WHEN c.order_id IS NOT NULL THEN 'ORD_ID_' || c.order_id END,
-    CASE WHEN r.vendoor_order_id IS NOT NULL THEN 'VEND_ID_' || r.vendoor_order_id END,
+    CASE WHEN r.vendoor_order_id IS NOT NULL AND r.vendoor_order_id > 0 THEN 'VEND_ID_' || r.vendoor_order_id END,
     CASE WHEN c.order_code IS NOT NULL AND TRIM(c.order_code) != '' THEN 'CODE_' || LOWER(TRIM(c.order_code)) END
   )`;
 
@@ -1213,12 +1223,13 @@ export function getDrilldownLogs(params: {
       FROM canonical_activity_events c
       LEFT JOIN raw_activity_events r ON c.raw_event_id = r.id
       ${whereClause}
+        AND ${orderIdentitySql} IS NOT NULL
     `).get(...sqlParams) as any)?.c || 0;
 
     events = db.prepare(`
       SELECT 
         MAX(c.id) as id,
-        c.order_code,
+        COALESCE(MAX(c.order_code), MAX(r.order_code), '') as order_code,
         MAX(c.actor_name) as actor_name,
         MAX(c.action_type) as action_type,
         MAX(c.from_status) as from_status,
@@ -1234,6 +1245,7 @@ export function getDrilldownLogs(params: {
       FROM canonical_activity_events c
       LEFT JOIN raw_activity_events r ON c.raw_event_id = r.id
       ${whereClause}
+        AND ${orderIdentitySql} IS NOT NULL
       GROUP BY ${orderIdentitySql}
       ORDER BY MAX(c.event_timestamp) DESC
       LIMIT ? OFFSET ?

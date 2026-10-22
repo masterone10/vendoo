@@ -125,6 +125,14 @@ apiRouter.get('/dashboard/stats', (req: Request, res: Response) => {
       )
     `).get(dateInterval.startCairo, dateInterval.endCairo, dateInterval.startCairo, dateInterval.endCairo) as any)?.count || 0;
 
+    const printedEventsCount = (db.prepare(`
+      SELECT COUNT(*) as count
+      FROM canonical_activity_events c
+      WHERE c.event_timestamp >= ? AND c.event_timestamp < ?
+        AND (c.to_status = 'Printed' OR c.action_type = 'confirmation')
+        AND c.order_code IS NOT NULL AND c.order_code != ''
+    `).get(dateInterval.startCairo, dateInterval.endCairo) as any)?.count || printedForDateCount;
+
     // Authoritative Canceled Count for targetDate (strictly from verified Vendoor logs)
     const canceledForDateCount = (db.prepare(`
       SELECT COUNT(DISTINCT c.order_code) as count
@@ -134,37 +142,135 @@ apiRouter.get('/dashboard/stats', (req: Request, res: Response) => {
         AND c.order_code IS NOT NULL AND c.order_code != ''
     `).get(dateInterval.startCairo, dateInterval.endCairo) as any)?.count || 0;
 
+    const cancelEventsCount = (db.prepare(`
+      SELECT COUNT(*) as count
+      FROM canonical_activity_events c
+      WHERE c.event_timestamp >= ? AND c.event_timestamp < ?
+        AND (c.to_status = 'Canceled' OR c.action_type = 'order_canceled')
+        AND c.order_code IS NOT NULL AND c.order_code != ''
+    `).get(dateInterval.startCairo, dateInterval.endCairo) as any)?.count || canceledForDateCount;
+
     currentCounts.Printed = printedForDateCount;
     currentCounts.Canceled = canceledForDateCount;
 
-    const dayTransitions: any[] = db.prepare(`
-      SELECT to_status, COUNT(*) as count
-      FROM order_status_events
-      WHERE observed_at >= ? AND observed_at < ?
-      GROUP BY to_status
-    `).all(dateInterval.startCairo, dateInterval.endCairo);
+    // Distinct unique orders and total events that entered Pending today from canonical logs (plus memory transitions fallback)
+    const pendingStats = (db.prepare(`
+      SELECT 
+        COUNT(DISTINCT o_id) as unique_orders,
+        COUNT(*) as total_events
+      FROM (
+        SELECT order_code as o_id FROM canonical_activity_events
+        WHERE event_timestamp >= ? AND event_timestamp < ?
+          AND to_status = 'Pending'
+          AND order_code IS NOT NULL AND order_code != ''
+        UNION ALL
+        SELECT random_number as o_id FROM order_status_events
+        WHERE observed_at >= ? AND observed_at < ?
+          AND to_status = 'Pending'
+          AND random_number IS NOT NULL AND random_number != ''
+          AND NOT EXISTS (
+            SELECT 1 FROM canonical_activity_events c
+            WHERE c.order_code = order_status_events.random_number
+              AND c.event_timestamp >= ? AND c.event_timestamp < ?
+              AND c.to_status = 'Pending'
+          )
+      )
+    `).get(
+      dateInterval.startCairo, dateInterval.endCairo,
+      dateInterval.startCairo, dateInterval.endCairo,
+      dateInterval.startCairo, dateInterval.endCairo
+    ) as any);
+    const pendingUniqueOrders = pendingStats?.unique_orders || 0;
+    const pendingTotalEvents = pendingStats?.total_events || 0;
 
-    const todayActivity = {
-      Created: 0,
-      Printed: printedForDateCount,
-      Pending: 0,
-      Processing: 0,
-      Canceling: 0,
-      Canceled: canceledForDateCount,
-    };
+    // Distinct unique orders and total events that entered Processing today
+    const processingStats = (db.prepare(`
+      SELECT 
+        COUNT(DISTINCT o_id) as unique_orders,
+        COUNT(*) as total_events
+      FROM (
+        SELECT order_code as o_id FROM canonical_activity_events
+        WHERE event_timestamp >= ? AND event_timestamp < ?
+          AND to_status = 'Processing'
+          AND order_code IS NOT NULL AND order_code != ''
+        UNION ALL
+        SELECT random_number as o_id FROM order_status_events
+        WHERE observed_at >= ? AND observed_at < ?
+          AND to_status = 'Processing'
+          AND random_number IS NOT NULL AND random_number != ''
+          AND NOT EXISTS (
+            SELECT 1 FROM canonical_activity_events c
+            WHERE c.order_code = order_status_events.random_number
+              AND c.event_timestamp >= ? AND c.event_timestamp < ?
+              AND c.to_status = 'Processing'
+          )
+      )
+    `).get(
+      dateInterval.startCairo, dateInterval.endCairo,
+      dateInterval.startCairo, dateInterval.endCairo,
+      dateInterval.startCairo, dateInterval.endCairo
+    ) as any);
+    const processingUniqueOrders = processingStats?.unique_orders || 0;
+    const processingTotalEvents = processingStats?.total_events || 0;
+
+    // Distinct unique orders and total events that entered Canceling today
+    const cancelingStats = (db.prepare(`
+      SELECT 
+        COUNT(DISTINCT o_id) as unique_orders,
+        COUNT(*) as total_events
+      FROM (
+        SELECT order_code as o_id FROM canonical_activity_events
+        WHERE event_timestamp >= ? AND event_timestamp < ?
+          AND to_status = 'Canceling'
+          AND order_code IS NOT NULL AND order_code != ''
+        UNION ALL
+        SELECT random_number as o_id FROM order_status_events
+        WHERE observed_at >= ? AND observed_at < ?
+          AND to_status = 'Canceling'
+          AND random_number IS NOT NULL AND random_number != ''
+          AND NOT EXISTS (
+            SELECT 1 FROM canonical_activity_events c
+            WHERE c.order_code = order_status_events.random_number
+              AND c.event_timestamp >= ? AND c.event_timestamp < ?
+              AND c.to_status = 'Canceling'
+          )
+      )
+    `).get(
+      dateInterval.startCairo, dateInterval.endCairo,
+      dateInterval.startCairo, dateInterval.endCairo,
+      dateInterval.startCairo, dateInterval.endCairo
+    ) as any);
+    const cancelingUniqueOrders = cancelingStats?.unique_orders || 0;
+    const cancelingTotalEvents = cancelingStats?.total_events || 0;
 
     const createdOnDate = (db.prepare(`
       SELECT COUNT(*) as count
       FROM orders
       WHERE created_at_source >= ? AND created_at_source < ?
     `).get(dateInterval.startCairo, dateInterval.endCairo) as any)?.count || 0;
-    todayActivity.Created = createdOnDate;
 
-    for (const t of dayTransitions) {
-      if (t.to_status === 'Pending') todayActivity.Pending = t.count;
-      else if (t.to_status === 'Processing') todayActivity.Processing = t.count;
-      else if (t.to_status === 'Canceling') todayActivity.Canceling = t.count;
-    }
+    const dayCumulative = {
+      Pending: { uniqueOrders: pendingUniqueOrders, totalEvents: pendingTotalEvents },
+      Processing: { uniqueOrders: processingUniqueOrders, totalEvents: processingTotalEvents },
+      Canceling: { uniqueOrders: cancelingUniqueOrders, totalEvents: cancelingTotalEvents },
+      Printed: { uniqueOrders: printedForDateCount, totalEvents: printedEventsCount },
+      Canceled: { uniqueOrders: canceledForDateCount, totalEvents: cancelEventsCount },
+    };
+
+    const todayActivity = {
+      Created: createdOnDate,
+      Printed: printedForDateCount,
+      Pending: pendingUniqueOrders,
+      Processing: processingUniqueOrders,
+      Canceling: cancelingUniqueOrders,
+      Canceled: canceledForDateCount,
+      createdEvents: createdOnDate,
+      printedEvents: printedEventsCount,
+      pendingEvents: pendingTotalEvents,
+      processingEvents: processingTotalEvents,
+      cancelingEvents: cancelingTotalEvents,
+      cancelEvents: cancelEventsCount,
+    };
 
     // 3. Confirmation Age counts
     const confStatus = syncEngine.getStatus().confirmationAgeStatus;
@@ -279,6 +385,7 @@ apiRouter.get('/dashboard/stats', (req: Request, res: Response) => {
     };
 
     const syncStatus = syncEngine.getStatus();
+    const todayLogsCoverage = syncEngine.getTodayLogsCoverage();
 
     res.json({
       selectedDate: targetDate,
@@ -295,6 +402,8 @@ apiRouter.get('/dashboard/stats', (req: Request, res: Response) => {
         openAlertsCount,
       },
       todayActivity,
+      dayCumulative,
+      todayLogsCoverage,
       pendingAge,
       processingAge,
       syncStatus,
@@ -857,7 +966,8 @@ apiRouter.get('/team', async (req: Request, res: Response) => {
         if (e.to_status === 'Printed') userStats[name].printed++;
         else if (e.to_status === 'Pending') userStats[name].pending++;
         else if (e.to_status === 'Processing') userStats[name].processing++;
-        else if (e.to_status === 'Canceled' || e.to_status === 'Canceling') userStats[name].cancel++;
+        else if (e.to_status === 'Canceled') userStats[name].cancel++;
+        else if (e.to_status === 'Canceling') (userStats[name] as any).canceling = ((userStats[name] as any).canceling || 0) + 1;
         else userStats[name].other++;
       } else {
         userStats[name].other++;
@@ -1512,9 +1622,11 @@ apiRouter.get('/reports', (req: Request, res: Response) => {
 
     const orderIdentitySql = `COALESCE(
       CASE WHEN c.order_id IS NOT NULL THEN 'ORD_ID_' || c.order_id END,
-      CASE WHEN r.vendoor_order_id IS NOT NULL THEN 'VEND_ID_' || r.vendoor_order_id END,
+      CASE WHEN r.vendoor_order_id IS NOT NULL AND r.vendoor_order_id > 0 THEN 'VEND_ID_' || r.vendoor_order_id END,
       CASE WHEN c.order_code IS NOT NULL AND TRIM(c.order_code) != '' THEN 'CODE_' || LOWER(TRIM(c.order_code)) END
     )`;
+
+    const orderHasIdentitySql = `((c.order_code IS NOT NULL AND TRIM(c.order_code) != '') OR c.order_id IS NOT NULL OR (r.vendoor_order_id IS NOT NULL AND r.vendoor_order_id > 0))`;
 
     // Orders Touched in period (distinct orders with canonical activity events in period)
     const touchedCount = (db.prepare(`
@@ -1522,7 +1634,7 @@ apiRouter.get('/reports', (req: Request, res: Response) => {
       FROM canonical_activity_events c
       LEFT JOIN raw_activity_events r ON c.raw_event_id = r.id
       WHERE c.event_timestamp >= ? AND c.event_timestamp < ?
-        AND (c.order_code IS NOT NULL AND TRIM(c.order_code) != '' OR c.order_id IS NOT NULL)
+        AND ${orderHasIdentitySql}
     `).get(startTime, endTime) as any)?.c || 0;
 
     // Events in period
@@ -1558,7 +1670,7 @@ apiRouter.get('/reports', (req: Request, res: Response) => {
       FROM canonical_activity_events c
       LEFT JOIN raw_activity_events r ON c.raw_event_id = r.id
       WHERE c.event_timestamp >= ? AND c.event_timestamp < ?
-        AND (c.order_code IS NOT NULL AND TRIM(c.order_code) != '' OR c.order_id IS NOT NULL)
+        AND ${orderHasIdentitySql}
         AND c.to_status = 'Printed'
     `).get(startTime, endTime) as any)?.c || 0;
 
@@ -1574,7 +1686,7 @@ apiRouter.get('/reports', (req: Request, res: Response) => {
       FROM canonical_activity_events c
       LEFT JOIN raw_activity_events r ON c.raw_event_id = r.id
       WHERE c.event_timestamp >= ? AND c.event_timestamp < ?
-        AND (c.order_code IS NOT NULL AND TRIM(c.order_code) != '' OR c.order_id IS NOT NULL)
+        AND ${orderHasIdentitySql}
         AND c.to_status = 'Canceled'
     `).get(startTime, endTime) as any)?.c || 0;
 
@@ -1590,7 +1702,7 @@ apiRouter.get('/reports', (req: Request, res: Response) => {
       FROM canonical_activity_events c
       LEFT JOIN raw_activity_events r ON c.raw_event_id = r.id
       WHERE c.event_timestamp >= ? AND c.event_timestamp < ?
-        AND (c.order_code IS NOT NULL AND TRIM(c.order_code) != '' OR c.order_id IS NOT NULL)
+        AND ${orderHasIdentitySql}
         AND c.to_status = 'Canceling'
     `).get(startTime, endTime) as any)?.c || 0;
 
@@ -1600,6 +1712,21 @@ apiRouter.get('/reports', (req: Request, res: Response) => {
       WHERE c.event_timestamp >= ? AND c.event_timestamp < ?
         AND c.to_status = 'Canceling'
     `).get(startTime, endTime) as any)?.c || 0;
+
+    // Created Orders from canonical logs (with fallback to orders table)
+    const createdLogsData: any = db.prepare(`
+      SELECT 
+        COUNT(DISTINCT ${orderIdentitySql}) as unique_orders,
+        COUNT(*) as events_count
+      FROM canonical_activity_events c
+      LEFT JOIN raw_activity_events r ON c.raw_event_id = r.id
+      WHERE c.event_timestamp >= ? AND c.event_timestamp < ?
+        AND ${orderHasIdentitySql}
+        AND c.action_type = 'order_created'
+    `).get(startTime, endTime);
+
+    const createdUniqueOrders = createdLogsData?.unique_orders > 0 ? createdLogsData.unique_orders : createdCount;
+    const createdEventsCount = createdLogsData?.events_count || createdUniqueOrders;
 
     // Cancellations in period
     const cancellations: any[] = db.prepare(`
@@ -1767,7 +1894,9 @@ apiRouter.get('/reports', (req: Request, res: Response) => {
       startDate: sDate,
       endDate: eDate,
       period: period || 'custom',
-      createdCount,
+      createdCount: createdUniqueOrders,
+      createdOrdersCount: createdUniqueOrders,
+      createdEventsCount,
       totalOrderValue,
       averageOrderValue,
       multiWarehouseCount,
@@ -1779,7 +1908,9 @@ apiRouter.get('/reports', (req: Request, res: Response) => {
         singleValue: Math.round((multiWarehouseStats?.single_value || 0) * 100) / 100,
       },
       touchedCount,
+      uniqueOrdersTouched: touchedCount,
       totalEvents,
+      totalLogs: totalEvents,
       statusCounts: {
         printed: printedUniqueOrders,
         printedEvents: printedEventsCount,
@@ -1787,14 +1918,17 @@ apiRouter.get('/reports', (req: Request, res: Response) => {
         canceledEvents: canceledEventsCount,
         canceling: cancelingUniqueOrders,
         cancelingEvents: cancelingEventsCount,
+        created: createdUniqueOrders,
+        createdEvents: createdEventsCount,
         pending: pendingTransitions,
         processing: processingTransitions,
       },
+      confirmedOrdersCount: printedUniqueOrders,
       printedUniqueOrders,
       printedEventsCount,
-      canceledUniqueOrders,
+      canceledOrdersCount: canceledUniqueOrders,
       canceledEventsCount,
-      cancelingUniqueOrders,
+      cancelingOrdersCount: cancelingUniqueOrders,
       cancelingEventsCount,
       ordersByStatus,
       dailyCreated,

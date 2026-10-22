@@ -856,10 +856,17 @@ export const ReportsView: React.FC<ReportsViewProps> = ({ onSelectOrder }) => {
                   {report.metrics.canceledEventsCount.toLocaleString()} حركة
                 </span>
               </div>
-              <div className="flex items-center justify-between">
+              <div
+                onClick={(e) => {
+                  e.stopPropagation();
+                  setDrilldownPillar('canceling');
+                }}
+                className="flex items-center justify-between hover:bg-slate-800/60 p-1 -mx-1 rounded transition"
+                title="انقر لعرض قائمة طلبات قيد الإلغاء (Canceling) المعزولة"
+              >
                 <span className="text-slate-400 font-sans">قيد الإلغاء (معزول):</span>
                 <span className="font-bold text-amber-400 font-mono">
-                  {report.metrics.cancelingEventsCount.toLocaleString()} طلب
+                  {report.metrics.cancelingOrdersCount.toLocaleString()} طلب
                 </span>
               </div>
             </div>

@@ -48,7 +48,8 @@ export function normalizeStatus(status: string | null | undefined): string | nul
   if (lower === 'printed' || lower === 'مطبوع') return 'Printed';
   if (lower === 'pending' || lower === 'معلق') return 'Pending';
   if (lower === 'processing' || lower === 'قيد التجهيز') return 'Processing';
-  if (lower === 'canceled' || lower === 'canceling' || lower === 'ملغي' || lower === 'ملغى') return 'Canceled';
+  if (lower === 'canceled' || lower === 'ملغي' || lower === 'ملغى') return 'Canceled';
+  if (lower === 'canceling' || lower === 'قيد الإلغاء' || lower === 'طلب إلغاء') return 'Canceling';
   if (lower === 'new' || lower === 'جديد') return 'New';
   if (lower === 'delivered' || lower === 'تم التوصيل') return 'Delivered';
   if (lower === 'returned' || lower === 'مرتجع') return 'Returned';
@@ -217,27 +218,35 @@ export function processAndDeduplicateTeamEvents(
       const targetStatus = normalizeStatus(ev.to_status)!;
       const declaredFromStatus = normalizeStatus(ev.from_status);
 
-      // Conservative burst grouping:
-      // Group into the same transition cluster ONLY if:
-      // 1. Same target status AND
-      // 2. Either exact same timestamp (0s), identical source_hash, or sub-5-second rapid burst write
-      // Never group or discard actions based on arbitrary 60-second windows alone
+      // Rule 2: Strictly prohibit discarding employee actions based on arbitrary 60-second windows.
+      // Group into the same transition cluster ONLY if supported by confirmed duplicate evidence:
+      // 1. Same target status for the same order, AND
+      // 2. Either exact same timestamp (0s), identical source_hash,
+      //    or rapid technical burst write within <= 5 seconds (e.g. Vendoor multi-row emission on button click).
+      // Any action occurring after 5 seconds is preserved as a separate distinct action.
       const timeDiff = lastTransitionCluster
         ? timeDifferenceInSeconds(lastTransitionCluster.primaryTimestamp, ev.event_timestamp)
         : 999999;
 
+      const isExactSourceHashMatch = Boolean(
+        ev.source_hash && lastTransitionCluster && lastTransitionCluster.events.some(e => e.source_hash === ev.source_hash)
+      );
+
+      const isSub5SecBurst = Boolean(
+        lastTransitionCluster &&
+        lastTransitionCluster.targetStatus === targetStatus &&
+        timeDiff <= 5 &&
+        (
+          lastTransitionCluster.events.some(e => e.actor_name === ev.actor_name) ||
+          !isHumanActor(ev.actor_name, ev.is_system_actor) ||
+          lastTransitionCluster.events.some(e => !isHumanActor(e.actor_name, e.is_system_actor))
+        )
+      );
+
       const isConfirmedBurst = Boolean(
         lastTransitionCluster &&
         lastTransitionCluster.targetStatus === targetStatus &&
-        (
-          timeDiff === 0 ||
-          (ev.source_hash && lastTransitionCluster.events.some(e => e.source_hash === ev.source_hash)) ||
-          (timeDiff <= 5 && (
-            lastTransitionCluster.events.some(e => e.actor_name === ev.actor_name) ||
-            !isHumanActor(ev.actor_name, ev.is_system_actor) ||
-            lastTransitionCluster.events.some(e => !isHumanActor(e.actor_name, e.is_system_actor))
-          ))
-        )
+        (isExactSourceHashMatch || isSub5SecBurst)
       );
 
       if (isConfirmedBurst && lastTransitionCluster) {
@@ -258,7 +267,11 @@ export function processAndDeduplicateTeamEvents(
         prevOrderEv &&
         normalizeStatus(prevOrderEv.to_status) === targetStatus &&
         timeDifferenceInSeconds(prevOrderEv.event_timestamp, ev.event_timestamp) <= 5 &&
-        (prevOrderEv.actor_name === ev.actor_name || !isHumanActor(ev.actor_name, ev.is_system_actor))
+        (
+          (prevOrderEv.source_hash && ev.source_hash && prevOrderEv.source_hash === ev.source_hash) ||
+          prevOrderEv.actor_name === ev.actor_name ||
+          !isHumanActor(ev.actor_name, ev.is_system_actor)
+        )
       );
 
       if (currentStatus === targetStatus && isImmediateRedundantClick) {
@@ -266,14 +279,16 @@ export function processAndDeduplicateTeamEvents(
           ...ev,
           is_counted: false,
           is_duplicate_transition: true,
-          exclusion_reason: 'IMMEDIATE_REDUNDANT_RECLICK',
+          exclusion_reason: prevOrderEv?.source_hash === ev.source_hash
+            ? 'EXACT_SOURCE_HASH_DUPLICATE'
+            : 'IMMEDIATE_REDUNDANT_RECLICK',
           authoritative_transition_id: prevOrderEv?.id || ev.id,
         });
         continue;
       }
 
-      // This is a new valid transition to targetStatus!
-      // Start a cluster to collect any immediate burst duplicates for this transition
+      // This is a valid, distinct action!
+      // Start a cluster to collect any immediate 0s/hash duplicates for this transition
       lastTransitionCluster = {
         targetStatus,
         events: [ev],

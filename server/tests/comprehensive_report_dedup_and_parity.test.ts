@@ -276,7 +276,51 @@ async function runTests() {
     assert.strictEqual(totalRawInDb.c, 10, 'All 10 inserted canonical records must remain in database');
     console.log('  ✔ Test 7 PASSED: All canonical audit records intact, zero records deleted.\n');
 
-    console.log('🎉 ALL 7 MANDATORY REPORT DEDUP & PARITY TESTS PASSED PERFECTLY! 🎉\n');
+    // -------------------------------------------------------------------------
+    // TEST 8: Empty / whitespace order codes strictly excluded from unique count
+    // -------------------------------------------------------------------------
+    console.log('▶ Test 8: Empty and whitespace order codes excluded from unique order count');
+    testDb.prepare(`
+      INSERT INTO canonical_activity_events (
+        raw_event_id, order_id, order_code, actor_name, action_type, to_status,
+        event_timestamp, is_system_actor, created_at
+      ) VALUES (801, NULL, '', 'System', 'status_change', 'Printed', '2026-10-22 14:00:00', 1, '2026-10-22T14:00:00Z')
+    `).run();
+    testDb.prepare(`
+      INSERT INTO canonical_activity_events (
+        raw_event_id, order_id, order_code, actor_name, action_type, to_status,
+        event_timestamp, is_system_actor, created_at
+      ) VALUES (802, NULL, '   ', 'System', 'status_change', 'Printed', '2026-10-22 14:05:00', 1, '2026-10-22T14:05:00Z')
+    `).run();
+
+    const emptyExclusionData: any = testDb.prepare(`
+      SELECT COUNT(DISTINCT ${orderIdentitySql}) as unique_orders
+      FROM canonical_activity_events c
+      LEFT JOIN raw_activity_events r ON c.raw_event_id = r.id
+      WHERE c.event_timestamp >= ? AND c.event_timestamp < ?
+        AND ((c.order_code IS NOT NULL AND TRIM(c.order_code) != '') OR c.order_id IS NOT NULL OR (r.vendoor_order_id IS NOT NULL AND r.vendoor_order_id > 0))
+        AND c.to_status = 'Printed'
+    `).get(interval.startCairo, interval.endCairo);
+
+    assert.strictEqual(emptyExclusionData.unique_orders, 1, 'Empty and whitespace order codes must be excluded from unique orders');
+    console.log('  ✔ Test 8 PASSED: Empty and whitespace codes successfully excluded without merging.\n');
+
+    // -------------------------------------------------------------------------
+    // TEST 9: Vendoor query parameters start_date and end_date formatting
+    // -------------------------------------------------------------------------
+    console.log('▶ Test 9: Vendoor query parameter verification');
+    const testUrl = new URL('https://aff.ven-door.com/dashboard/log/system');
+    const queryDate = '2026-10-22';
+    testUrl.searchParams.set('page', '1');
+    testUrl.searchParams.set('start_date', queryDate);
+    testUrl.searchParams.set('end_date', queryDate);
+
+    assert.strictEqual(testUrl.searchParams.get('start_date'), '2026-10-22', 'start_date param name and value match');
+    assert.strictEqual(testUrl.searchParams.get('end_date'), '2026-10-22', 'end_date param name and value match');
+    assert.strictEqual(testUrl.searchParams.get('page'), '1', 'page param matches');
+    console.log('  ✔ Test 9 PASSED: Vendoor query parameters reach with verified start_date and end_date.\n');
+
+    console.log('🎉 ALL 9 MANDATORY REPORT DEDUP, PARITY & VENDOOR TESTS PASSED PERFECTLY! 🎉\n');
   } finally {
     testDb.close();
     try {

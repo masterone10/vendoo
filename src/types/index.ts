@@ -122,6 +122,27 @@ export interface DashboardStats {
     Processing: number;
     Canceling: number;
     Canceled: number;
+    createdEvents?: number;
+    printedEvents?: number;
+    pendingEvents?: number;
+    processingEvents?: number;
+    cancelingEvents?: number;
+    cancelEvents?: number;
+  };
+  dayCumulative?: {
+    Pending: { uniqueOrders: number; totalEvents: number };
+    Processing: { uniqueOrders: number; totalEvents: number };
+    Canceling: { uniqueOrders: number; totalEvents: number };
+    Printed: { uniqueOrders: number; totalEvents: number };
+    Canceled: { uniqueOrders: number; totalEvents: number };
+  };
+  todayLogsCoverage?: {
+    completionStatus: 'COMPLETE' | 'RUNNING' | 'PARTIAL' | 'FAILED' | 'NOT_SYNCED';
+    pagesRead: number;
+    pagesDiscovered: number;
+    recordsSaved: number;
+    isSyncing: boolean;
+    lastAttemptedAt?: string | null;
   };
   pendingAge: {
     lessThanTwoDays: number;

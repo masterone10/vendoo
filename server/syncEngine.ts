@@ -1674,15 +1674,23 @@ export class SyncEngine {
   }
 
   /**
-   * Sync System Logs into Raw Activity and Canonical Events with full pagination
+   * Sync System Logs into Raw Activity and Canonical Events with full day coverage from 00:00 Cairo
    */
   public async syncSystemLogs(nowIso: string, targetDate?: string): Promise<{ totalLogs: number; newSaved: number; hasErrors: boolean }> {
     let hasErrors = false;
     try {
+      if (!vendoorClient.isConfigured()) {
+        return { totalLogs: 0, newSaved: 0, hasErrors: false };
+      }
+
       const dateToSync = targetDate || getCairoDateString();
+      const existingCov = getCoverageRecord('logs', dateToSync);
+      const isAlreadyComplete = existingCov?.completion_status === 'COMPLETE';
+
       const firstPage = await vendoorClient.fetchSystemLogs(1, dateToSync, dateToSync);
       const totalPages = Math.max(1, firstPage.totalPages);
-      const maxPages = Math.min(totalPages, targetDate ? 50 : 20);
+      // When day is incomplete, do not cap at 20 pages; read all discovered pages up to safe max 100
+      const maxPages = isAlreadyComplete ? Math.min(totalPages, 5) : Math.min(totalPages, 100);
 
       const insertRawStmt = db.prepare(`
         INSERT OR IGNORE INTO raw_activity_events (
@@ -1786,24 +1794,24 @@ export class SyncEngine {
       };
 
       // Process first page
+      let actualPagesRead = 1;
       const newOnFirstPage = processEntries(firstPage.entries);
 
-      // Check if DB already has existing events
-      const existingEventsCount = (db.prepare('SELECT count(*) as c FROM raw_activity_events').get() as any)?.c || 0;
-
-      if (newOnFirstPage === 0 && existingEventsCount > 0 && !targetDate) {
+      // Fast exit ONLY if today was already confirmed complete AND no new entries appeared on page 1
+      if (isAlreadyComplete && newOnFirstPage === 0 && !targetDate) {
         // Fast exit: no new logs on page 1 since last sync cycle
       } else {
-        // Scan backwards through recent pages until an entire page is already known
+        // Scan backwards through all discovered pages until the whole day from 00:00 Cairo is ingested
         for (let p = 2; p <= maxPages; p++) {
           try {
             const pageData = await vendoorClient.fetchSystemLogs(p, dateToSync, dateToSync);
             if (!pageData.entries || pageData.entries.length === 0) {
               break;
             }
+            actualPagesRead = p;
             const newOnPage = processEntries(pageData.entries);
-            // If an entire page contains only previously ingested events, earlier pages are guaranteed older
-            if (newOnPage === 0 && existingEventsCount > 0) {
+            // If already complete, we can stop when encountering a known page
+            if (isAlreadyComplete && newOnPage === 0) {
               break;
             }
           } catch (pageErr: any) {
@@ -1815,18 +1823,22 @@ export class SyncEngine {
       }
 
       // Record historical coverage
+      const finalCompletionStatus: 'COMPLETE' | 'PARTIAL' | 'FAILED' = hasErrors
+        ? 'PARTIAL'
+        : (actualPagesRead >= totalPages || isAlreadyComplete ? 'COMPLETE' : 'PARTIAL');
+
       saveCoverageRecord({
         accountId: 'primary',
         sourceDomain: 'logs',
         periodDate: dateToSync,
         storageTier: isDateInHot(dateToSync) ? 'HOT' : 'COLD',
         pagesDiscovered: totalPages,
-        pagesRead: totalPages,
+        pagesRead: actualPagesRead,
         recordsExtracted: totalLogs,
         recordsSaved: newCanonicalCount,
-        completionStatus: hasErrors ? 'PARTIAL' : 'COMPLETE',
+        completionStatus: finalCompletionStatus,
         lastAttemptedAt: nowIso,
-        completedAt: hasErrors ? null : nowIso,
+        completedAt: finalCompletionStatus === 'COMPLETE' ? nowIso : null,
       });
 
       return { totalLogs, newSaved: newCanonicalCount, hasErrors };
@@ -1834,6 +1846,43 @@ export class SyncEngine {
       console.warn('[SyncEngine] Warning syncing system logs:', err.message);
       return { totalLogs: 0, newSaved: 0, hasErrors: true };
     }
+  }
+
+  /**
+   * Returns current day logs coverage and sync progress
+   */
+  public getTodayLogsCoverage(): {
+    completionStatus: 'COMPLETE' | 'RUNNING' | 'PARTIAL' | 'FAILED' | 'NOT_SYNCED';
+    pagesRead: number;
+    pagesDiscovered: number;
+    recordsSaved: number;
+    isSyncing: boolean;
+    lastAttemptedAt: string | null;
+  } {
+    const cairoToday = getCairoDateString();
+    const isSyncing = this.status.currentPhase === 'SYNCING_SYSTEM_LOGS';
+    const cov = getCoverageRecord('logs', cairoToday);
+    const interval = getCairoDateInterval(cairoToday);
+    let totalEventsInDay = 0;
+    try {
+      totalEventsInDay = (db.prepare(`
+        SELECT COUNT(*) as c FROM canonical_activity_events
+        WHERE event_timestamp >= ? AND event_timestamp < ?
+      `).get(interval.startCairo, interval.endCairo) as any)?.c || 0;
+    } catch {}
+
+    const completionStatus: 'COMPLETE' | 'RUNNING' | 'PARTIAL' | 'FAILED' | 'NOT_SYNCED' = isSyncing
+      ? 'RUNNING'
+      : (cov?.completion_status as any || 'NOT_SYNCED');
+
+    return {
+      completionStatus,
+      pagesRead: cov?.pages_read || (isSyncing ? 1 : 0),
+      pagesDiscovered: cov?.pages_discovered || (isSyncing ? 1 : 0),
+      recordsSaved: Math.max(cov?.records_saved || 0, totalEventsInDay),
+      isSyncing,
+      lastAttemptedAt: cov?.last_attempted_at || null,
+    };
   }
 
   /**
