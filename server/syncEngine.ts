@@ -1783,6 +1783,37 @@ export class SyncEngine {
                 detailsJson
               );
               newCanonicalCount++;
+
+              // Reflect extra phone additions immediately in orders table
+              if (parsed.actionType === 'extra_phone_added' || parsed.actionType === 'extra_phone_edit') {
+                const rawNew = (parsed.newValue || '').trim();
+                const cleanPhone = rawNew.replace(/[\s\-\+]/g, '');
+                const isValid = /^(01[0125]\d{8}|201[0125]\d{8})$/.test(cleanPhone);
+                const isPresent = cleanPhone.length >= 10 && isValid;
+                const status = isPresent ? 'PRESENT' : (rawNew === '' ? 'CONFIRMED_ABSENT' : 'INVALID');
+
+                try {
+                  db.prepare(`
+                    UPDATE orders
+                    SET customer_phone_extra = ?,
+                        extra_phone_valid = ?,
+                        extra_phone_status = ?,
+                        updated_at = ?
+                    WHERE (id = ? OR random_number = ? OR order_no = ? OR CAST(vendoor_id AS TEXT) = ?)
+                  `).run(
+                    rawNew || null,
+                    isValid ? 1 : 0,
+                    status,
+                    entry.eventTimestamp || nowIso,
+                    matchedOrderId || -1,
+                    entry.orderCode,
+                    entry.orderCode,
+                    entry.orderCode
+                  );
+                } catch (phoneErr: any) {
+                  console.warn('[SyncEngine] Phone update error:', phoneErr.message);
+                }
+              }
             }
           }
           db.exec('COMMIT;');

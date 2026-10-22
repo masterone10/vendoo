@@ -23,6 +23,7 @@ export const OrdersView: React.FC<OrdersViewProps> = ({
   const [page, setPage] = useState(0);
   const [multiOnly, setMultiOnly] = useState(false);
   const [lowDeliveryOnly, setLowDeliveryOnly] = useState(false);
+  const [noExtraPhoneOnly, setNoExtraPhoneOnly] = useState(false);
 
   const limit = 50;
 
@@ -33,7 +34,7 @@ export const OrdersView: React.FC<OrdersViewProps> = ({
 
   useEffect(() => {
     fetchOrders();
-  }, [status, page, multiOnly, lowDeliveryOnly, selectedDate]);
+  }, [status, page, multiOnly, lowDeliveryOnly, noExtraPhoneOnly, selectedDate]);
 
   async function fetchOrders() {
     setLoading(true);
@@ -43,6 +44,7 @@ export const OrdersView: React.FC<OrdersViewProps> = ({
       if (search) params.set('search', search);
       if (multiOnly) params.set('multiMerchant', '1');
       if (lowDeliveryOnly) params.set('lowDelivery', '1');
+      if (noExtraPhoneOnly) params.set('noExtraPhone', '1');
       if (selectedDate) params.set('date', selectedDate);
       params.set('limit', String(limit));
       params.set('offset', String(page * limit));
@@ -129,6 +131,20 @@ export const OrdersView: React.FC<OrdersViewProps> = ({
             }`}
           >
             نسبة استلام &lt; 70%
+          </button>
+
+          <button
+            onClick={() => {
+              setNoExtraPhoneOnly(!noExtraPhoneOnly);
+              setPage(0);
+            }}
+            className={`px-3 py-1.5 rounded-lg text-xs font-medium border transition-colors cursor-pointer ${
+              noExtraPhoneOnly
+                ? 'bg-amber-500/20 border-amber-500/40 text-amber-300'
+                : 'bg-slate-900 border-slate-800 text-slate-400 hover:text-slate-200'
+            }`}
+          >
+            دون هاتف إضافي
           </button>
         </div>
       </div>

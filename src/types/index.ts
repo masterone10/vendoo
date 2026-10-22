@@ -113,6 +113,12 @@ export interface DashboardStats {
     multiMerchantPrinted: number;
     lowDeliveryRatePrinted: number;
     missingExtraPhonePrinted: number;
+    multiMerchantTotal?: number;
+    lowDeliveryRateTotal?: number;
+    missingExtraPhoneTotal?: number;
+    multiMerchantCount?: number;
+    lowDeliveryCount?: number;
+    missingPhoneCount?: number;
     openAlertsCount: number;
   };
   todayActivity: {

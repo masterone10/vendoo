@@ -1,4 +1,4 @@
-import React from 'react';
+import React, { useState } from 'react';
 import {
   AlertTriangle,
   Clock,
@@ -13,6 +13,7 @@ import {
   ChevronLeft,
 } from 'lucide-react';
 import { DashboardStats } from '../types';
+import { RiskDetailsModal, RiskType } from './RiskDetailsModal';
 
 interface DashboardViewProps {
   stats: DashboardStats | null;
@@ -56,6 +57,8 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
     dayCumulative,
     todayLogsCoverage,
   } = stats;
+
+  const [selectedRiskType, setSelectedRiskType] = useState<RiskType | null>(null);
 
   return (
     <div className="p-6 space-y-6 max-w-7xl mx-auto">
@@ -235,17 +238,19 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
         <div className="flex items-center justify-between">
           <h3 className="text-xs font-semibold uppercase tracking-wider text-rose-400 flex items-center gap-1.5">
             <AlertTriangle className="w-3.5 h-3.5 text-rose-400" />
-            <span>مؤشرات المخاطر الحرجة (محرك التنبيهات المباشر)</span>
+            <span>مؤشرات المخاطر التشغيلية (فحص شامل لكامل النظام)</span>
           </h3>
-          <span className="text-[11px] text-slate-500">للطلبات المطبوعة في اليوم المختار ({selectedDate || 'اليوم'})</span>
+          <span className="text-[11px] text-slate-500">
+            الرقم الرئيسي: إجمالي النظام المطابق • السطر التوضيحي: طلبات {selectedDate || 'اليوم'} المؤكدة (Printed)
+          </span>
         </div>
 
         <div className="grid grid-cols-1 md:grid-cols-4 gap-3">
           {/* Multi-Merchant Codes Alert */}
           <div
-            onClick={() => onNavigateToPrintedTab('multi_merchant')}
-            className={`p-4 rounded-xl border transition-all cursor-pointer ${
-              riskIndicators.multiMerchantPrinted > 0
+            onClick={() => setSelectedRiskType('multi_merchant')}
+            className={`p-4 rounded-xl border transition-all cursor-pointer group ${
+              (riskIndicators.multiMerchantTotal ?? riskIndicators.multiMerchantPrinted) > 0
                 ? 'bg-rose-500/10 border-rose-500/40 hover:bg-rose-500/20 shadow-md shadow-rose-950/40'
                 : 'bg-slate-900 border-slate-800 hover:border-slate-700'
             }`}
@@ -255,47 +260,56 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
                 <AlertTriangle className="w-4 h-4 text-rose-400" />
                 <span>تعدد أكواد المخازن (Multi-Warehouse)</span>
               </span>
-              <span className="text-[10px] text-rose-400 uppercase tracking-widest font-mono">حرج</span>
+              <span className="text-[10px] text-rose-400 uppercase tracking-widest font-mono group-hover:underline">تفاصيل ↗</span>
             </div>
-            <div className="text-2xl font-bold font-mono text-rose-400">
-              {riskIndicators.multiMerchantPrinted}
+            <div className="text-2xl font-bold font-mono text-rose-400 tabular-nums">
+              {riskIndicators.multiMerchantTotal ?? riskIndicators.multiMerchantCount ?? 0}
             </div>
-            <p className="mt-1.5 text-[11px] text-slate-400 leading-relaxed">
-              طلبات مطبوعة لليوم المختار تحتوي منتجات من أكثر من كود مخزن مستقل.
+            <div className="mt-1 text-[11px] font-mono text-emerald-400/90 font-medium">
+              اليوم: {riskIndicators.multiMerchantPrinted} مؤكد (Printed)
+            </div>
+            <p className="mt-1 text-[11px] text-slate-400 leading-relaxed">
+              طلبات النظام التي تحوي سلعًا من عدة مخازن أو تجار • اضغط للتفاصيل
             </p>
           </div>
 
           {/* Missing Extra Phone */}
           <div
-            onClick={() => onNavigateToPrintedTab('no_extra_phone')}
-            className="p-4 rounded-xl bg-slate-900 border border-slate-800 hover:border-amber-500/30 hover:bg-slate-800/60 transition-all cursor-pointer"
+            onClick={() => setSelectedRiskType('no_extra_phone')}
+            className="p-4 rounded-xl bg-slate-900 border border-slate-800 hover:border-amber-500/30 hover:bg-slate-800/60 transition-all cursor-pointer group"
           >
             <div className="flex items-center justify-between text-xs text-amber-400 mb-2">
               <span className="font-semibold">دون هاتف إضافي صالح</span>
-              <span className="text-[10px] text-slate-500 font-mono">تأكيد</span>
+              <span className="text-[10px] text-amber-400/80 font-mono group-hover:underline">تفاصيل ↗</span>
             </div>
-            <div className="text-2xl font-bold font-mono text-amber-400">
-              {riskIndicators.missingExtraPhonePrinted}
+            <div className="text-2xl font-bold font-mono text-amber-400 tabular-nums">
+              {riskIndicators.missingExtraPhoneTotal ?? riskIndicators.missingPhoneCount ?? 0}
             </div>
-            <p className="mt-1.5 text-[11px] text-slate-400 leading-relaxed">
-              طلبات مطبوعة لليوم المختار لم يسجل بها هاتف إضافي أو بصيغة غير صالحة.
+            <div className="mt-1 text-[11px] font-mono text-emerald-400/90 font-medium">
+              اليوم: {riskIndicators.missingExtraPhonePrinted} مؤكد (Printed)
+            </div>
+            <p className="mt-1 text-[11px] text-slate-400 leading-relaxed">
+              طلبات دون هاتف بديل أو مكرر أو صيغته غير صالحة • اضغط للتفاصيل
             </p>
           </div>
 
           {/* Delivery Rate < 70% */}
           <div
-            onClick={() => onNavigateToPrintedTab('low_delivery')}
-            className="p-4 rounded-xl bg-slate-900 border border-slate-800 hover:border-rose-500/30 hover:bg-slate-800/60 transition-all cursor-pointer"
+            onClick={() => setSelectedRiskType('low_delivery')}
+            className="p-4 rounded-xl bg-slate-900 border border-slate-800 hover:border-rose-500/30 hover:bg-slate-800/60 transition-all cursor-pointer group"
           >
             <div className="flex items-center justify-between text-xs text-rose-400 mb-2">
               <span className="font-semibold">نسبة تسليم أقل من 70%</span>
-              <span className="text-[10px] text-slate-500 font-mono">&lt; 70%</span>
+              <span className="text-[10px] text-rose-400/80 font-mono group-hover:underline">تفاصيل ↗</span>
             </div>
-            <div className="text-2xl font-bold font-mono text-rose-400">
-              {riskIndicators.lowDeliveryRatePrinted}
+            <div className="text-2xl font-bold font-mono text-rose-400 tabular-nums">
+              {riskIndicators.lowDeliveryRateTotal ?? riskIndicators.lowDeliveryCount ?? 0}
             </div>
-            <p className="mt-1.5 text-[11px] text-slate-400 leading-relaxed">
-              عملاء لديهم سجل تاريخي بنسبة استلام منخفضة (&lt; 70%) لطلبات اليوم المختار.
+            <div className="mt-1 text-[11px] font-mono text-emerald-400/90 font-medium">
+              اليوم: {riskIndicators.lowDeliveryRatePrinted} مؤكد (Printed)
+            </div>
+            <p className="mt-1 text-[11px] text-slate-400 leading-relaxed">
+              عملاء لديهم سجل تاريخي بنسبة استلام &lt; 70% • اضغط للتفاصيل
             </p>
           </div>
 
@@ -308,7 +322,7 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
               <span className="font-semibold">إجمالي التنبيهات المفتوحة</span>
               <span className="text-[10px] text-slate-500 font-mono">Alerts</span>
             </div>
-            <div className="text-2xl font-bold font-mono text-slate-100">
+            <div className="text-2xl font-bold font-mono text-slate-100 tabular-nums">
               {riskIndicators.openAlertsCount}
             </div>
             <p className="mt-1.5 text-[11px] text-slate-400 leading-relaxed">
@@ -553,6 +567,16 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
           )}
         </div>
       </section>
+
+      {/* Unified Risk Drilldown Modal */}
+      {selectedRiskType && (
+        <RiskDetailsModal
+          isOpen={!!selectedRiskType}
+          riskType={selectedRiskType}
+          selectedDate={selectedDate}
+          onClose={() => setSelectedRiskType(null)}
+        />
+      )}
     </div>
   );
 };

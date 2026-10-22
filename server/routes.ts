@@ -40,6 +40,11 @@ import { importBatchLogFiles } from './batchLogsImporter.ts';
 import { handleLogUploadChunk, getImportJob, getActiveOrRecentJob } from './importJobManager.ts';
 import { resolveHistoricalDay } from './historicalDayResolver.ts';
 import { reconcileHistoricalRange } from './historicalReconciliationService.ts';
+import {
+  getDashboardRiskStats,
+  getRiskOrdersDrilldown,
+  getRiskConditionSql,
+} from './riskService.ts';
 
 export function isCSEmployee(actorName: string): boolean {
   if (!actorName) return false;
@@ -298,29 +303,14 @@ apiRouter.get('/dashboard/stats', (req: Request, res: Response) => {
       }
     }
 
-    // 4. Risk Indicators for Printed orders (Strictly scoped to the selected targetDate / dateInterval)
-    const printedRiskStats = (db.prepare(`
-      SELECT
-        COUNT(DISTINCT CASE WHEN o.multi_merchant_flag = 1 THEN o.id END) as multiMerchantCount,
-        COUNT(DISTINCT CASE WHEN o.extra_phone_status = 'CONFIRMED_ABSENT' THEN o.id END) as missingPhoneCount,
-        COUNT(DISTINCT CASE WHEN o.delivery_rate IS NOT NULL AND o.delivery_rate < 70
-                                 AND (o.delivery_rate_denom > 0 OR o.total_customer_orders > 0)
-                                 AND NOT (o.delivery_rate = 0 AND (o.cancel_rate = 0 OR o.cancel_rate IS NULL))
-                            THEN o.id END) as lowDeliveryCount
-      FROM orders o
-      LEFT JOIN (
-        SELECT order_code, id
-        FROM canonical_activity_events
-        WHERE event_timestamp >= ? AND event_timestamp < ?
-          AND (to_status = 'Printed' OR action_type = 'confirmation')
-        GROUP BY order_code
-      ) c ON c.order_code = o.random_number OR c.order_code = o.order_no OR c.order_code = CAST(o.vendoor_id AS TEXT)
-      WHERE (c.id IS NOT NULL OR (o.printed_date >= ? AND o.printed_date < ?))
-    `).get(dateInterval.startCairo, dateInterval.endCairo, dateInterval.startCairo, dateInterval.endCairo) as any);
-
-    const multiMerchantPrinted = printedRiskStats?.multiMerchantCount || 0;
-    const missingExtraPhonePrinted = printedRiskStats?.missingPhoneCount || 0;
-    const lowDeliveryRatePrinted = printedRiskStats?.lowDeliveryCount || 0;
+    // 4. Unified Risk Indicators from riskService (Guarantees 100% mathematical consistency)
+    const riskStats = getDashboardRiskStats(targetDate);
+    const multiMerchantTotal = riskStats.multiMerchantTotal;
+    const multiMerchantPrinted = riskStats.multiMerchantPrinted;
+    const missingExtraPhoneTotal = riskStats.missingExtraPhoneTotal;
+    const missingExtraPhonePrinted = riskStats.missingExtraPhonePrinted;
+    const lowDeliveryRateTotal = riskStats.lowDeliveryRateTotal;
+    const lowDeliveryRatePrinted = riskStats.lowDeliveryRatePrinted;
 
     const openAlertsCount = (db.prepare(`
       SELECT COUNT(*) as count
@@ -396,9 +386,15 @@ apiRouter.get('/dashboard/stats', (req: Request, res: Response) => {
       currentCounts,
       confirmationAges,
       riskIndicators: {
+        multiMerchantTotal,
         multiMerchantPrinted,
-        lowDeliveryRatePrinted,
+        missingExtraPhoneTotal,
         missingExtraPhonePrinted,
+        lowDeliveryRateTotal,
+        lowDeliveryRatePrinted,
+        multiMerchantCount: multiMerchantTotal,
+        lowDeliveryCount: lowDeliveryRateTotal,
+        missingPhoneCount: missingExtraPhoneTotal,
         openAlertsCount,
       },
       todayActivity,
@@ -412,6 +408,32 @@ apiRouter.get('/dashboard/stats', (req: Request, res: Response) => {
     });
   } catch (err: any) {
     console.error('Error in /dashboard/stats:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// 2b. Risk Drilldown Orders Endpoint (100% consistent with dashboard cards & system state)
+apiRouter.get('/dashboard/risk-orders', (req: Request, res: Response) => {
+  try {
+    const riskType = (req.query.riskType as any) || 'multi_merchant';
+    const tab = (req.query.tab as string) || 'all';
+    const search = (req.query.search as string) || '';
+    const page = Math.max(0, parseInt((req.query.page as string) || '0', 10));
+    const limit = Math.min(100, Math.max(1, parseInt((req.query.limit as string) || '50', 10)));
+    const date = req.query.date as string | undefined;
+
+    const result = getRiskOrdersDrilldown({
+      riskType,
+      tab,
+      search,
+      page,
+      limit,
+      date,
+    });
+
+    res.json(result);
+  } catch (err: any) {
+    console.error('Error in /dashboard/risk-orders:', err);
     res.status(500).json({ error: err.message });
   }
 });
@@ -478,15 +500,15 @@ apiRouter.get('/orders', (req: Request, res: Response) => {
     }
 
     if (multiMerchant === '1') {
-      conditions.push('multi_merchant_flag = 1');
+      conditions.push(getRiskConditionSql('multi_merchant', 'orders'));
     }
 
     if (lowDelivery === '1') {
-      conditions.push('delivery_rate IS NOT NULL AND delivery_rate < 70');
+      conditions.push(getRiskConditionSql('low_delivery', 'orders'));
     }
 
     if (noExtraPhone === '1') {
-      conditions.push("extra_phone_status = 'CONFIRMED_ABSENT'");
+      conditions.push(getRiskConditionSql('no_extra_phone', 'orders'));
     }
 
     if (search) {
