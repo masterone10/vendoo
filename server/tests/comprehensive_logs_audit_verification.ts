@@ -262,35 +262,59 @@ async function runAudit() {
   // [Audit Step 6] Drilldown Modal Verification for each KPI Pillar
   console.log('[Audit Step 6] Testing ReportKpiDrilldownModal query endpoints...');
   
-  const drilldownConfirmed = getDrilldownLogs({
+  const drilldownConfirmedOrders = getDrilldownLogs({
     startDate: auditDate,
     endDate: auditDate,
     pillar: 'confirmed',
+    viewType: 'orders',
     limit: 50,
   });
-  console.log(`  Drilldown 'confirmed': total = ${drilldownConfirmed.total}`);
-  assert.strictEqual(drilldownConfirmed.total, rep.metrics.printedEventsCount, 'Drilldown confirmed total must match printedEventsCount');
-  assert.ok(drilldownConfirmed.events.every((e: any) => e.to_status === 'Printed'), 'All confirmed drilldown events must have to_status = Printed');
+  console.log(`  Drilldown 'confirmed' (orders): total = ${drilldownConfirmedOrders.total}`);
+  assert.strictEqual(drilldownConfirmedOrders.total, rep.metrics.confirmedOrdersCount, 'Drilldown confirmed (orders) total must match confirmedOrdersCount');
+  assert.ok(drilldownConfirmedOrders.events.every((e: any) => e.to_status === 'Printed'), 'All confirmed drilldown events must have to_status = Printed');
+
+  const drilldownConfirmedEvents = getDrilldownLogs({
+    startDate: auditDate,
+    endDate: auditDate,
+    pillar: 'confirmed',
+    viewType: 'events',
+    limit: 50,
+  });
+  console.log(`  Drilldown 'confirmed' (events): total = ${drilldownConfirmedEvents.total}`);
+  assert.strictEqual(drilldownConfirmedEvents.total, rep.metrics.printedEventsCount, 'Drilldown confirmed (events) total must match printedEventsCount');
 
   const drilldownCanceled = getDrilldownLogs({
     startDate: auditDate,
     endDate: auditDate,
     pillar: 'canceled',
+    viewType: 'orders',
     limit: 50,
   });
   console.log(`  Drilldown 'canceled': total = ${drilldownCanceled.total}`);
-  assert.strictEqual(drilldownCanceled.total, rep.metrics.canceledEventsCount, 'Drilldown canceled total must match canceledEventsCount');
+  assert.strictEqual(drilldownCanceled.total, rep.metrics.canceledOrdersCount, 'Drilldown canceled total must match canceledOrdersCount');
   assert.ok(drilldownCanceled.events.every((e: any) => e.to_status === 'Canceled'), 'All canceled drilldown events must have to_status = Canceled');
 
   const drilldownCanceling = getDrilldownLogs({
     startDate: auditDate,
     endDate: auditDate,
     pillar: 'canceling',
+    viewType: 'orders',
     limit: 50,
   });
   console.log(`  Drilldown 'canceling': total = ${drilldownCanceling.total}`);
-  assert.strictEqual(drilldownCanceling.total, rep.metrics.cancelingEventsCount, 'Drilldown canceling total must match cancelingEventsCount');
+  assert.strictEqual(drilldownCanceling.total, rep.metrics.cancelingOrdersCount, 'Drilldown canceling total must match cancelingOrdersCount');
   assert.ok(drilldownCanceling.events.every((e: any) => e.to_status === 'Canceling'), 'All canceling drilldown events must have to_status = Canceling');
+
+  const drilldownCancelingEvents = getDrilldownLogs({
+    startDate: auditDate,
+    endDate: auditDate,
+    pillar: 'canceling',
+    viewType: 'events',
+    limit: 50,
+  });
+  console.log(`  Drilldown 'canceling' (events): total = ${drilldownCancelingEvents.total}`);
+  assert.strictEqual(drilldownCancelingEvents.total, rep.metrics.cancelingEventsCount, 'Drilldown canceling total must match cancelingEventsCount');
+  assert.ok(drilldownCancelingEvents.events.every((e: any) => e.to_status === 'Canceling'), 'All canceling drilldown events must have to_status = Canceling');
 
   const drilldownExtraPhone = getDrilldownLogs({
     startDate: auditDate,

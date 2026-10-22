@@ -180,22 +180,27 @@ export function processAndDeduplicateTeamEvents(
 
       // Non-status change actions on an order (e.g. edited address, added phone, note)
       if (ev.action_type !== 'status_change' || !ev.to_status) {
-        // Check for identical consecutive duplicate non-status actions within 10 seconds
+        // Strict conservative duplicate check:
+        // Only classify as duplicate if exact identical source_hash OR exact same second timestamp with identical actor and raw_action_text
         const prev = i > 0 ? orderEvents[i - 1] : null;
-        const isDuplicateNonStatus =
+        const isExactHashDuplicate = Boolean(
+          prev && prev.source_hash && ev.source_hash && prev.source_hash === ev.source_hash
+        );
+        const isZeroSecondDuplicate = Boolean(
           prev &&
           prev.action_type === ev.action_type &&
           prev.actor_name === ev.actor_name &&
           prev.raw_action_text === ev.raw_action_text &&
-          timeDifferenceInSeconds(prev.event_timestamp, ev.event_timestamp) <= 10;
+          prev.event_timestamp === ev.event_timestamp
+        );
 
-        if (isDuplicateNonStatus) {
+        if (isExactHashDuplicate || isZeroSecondDuplicate) {
           resultMap.set(ev.id, {
             ...ev,
             is_counted: false,
             is_duplicate_transition: true,
-            exclusion_reason: 'DUPLICATE_IDENTICAL_ACTION',
-            authoritative_transition_id: prev.id,
+            exclusion_reason: isExactHashDuplicate ? 'EXACT_SOURCE_HASH_DUPLICATE' : 'ZERO_SECOND_IDENTICAL_ACTION',
+            authoritative_transition_id: prev!.id,
           });
         } else {
           resultMap.set(ev.id, {
@@ -212,34 +217,57 @@ export function processAndDeduplicateTeamEvents(
       const targetStatus = normalizeStatus(ev.to_status)!;
       const declaredFromStatus = normalizeStatus(ev.from_status);
 
-      // Check if this event belongs to the current in-flight transition cluster
-      // (within 30 seconds of identical targetStatus transition burst)
-      if (
+      // Conservative burst grouping:
+      // Group into the same transition cluster ONLY if:
+      // 1. Same target status AND
+      // 2. Either exact same timestamp (0s), identical source_hash, or sub-5-second rapid burst write
+      // Never group or discard actions based on arbitrary 60-second windows alone
+      const timeDiff = lastTransitionCluster
+        ? timeDifferenceInSeconds(lastTransitionCluster.primaryTimestamp, ev.event_timestamp)
+        : 999999;
+
+      const isConfirmedBurst = Boolean(
         lastTransitionCluster &&
         lastTransitionCluster.targetStatus === targetStatus &&
-        timeDifferenceInSeconds(lastTransitionCluster.primaryTimestamp, ev.event_timestamp) <= 60
-      ) {
-        // Group into the same transition cluster
+        (
+          timeDiff === 0 ||
+          (ev.source_hash && lastTransitionCluster.events.some(e => e.source_hash === ev.source_hash)) ||
+          (timeDiff <= 5 && (
+            lastTransitionCluster.events.some(e => e.actor_name === ev.actor_name) ||
+            !isHumanActor(ev.actor_name, ev.is_system_actor) ||
+            lastTransitionCluster.events.some(e => !isHumanActor(e.actor_name, e.is_system_actor))
+          ))
+        )
+      );
+
+      if (isConfirmedBurst && lastTransitionCluster) {
         lastTransitionCluster.events.push(ev);
         continue;
       }
 
-      // If we had an existing transition cluster and now see a different transition or time gap, finalize it
+      // If we had an existing transition cluster and now see a different transition or distinct event, finalize it
       if (lastTransitionCluster) {
         finalizeCluster(lastTransitionCluster);
         currentStatus = lastTransitionCluster.targetStatus;
         lastTransitionCluster = null;
       }
 
-      // If order is already in targetStatus, and this is NOT a valid new transition from a different status:
-      if (currentStatus === targetStatus) {
-        // Redundant transition without intermediate status change
+      // If order is already in targetStatus, only exclude if it's an immediate duplicate within 5s of same status
+      const prevOrderEv = i > 0 ? orderEvents[i - 1] : null;
+      const isImmediateRedundantClick = Boolean(
+        prevOrderEv &&
+        normalizeStatus(prevOrderEv.to_status) === targetStatus &&
+        timeDifferenceInSeconds(prevOrderEv.event_timestamp, ev.event_timestamp) <= 5 &&
+        (prevOrderEv.actor_name === ev.actor_name || !isHumanActor(ev.actor_name, ev.is_system_actor))
+      );
+
+      if (currentStatus === targetStatus && isImmediateRedundantClick) {
         resultMap.set(ev.id, {
           ...ev,
           is_counted: false,
           is_duplicate_transition: true,
-          exclusion_reason: 'ALREADY_IN_TARGET_STATUS',
-          authoritative_transition_id: ev.id,
+          exclusion_reason: 'IMMEDIATE_REDUNDANT_RECLICK',
+          authoritative_transition_id: prevOrderEv?.id || ev.id,
         });
         continue;
       }

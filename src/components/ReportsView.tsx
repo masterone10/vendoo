@@ -849,11 +849,19 @@ export const ReportsView: React.FC<ReportsViewProps> = ({ onSelectOrder }) => {
             <div className="text-2xl font-black text-rose-400 font-mono">
               {report.metrics.canceledOrdersCount.toLocaleString()}
             </div>
-            <div className="mt-2 pt-2 border-t border-slate-800/80 flex items-center justify-between text-xs">
-              <span className="text-slate-400 font-sans">قيد الإلغاء (معزول):</span>
-              <span className="font-bold text-amber-400 font-mono">
-                {report.metrics.cancelingEventsCount.toLocaleString()} طلب
-              </span>
+            <div className="mt-2 pt-2 border-t border-slate-800/80 flex flex-col gap-1 text-xs">
+              <div className="flex items-center justify-between">
+                <span className="text-slate-400 font-sans">حركات الإلغاء النهائي:</span>
+                <span className="font-bold text-rose-400 font-mono">
+                  {report.metrics.canceledEventsCount.toLocaleString()} حركة
+                </span>
+              </div>
+              <div className="flex items-center justify-between">
+                <span className="text-slate-400 font-sans">قيد الإلغاء (معزول):</span>
+                <span className="font-bold text-amber-400 font-mono">
+                  {report.metrics.cancelingEventsCount.toLocaleString()} طلب
+                </span>
+              </div>
             </div>
           </div>
 
@@ -1293,12 +1301,12 @@ export const ReportsView: React.FC<ReportsViewProps> = ({ onSelectOrder }) => {
                       <th className="py-3 px-4">#</th>
                       <th className="py-3 px-4">اسم المنفذ</th>
                       <th className="py-3 px-4">طبيعة المنفذ</th>
-                      <th className="py-3 px-4">إجمالي الحركات</th>
+                      <th className="py-3 px-4">الحركات الفعلية</th>
                       <th className="py-3 px-4">أوردرات فريدة</th>
                       <th className="py-3 px-4">مؤكدة (Printed)</th>
                       <th className="py-3 px-4">ملغاة (Canceled)</th>
                       <th className="py-3 px-4">أرقام إضافية</th>
-                      <th className="py-3 px-4">تغيير حالات</th>
+                      <th className="py-3 px-4">تكرار مستبعد</th>
                       <th className="py-3 px-4">توزيع الإجراءات</th>
                     </tr>
                   </thead>
@@ -1343,8 +1351,14 @@ export const ReportsView: React.FC<ReportsViewProps> = ({ onSelectOrder }) => {
                         <td className="py-3 px-4 font-bold text-cyan-400">
                           {emp.extra_phones_added_count.toLocaleString()}
                         </td>
-                        <td className="py-3 px-4 text-slate-300">
-                          {emp.status_changes_count.toLocaleString()}
+                        <td className="py-3 px-4 text-slate-400">
+                          {emp.duplicate_events_count ? (
+                            <span className="text-amber-500/90 font-mono text-[11px]">
+                              {emp.duplicate_events_count} مستبعد
+                            </span>
+                          ) : (
+                            <span className="text-slate-600 font-mono text-[11px]">0</span>
+                          )}
                         </td>
                         <td className="py-3 px-4 font-sans">
                           <div className="flex flex-wrap gap-1">

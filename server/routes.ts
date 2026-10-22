@@ -192,24 +192,29 @@ apiRouter.get('/dashboard/stats', (req: Request, res: Response) => {
       }
     }
 
-    // 4. Risk Indicators for Printed orders
-    const multiMerchantPrinted = (db.prepare(`
-      SELECT COUNT(*) as count
-      FROM orders
-      WHERE current_status = 'Printed' AND multi_merchant_flag = 1
-    `).get() as any)?.count || 0;
+    // 4. Risk Indicators for Printed orders (Strictly scoped to the selected targetDate / dateInterval)
+    const printedRiskStats = (db.prepare(`
+      SELECT
+        COUNT(DISTINCT CASE WHEN o.multi_merchant_flag = 1 THEN o.id END) as multiMerchantCount,
+        COUNT(DISTINCT CASE WHEN o.extra_phone_status = 'CONFIRMED_ABSENT' THEN o.id END) as missingPhoneCount,
+        COUNT(DISTINCT CASE WHEN o.delivery_rate IS NOT NULL AND o.delivery_rate < 70
+                                 AND (o.delivery_rate_denom > 0 OR o.total_customer_orders > 0)
+                                 AND NOT (o.delivery_rate = 0 AND (o.cancel_rate = 0 OR o.cancel_rate IS NULL))
+                            THEN o.id END) as lowDeliveryCount
+      FROM orders o
+      LEFT JOIN (
+        SELECT order_code, id
+        FROM canonical_activity_events
+        WHERE event_timestamp >= ? AND event_timestamp < ?
+          AND (to_status = 'Printed' OR action_type = 'confirmation')
+        GROUP BY order_code
+      ) c ON c.order_code = o.random_number OR c.order_code = o.order_no OR c.order_code = CAST(o.vendoor_id AS TEXT)
+      WHERE (c.id IS NOT NULL OR (o.printed_date >= ? AND o.printed_date < ?))
+    `).get(dateInterval.startCairo, dateInterval.endCairo, dateInterval.startCairo, dateInterval.endCairo) as any);
 
-    const lowDeliveryRatePrinted = (db.prepare(`
-      SELECT COUNT(*) as count
-      FROM orders
-      WHERE current_status = 'Printed' AND delivery_rate IS NOT NULL AND delivery_rate < 70
-    `).get() as any)?.count || 0;
-
-    const missingExtraPhonePrinted = (db.prepare(`
-      SELECT COUNT(*) as count
-      FROM orders
-      WHERE current_status = 'Printed' AND extra_phone_status = 'CONFIRMED_ABSENT'
-    `).get() as any)?.count || 0;
+    const multiMerchantPrinted = printedRiskStats?.multiMerchantCount || 0;
+    const missingExtraPhonePrinted = printedRiskStats?.missingPhoneCount || 0;
+    const lowDeliveryRatePrinted = printedRiskStats?.lowDeliveryCount || 0;
 
     const openAlertsCount = (db.prepare(`
       SELECT COUNT(*) as count
@@ -536,7 +541,7 @@ apiRouter.get('/printed', (req: Request, res: Response) => {
     } else if (category === 'multi_merchant') {
       categorySql = ' AND o.multi_merchant_flag = 1';
     } else if (category === 'low_delivery') {
-      categorySql = ' AND o.delivery_rate IS NOT NULL AND o.delivery_rate < 70';
+      categorySql = ' AND o.delivery_rate IS NOT NULL AND o.delivery_rate < 70 AND (o.delivery_rate_denom > 0 OR o.total_customer_orders > 0) AND NOT (o.delivery_rate = 0 AND (o.cancel_rate = 0 OR o.cancel_rate IS NULL))';
     }
 
     // Query orders that transitioned to Printed on targetDate (from log events or printed_date)
@@ -549,8 +554,8 @@ apiRouter.get('/printed', (req: Request, res: Response) => {
         COALESCE(c.actor_name, 'النظام') as printed_by,
         CASE WHEN c.id IS NOT NULL THEN 'MATCHED' ELSE 'PENDING_LOG_MATCH' END as log_match_status,
         o.distinct_merchant_count, o.multi_merchant_flag, o.delivery_rate,
-        o.delivery_rate_num, o.delivery_rate_denom, o.confirmation_age_category,
-        o.address_quality_status, o.last_observed_at
+        o.delivery_rate_num, o.delivery_rate_denom, o.cancel_rate, o.total_customer_orders,
+        o.confirmation_age_category, o.address_quality_status, o.last_observed_at
       FROM orders o
       LEFT JOIN (
         SELECT order_code, actor_name, event_timestamp, id
@@ -1361,6 +1366,7 @@ apiRouter.get('/reports/logs-drilldown', (req: Request, res: Response) => {
       search,
       page = '1',
       limit = '25',
+      viewType,
     } = req.query;
 
     const sDate = ((startDate as string) || getCairoDateString()).slice(0, 10);
@@ -1374,6 +1380,7 @@ apiRouter.get('/reports/logs-drilldown', (req: Request, res: Response) => {
       search: search ? String(search) : undefined,
       page: parseInt(page as string, 10) || 1,
       limit: parseInt(limit as string, 10) || 25,
+      viewType: viewType ? (String(viewType) as 'orders' | 'events') : undefined,
     });
 
     res.json({ success: true, ...result });
@@ -1385,7 +1392,7 @@ apiRouter.get('/reports/logs-drilldown', (req: Request, res: Response) => {
 // CSV Export for logs report
 apiRouter.get('/reports/logs-export', (req: Request, res: Response) => {
   try {
-    const { startDate, endDate, pillar = 'all' } = req.query;
+    const { startDate, endDate, pillar = 'all', viewType } = req.query;
     const sDate = ((startDate as string) || getCairoDateString()).slice(0, 10);
     const eDate = ((endDate as string) || sDate).slice(0, 10);
 
@@ -1394,6 +1401,7 @@ apiRouter.get('/reports/logs-export', (req: Request, res: Response) => {
       startDate: sDate,
       endDate: eDate,
       limit: 5000,
+      viewType: viewType ? (String(viewType) as 'orders' | 'events') : undefined,
     });
 
     const header = [
@@ -1502,10 +1510,19 @@ apiRouter.get('/reports', (req: Request, res: Response) => {
       WHERE created_at_source >= ? AND created_at_source < ? AND multi_merchant_flag = 1
     `).get(startTime, endTime) as any)?.c || 0;
 
+    const orderIdentitySql = `COALESCE(
+      CASE WHEN c.order_id IS NOT NULL THEN 'ORD_ID_' || c.order_id END,
+      CASE WHEN r.vendoor_order_id IS NOT NULL THEN 'VEND_ID_' || r.vendoor_order_id END,
+      CASE WHEN c.order_code IS NOT NULL AND TRIM(c.order_code) != '' THEN 'CODE_' || LOWER(TRIM(c.order_code)) END
+    )`;
+
     // Orders Touched in period (distinct orders with canonical activity events in period)
     const touchedCount = (db.prepare(`
-      SELECT COUNT(DISTINCT order_code) as c FROM canonical_activity_events
-      WHERE event_timestamp >= ? AND event_timestamp < ? AND order_code IS NOT NULL
+      SELECT COUNT(DISTINCT ${orderIdentitySql}) as c
+      FROM canonical_activity_events c
+      LEFT JOIN raw_activity_events r ON c.raw_event_id = r.id
+      WHERE c.event_timestamp >= ? AND c.event_timestamp < ?
+        AND (c.order_code IS NOT NULL AND TRIM(c.order_code) != '' OR c.order_id IS NOT NULL)
     `).get(startTime, endTime) as any)?.c || 0;
 
     // Events in period
@@ -1535,6 +1552,55 @@ apiRouter.get('/reports', (req: Request, res: Response) => {
       else if (t.to_status === 'Canceling') cancelingTransitions += t.count;
     }
 
+    // Precise unique orders vs events for printed, canceled, and canceling
+    const printedUniqueOrders = (db.prepare(`
+      SELECT COUNT(DISTINCT ${orderIdentitySql}) as c
+      FROM canonical_activity_events c
+      LEFT JOIN raw_activity_events r ON c.raw_event_id = r.id
+      WHERE c.event_timestamp >= ? AND c.event_timestamp < ?
+        AND (c.order_code IS NOT NULL AND TRIM(c.order_code) != '' OR c.order_id IS NOT NULL)
+        AND c.to_status = 'Printed'
+    `).get(startTime, endTime) as any)?.c || 0;
+
+    const printedEventsCount = (db.prepare(`
+      SELECT COUNT(*) as c
+      FROM canonical_activity_events c
+      WHERE c.event_timestamp >= ? AND c.event_timestamp < ?
+        AND c.to_status = 'Printed'
+    `).get(startTime, endTime) as any)?.c || 0;
+
+    const canceledUniqueOrders = (db.prepare(`
+      SELECT COUNT(DISTINCT ${orderIdentitySql}) as c
+      FROM canonical_activity_events c
+      LEFT JOIN raw_activity_events r ON c.raw_event_id = r.id
+      WHERE c.event_timestamp >= ? AND c.event_timestamp < ?
+        AND (c.order_code IS NOT NULL AND TRIM(c.order_code) != '' OR c.order_id IS NOT NULL)
+        AND c.to_status = 'Canceled'
+    `).get(startTime, endTime) as any)?.c || 0;
+
+    const canceledEventsCount = (db.prepare(`
+      SELECT COUNT(*) as c
+      FROM canonical_activity_events c
+      WHERE c.event_timestamp >= ? AND c.event_timestamp < ?
+        AND c.to_status = 'Canceled'
+    `).get(startTime, endTime) as any)?.c || 0;
+
+    const cancelingUniqueOrders = (db.prepare(`
+      SELECT COUNT(DISTINCT ${orderIdentitySql}) as c
+      FROM canonical_activity_events c
+      LEFT JOIN raw_activity_events r ON c.raw_event_id = r.id
+      WHERE c.event_timestamp >= ? AND c.event_timestamp < ?
+        AND (c.order_code IS NOT NULL AND TRIM(c.order_code) != '' OR c.order_id IS NOT NULL)
+        AND c.to_status = 'Canceling'
+    `).get(startTime, endTime) as any)?.c || 0;
+
+    const cancelingEventsCount = (db.prepare(`
+      SELECT COUNT(*) as c
+      FROM canonical_activity_events c
+      WHERE c.event_timestamp >= ? AND c.event_timestamp < ?
+        AND c.to_status = 'Canceling'
+    `).get(startTime, endTime) as any)?.c || 0;
+
     // Cancellations in period
     const cancellations: any[] = db.prepare(`
       SELECT to_status, COUNT(*) as count
@@ -1546,16 +1612,23 @@ apiRouter.get('/reports', (req: Request, res: Response) => {
     // Employee activity in period
     const employees: any[] = db.prepare(`
       SELECT 
-        actor_name, 
-        COUNT(*) as action_count, 
-        COUNT(DISTINCT order_code) as unique_orders,
-        SUM(CASE WHEN to_status = 'Printed' THEN 1 ELSE 0 END) as printed_count,
-        SUM(CASE WHEN to_status = 'Canceled' OR to_status = 'Canceling' THEN 1 ELSE 0 END) as cancel_count
-      FROM canonical_activity_events
-      WHERE event_timestamp >= ? AND event_timestamp < ? AND is_system_actor = 0
-      GROUP BY actor_name
-      ORDER BY action_count DESC
-    `).all(startTime, endTime);
+        c.actor_name, 
+        COUNT(*) as raw_action_count, 
+        COUNT(DISTINCT ${orderIdentitySql}) as unique_orders,
+        COUNT(DISTINCT CASE WHEN c.to_status = 'Printed' THEN ${orderIdentitySql} END) as printed_count,
+        COUNT(DISTINCT CASE WHEN c.to_status = 'Canceled' THEN ${orderIdentitySql} END) as cancel_count,
+        SUM(CASE WHEN c.to_status = 'Printed' THEN 1 ELSE 0 END) as printed_events_count,
+        SUM(CASE WHEN c.to_status = 'Canceled' THEN 1 ELSE 0 END) as canceled_events_count,
+        SUM(CASE WHEN c.to_status = 'Canceling' THEN 1 ELSE 0 END) as canceling_events_count
+      FROM canonical_activity_events c
+      LEFT JOIN raw_activity_events r ON c.raw_event_id = r.id
+      WHERE c.event_timestamp >= ? AND c.event_timestamp < ? AND c.is_system_actor = 0
+      GROUP BY c.actor_name
+      ORDER BY raw_action_count DESC
+    `).all(startTime, endTime).map((e: any) => ({
+      ...e,
+      action_count: e.raw_action_count,
+    }));
 
     // Status breakdown of orders created in period
     let ordersByStatus: any[] = db.prepare(`
@@ -1708,11 +1781,21 @@ apiRouter.get('/reports', (req: Request, res: Response) => {
       touchedCount,
       totalEvents,
       statusCounts: {
-        printed: printedTransitions,
+        printed: printedUniqueOrders,
+        printedEvents: printedEventsCount,
+        canceled: canceledUniqueOrders,
+        canceledEvents: canceledEventsCount,
+        canceling: cancelingUniqueOrders,
+        cancelingEvents: cancelingEventsCount,
         pending: pendingTransitions,
         processing: processingTransitions,
-        canceling: cancelingTransitions,
       },
+      printedUniqueOrders,
+      printedEventsCount,
+      canceledUniqueOrders,
+      canceledEventsCount,
+      cancelingUniqueOrders,
+      cancelingEventsCount,
       ordersByStatus,
       dailyCreated,
       transitions,

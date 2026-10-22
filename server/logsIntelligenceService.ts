@@ -5,6 +5,7 @@ import { parseLogActionDetails } from './logDetailsParser.ts';
 import { persistLogEntries, repairRawWithoutCanonical } from './historicalLogsService.ts';
 import { importBatchLogFiles } from './batchLogsImporter.ts';
 import { isSupabaseConfigured, fetchDayLogsFromSupabase } from './supabaseClient.ts';
+import { processAndDeduplicateTeamEvents } from './teamDeduplication.ts';
 
 export type FetchStage =
   | 'IDLE'
@@ -422,13 +423,14 @@ export interface LogsIntelligenceReport {
   metrics: {
     totalLogs: number;
     uniqueOrdersTouched: number;
-    confirmedOrdersCount: number; // Rule: Printed = Confirmed
-    printedEventsCount: number;
-    canceledOrdersCount: number;  // Strictly Canceled
-    canceledEventsCount: number;
-    cancelingEventsCount: number; // Strictly Canceling
-    createdOrdersCount: number;
-    createdEventsCount: number;
+    confirmedOrdersCount: number; // Unique Printed Orders
+    printedEventsCount: number;   // Total Printed Events
+    canceledOrdersCount: number;  // Strictly Unique Canceled Orders
+    canceledEventsCount: number;  // Total Canceled Events
+    cancelingOrdersCount: number; // Strictly Unique Canceling Orders
+    cancelingEventsCount: number; // Total Canceling Events
+    createdOrdersCount: number;   // Unique Created Orders
+    createdEventsCount: number;   // Total Created Events
     extraPhonesAddedUniqueOrders: number;
     extraPhonesAddedEvents: number;
     extraPhonesReplacedCount: number;
@@ -443,8 +445,13 @@ export interface LogsIntelligenceReport {
     totalLogs: number;
     uniqueOrdersTouched: number;
     createdOrdersCount: number;
+    createdEventsCount: number;
     confirmedOrdersCount: number;
+    printedEventsCount: number;
     canceledOrdersCount: number;
+    canceledEventsCount: number;
+    cancelingOrdersCount: number;
+    cancelingEventsCount: number;
     extraPhonesAddedCount: number;
     activeEmployeesCount: number;
     coverageStatus: string;
@@ -457,9 +464,13 @@ export interface LogsIntelligenceReport {
     is_system: number;
     actor_type: 'STAFF' | 'SYSTEM' | 'UNKNOWN';
     action_count: number;
+    raw_events_count: number;
+    duplicate_events_count: number;
     unique_orders: number;
     confirmed_orders_count: number;
+    printed_events_count: number;
     canceled_orders_count: number;
+    canceled_events_count: number;
     extra_phones_added_count: number;
     status_changes_count: number;
     actions_breakdown: Record<string, number>;
@@ -585,27 +596,36 @@ export function generateLogsIntelligenceReport(startDateStr: string, endDateStr:
     ? 'PARTIAL'
     : 'FAILED';
 
-  // 2. Base Counts from canonical_activity_events
+  // 2. Base Counts from canonical_activity_events using permanent order identity
+  const orderIdentitySql = `COALESCE(
+    CASE WHEN c.order_id IS NOT NULL THEN 'ORD_ID_' || c.order_id END,
+    CASE WHEN r.vendoor_order_id IS NOT NULL THEN 'VEND_ID_' || r.vendoor_order_id END,
+    CASE WHEN c.order_code IS NOT NULL AND TRIM(c.order_code) != '' THEN 'CODE_' || LOWER(TRIM(c.order_code)) END
+  )`;
+
   const totalLogs = (db.prepare(`
     SELECT COUNT(*) as c FROM canonical_activity_events
     WHERE event_timestamp >= ? AND event_timestamp < ?
   `).get(startTime, endTime) as any)?.c || 0;
 
   const uniqueOrdersTouched = (db.prepare(`
-    SELECT COUNT(DISTINCT order_code) as c FROM canonical_activity_events
-    WHERE event_timestamp >= ? AND event_timestamp < ?
-      AND order_code IS NOT NULL AND order_code != ''
+    SELECT COUNT(DISTINCT ${orderIdentitySql}) as c
+    FROM canonical_activity_events c
+    LEFT JOIN raw_activity_events r ON c.raw_event_id = r.id
+    WHERE c.event_timestamp >= ? AND c.event_timestamp < ?
+      AND (c.order_code IS NOT NULL AND TRIM(c.order_code) != '' OR c.order_id IS NOT NULL)
   `).get(startTime, endTime) as any)?.c || 0;
 
   // Confirmed Orders (Rule: Printed = Confirmation)
   const confirmedData: any = db.prepare(`
     SELECT 
-      COUNT(DISTINCT order_code) as unique_orders,
+      COUNT(DISTINCT ${orderIdentitySql}) as unique_orders,
       COUNT(*) as events_count
-    FROM canonical_activity_events
-    WHERE event_timestamp >= ? AND event_timestamp < ?
-      AND order_code IS NOT NULL AND order_code != ''
-      AND to_status = 'Printed'
+    FROM canonical_activity_events c
+    LEFT JOIN raw_activity_events r ON c.raw_event_id = r.id
+    WHERE c.event_timestamp >= ? AND c.event_timestamp < ?
+      AND (c.order_code IS NOT NULL AND TRIM(c.order_code) != '' OR c.order_id IS NOT NULL)
+      AND c.to_status = 'Printed'
   `).get(startTime, endTime);
 
   const confirmedOrdersCount = confirmedData?.unique_orders || 0;
@@ -614,32 +634,43 @@ export function generateLogsIntelligenceReport(startDateStr: string, endDateStr:
   // Canceled Orders (Strictly Canceled - separated from Canceling)
   const canceledData: any = db.prepare(`
     SELECT 
-      COUNT(DISTINCT order_code) as unique_orders,
+      COUNT(DISTINCT ${orderIdentitySql}) as unique_orders,
       COUNT(*) as events_count
-    FROM canonical_activity_events
-    WHERE event_timestamp >= ? AND event_timestamp < ?
-      AND order_code IS NOT NULL AND order_code != ''
-      AND to_status = 'Canceled'
+    FROM canonical_activity_events c
+    LEFT JOIN raw_activity_events r ON c.raw_event_id = r.id
+    WHERE c.event_timestamp >= ? AND c.event_timestamp < ?
+      AND (c.order_code IS NOT NULL AND TRIM(c.order_code) != '' OR c.order_id IS NOT NULL)
+      AND c.to_status = 'Canceled'
   `).get(startTime, endTime);
 
   const canceledOrdersCount = canceledData?.unique_orders || 0;
   const canceledEventsCount = canceledData?.events_count || 0;
 
-  const cancelingEventsCount = (db.prepare(`
-    SELECT COUNT(*) as c FROM canonical_activity_events
-    WHERE event_timestamp >= ? AND event_timestamp < ?
-      AND to_status = 'Canceling'
-  `).get(startTime, endTime) as any)?.c || 0;
+  // Canceling Orders (Strictly Canceling - separated from Canceled)
+  const cancelingData: any = db.prepare(`
+    SELECT 
+      COUNT(DISTINCT ${orderIdentitySql}) as unique_orders,
+      COUNT(*) as events_count
+    FROM canonical_activity_events c
+    LEFT JOIN raw_activity_events r ON c.raw_event_id = r.id
+    WHERE c.event_timestamp >= ? AND c.event_timestamp < ?
+      AND (c.order_code IS NOT NULL AND TRIM(c.order_code) != '' OR c.order_id IS NOT NULL)
+      AND c.to_status = 'Canceling'
+  `).get(startTime, endTime);
+
+  const cancelingOrdersCount = cancelingData?.unique_orders || 0;
+  const cancelingEventsCount = cancelingData?.events_count || 0;
 
   // Created Orders
   const createdData: any = db.prepare(`
     SELECT 
-      COUNT(DISTINCT order_code) as unique_orders,
+      COUNT(DISTINCT ${orderIdentitySql}) as unique_orders,
       COUNT(*) as events_count
-    FROM canonical_activity_events
-    WHERE event_timestamp >= ? AND event_timestamp < ?
-      AND order_code IS NOT NULL AND order_code != ''
-      AND action_type = 'order_created'
+    FROM canonical_activity_events c
+    LEFT JOIN raw_activity_events r ON c.raw_event_id = r.id
+    WHERE c.event_timestamp >= ? AND c.event_timestamp < ?
+      AND (c.order_code IS NOT NULL AND TRIM(c.order_code) != '' OR c.order_id IS NOT NULL)
+      AND c.action_type = 'order_created'
   `).get(startTime, endTime);
 
   const createdOrdersCount = createdData?.unique_orders || 0;
@@ -648,18 +679,19 @@ export function generateLogsIntelligenceReport(startDateStr: string, endDateStr:
   // Extra Phone Numbers Analysis
   const extraPhonesAddedData: any = db.prepare(`
     SELECT 
-      COUNT(DISTINCT order_code) as unique_orders,
+      COUNT(DISTINCT ${orderIdentitySql}) as unique_orders,
       COUNT(*) as events_count
-    FROM canonical_activity_events
-    WHERE event_timestamp >= ? AND event_timestamp < ?
-      AND order_code IS NOT NULL AND order_code != ''
+    FROM canonical_activity_events c
+    LEFT JOIN raw_activity_events r ON c.raw_event_id = r.id
+    WHERE c.event_timestamp >= ? AND c.event_timestamp < ?
+      AND (c.order_code IS NOT NULL AND TRIM(c.order_code) != '' OR c.order_id IS NOT NULL)
       AND (
-        action_type = 'extra_phone_added'
-        OR details_json LIKE '%"extraPhoneOperation":"ADDITION"%'
+        c.action_type = 'extra_phone_added'
+        OR c.details_json LIKE '%"extraPhoneOperation":"ADDITION"%'
         OR (
-          field_name = 'الهاتف الإضافي' 
-          AND (old_value IS NULL OR TRIM(REPLACE(REPLACE(old_value, '''', ''), '"', '')) = '')
-          AND (new_value IS NOT NULL AND TRIM(REPLACE(REPLACE(new_value, '''', ''), '"', '')) != '')
+          c.field_name = 'الهاتف الإضافي' 
+          AND (c.old_value IS NULL OR TRIM(REPLACE(REPLACE(c.old_value, '''', ''), '"', '')) = '')
+          AND (c.new_value IS NOT NULL AND TRIM(REPLACE(REPLACE(c.new_value, '''', ''), '"', '')) != '')
         )
       )
   `).get(startTime, endTime);
@@ -728,43 +760,70 @@ export function generateLogsIntelligenceReport(startDateStr: string, endDateStr:
     `).get(dayInterval.startCairo, dayInterval.endCairo) as any)?.c || 0;
 
     const dUniqueOrders = (db.prepare(`
-      SELECT COUNT(DISTINCT order_code) as c FROM canonical_activity_events
-      WHERE event_timestamp >= ? AND event_timestamp < ?
-        AND order_code IS NOT NULL AND order_code != ''
+      SELECT COUNT(DISTINCT ${orderIdentitySql}) as c
+      FROM canonical_activity_events c
+      LEFT JOIN raw_activity_events r ON c.raw_event_id = r.id
+      WHERE c.event_timestamp >= ? AND c.event_timestamp < ?
+        AND (c.order_code IS NOT NULL AND TRIM(c.order_code) != '' OR c.order_id IS NOT NULL)
     `).get(dayInterval.startCairo, dayInterval.endCairo) as any)?.c || 0;
 
-    const dCreatedOrders = (db.prepare(`
-      SELECT COUNT(DISTINCT order_code) as c FROM canonical_activity_events
-      WHERE event_timestamp >= ? AND event_timestamp < ?
-        AND order_code IS NOT NULL AND order_code != ''
-        AND action_type = 'order_created'
-    `).get(dayInterval.startCairo, dayInterval.endCairo) as any)?.c || 0;
+    const dCreatedData: any = db.prepare(`
+      SELECT 
+        COUNT(DISTINCT ${orderIdentitySql}) as unique_orders,
+        COUNT(*) as events_count
+      FROM canonical_activity_events c
+      LEFT JOIN raw_activity_events r ON c.raw_event_id = r.id
+      WHERE c.event_timestamp >= ? AND c.event_timestamp < ?
+        AND (c.order_code IS NOT NULL AND TRIM(c.order_code) != '' OR c.order_id IS NOT NULL)
+        AND c.action_type = 'order_created'
+    `).get(dayInterval.startCairo, dayInterval.endCairo);
 
-    const dConfirmedOrders = (db.prepare(`
-      SELECT COUNT(DISTINCT order_code) as c FROM canonical_activity_events
-      WHERE event_timestamp >= ? AND event_timestamp < ?
-        AND order_code IS NOT NULL AND order_code != ''
-        AND to_status = 'Printed'
-    `).get(dayInterval.startCairo, dayInterval.endCairo) as any)?.c || 0;
+    const dConfirmedData: any = db.prepare(`
+      SELECT 
+        COUNT(DISTINCT ${orderIdentitySql}) as unique_orders,
+        COUNT(*) as events_count
+      FROM canonical_activity_events c
+      LEFT JOIN raw_activity_events r ON c.raw_event_id = r.id
+      WHERE c.event_timestamp >= ? AND c.event_timestamp < ?
+        AND (c.order_code IS NOT NULL AND TRIM(c.order_code) != '' OR c.order_id IS NOT NULL)
+        AND c.to_status = 'Printed'
+    `).get(dayInterval.startCairo, dayInterval.endCairo);
 
-    const dCanceledOrders = (db.prepare(`
-      SELECT COUNT(DISTINCT order_code) as c FROM canonical_activity_events
-      WHERE event_timestamp >= ? AND event_timestamp < ?
-        AND order_code IS NOT NULL AND order_code != ''
-        AND to_status = 'Canceled'
-    `).get(dayInterval.startCairo, dayInterval.endCairo) as any)?.c || 0;
+    const dCanceledData: any = db.prepare(`
+      SELECT 
+        COUNT(DISTINCT ${orderIdentitySql}) as unique_orders,
+        COUNT(*) as events_count
+      FROM canonical_activity_events c
+      LEFT JOIN raw_activity_events r ON c.raw_event_id = r.id
+      WHERE c.event_timestamp >= ? AND c.event_timestamp < ?
+        AND (c.order_code IS NOT NULL AND TRIM(c.order_code) != '' OR c.order_id IS NOT NULL)
+        AND c.to_status = 'Canceled'
+    `).get(dayInterval.startCairo, dayInterval.endCairo);
+
+    const dCancelingData: any = db.prepare(`
+      SELECT 
+        COUNT(DISTINCT ${orderIdentitySql}) as unique_orders,
+        COUNT(*) as events_count
+      FROM canonical_activity_events c
+      LEFT JOIN raw_activity_events r ON c.raw_event_id = r.id
+      WHERE c.event_timestamp >= ? AND c.event_timestamp < ?
+        AND (c.order_code IS NOT NULL AND TRIM(c.order_code) != '' OR c.order_id IS NOT NULL)
+        AND c.to_status = 'Canceling'
+    `).get(dayInterval.startCairo, dayInterval.endCairo);
 
     const dExtraPhones = (db.prepare(`
-      SELECT COUNT(DISTINCT order_code) as c FROM canonical_activity_events
-      WHERE event_timestamp >= ? AND event_timestamp < ?
-        AND order_code IS NOT NULL AND order_code != ''
+      SELECT COUNT(DISTINCT ${orderIdentitySql}) as c
+      FROM canonical_activity_events c
+      LEFT JOIN raw_activity_events r ON c.raw_event_id = r.id
+      WHERE c.event_timestamp >= ? AND c.event_timestamp < ?
+        AND (c.order_code IS NOT NULL AND TRIM(c.order_code) != '' OR c.order_id IS NOT NULL)
         AND (
-          action_type = 'extra_phone_added'
-          OR details_json LIKE '%"extraPhoneOperation":"ADDITION"%'
+          c.action_type = 'extra_phone_added'
+          OR c.details_json LIKE '%"extraPhoneOperation":"ADDITION"%'
           OR (
-            field_name = 'الهاتف الإضافي' 
-            AND (old_value IS NULL OR TRIM(REPLACE(REPLACE(old_value, '''', ''), '"', '')) = '')
-            AND (new_value IS NOT NULL AND TRIM(REPLACE(REPLACE(new_value, '''', ''), '"', '')) != '')
+            c.field_name = 'الهاتف الإضافي' 
+            AND (c.old_value IS NULL OR TRIM(REPLACE(REPLACE(c.old_value, '''', ''), '"', '')) = '')
+            AND (c.new_value IS NOT NULL AND TRIM(REPLACE(REPLACE(c.new_value, '''', ''), '"', '')) != '')
           )
         )
     `).get(dayInterval.startCairo, dayInterval.endCairo) as any)?.c || 0;
@@ -784,9 +843,14 @@ export function generateLogsIntelligenceReport(startDateStr: string, endDateStr:
       dayNameAr,
       totalLogs: dTotalLogs,
       uniqueOrdersTouched: dUniqueOrders,
-      createdOrdersCount: dCreatedOrders,
-      confirmedOrdersCount: dConfirmedOrders,
-      canceledOrdersCount: dCanceledOrders,
+      createdOrdersCount: dCreatedData?.unique_orders || 0,
+      createdEventsCount: dCreatedData?.events_count || 0,
+      confirmedOrdersCount: dConfirmedData?.unique_orders || 0,
+      printedEventsCount: dConfirmedData?.events_count || 0,
+      canceledOrdersCount: dCanceledData?.unique_orders || 0,
+      canceledEventsCount: dCanceledData?.events_count || 0,
+      cancelingOrdersCount: dCancelingData?.unique_orders || 0,
+      cancelingEventsCount: dCancelingData?.events_count || 0,
       extraPhonesAddedCount: dExtraPhones,
       activeEmployeesCount: dActiveEmployees,
       coverageStatus: dayCovStatus,
@@ -796,64 +860,141 @@ export function generateLogsIntelligenceReport(startDateStr: string, endDateStr:
     });
   }
 
-  // 4. Employee Activity Table
-  const rawEmployees: any[] = db.prepare(`
-    SELECT 
-      actor_name,
-      is_system_actor,
-      COUNT(*) as action_count,
-      COUNT(DISTINCT order_code) as unique_orders,
-      COUNT(DISTINCT CASE WHEN to_status = 'Printed' THEN order_code END) as confirmed_orders_count,
-      COUNT(DISTINCT CASE WHEN to_status = 'Canceled' THEN order_code END) as canceled_orders_count,
-      COUNT(DISTINCT CASE 
-        WHEN action_type = 'extra_phone_added' 
-             OR details_json LIKE '%"extraPhoneOperation":"ADDITION"%'
-             OR (field_name = 'الهاتف الإضافي' AND (old_value IS NULL OR TRIM(REPLACE(REPLACE(old_value, '''', ''), '"', '')) = '') AND (new_value IS NOT NULL AND TRIM(REPLACE(REPLACE(new_value, '''', ''), '"', '')) != ''))
-        THEN order_code 
-      END) as extra_phones_added_count,
-      SUM(CASE WHEN action_type = 'status_change' THEN 1 ELSE 0 END) as status_changes_count
-    FROM canonical_activity_events
-    WHERE event_timestamp >= ? AND event_timestamp < ?
-    GROUP BY actor_name, is_system_actor
-    ORDER BY action_count DESC
+  // 4. Employee Activity Table with conservative deduplication
+  const employeeEvents: any[] = db.prepare(`
+    SELECT
+      c.id,
+      c.actor_name,
+      c.action_type,
+      c.from_status,
+      c.to_status,
+      c.order_code,
+      c.event_timestamp,
+      c.is_system_actor,
+      c.raw_event_id,
+      COALESCE(r.source_hash, '') as source_hash,
+      COALESCE(r.raw_action_text, '') as raw_action_text,
+      c.order_id,
+      r.vendoor_order_id,
+      c.field_name,
+      c.old_value,
+      c.new_value,
+      c.details_json
+    FROM canonical_activity_events c
+    LEFT JOIN raw_activity_events r ON c.raw_event_id = r.id
+    WHERE c.event_timestamp >= ? AND c.event_timestamp < ?
+    ORDER BY c.event_timestamp ASC, c.id ASC
   `).all(startTime, endTime);
 
-  // Group actions breakdown per employee
-  const employeeBreakdownRows: any[] = db.prepare(`
-    SELECT actor_name, action_type, COUNT(*) as c
-    FROM canonical_activity_events
-    WHERE event_timestamp >= ? AND event_timestamp < ?
-    GROUP BY actor_name, action_type
-  `).all(startTime, endTime);
+  const deduplicatedEvents = processAndDeduplicateTeamEvents(employeeEvents);
 
-  const empBreakdownMap = new Map<string, Record<string, number>>();
-  for (const r of employeeBreakdownRows) {
-    if (!empBreakdownMap.has(r.actor_name)) {
-      empBreakdownMap.set(r.actor_name, {});
+  const empStatsMap = new Map<string, {
+    actor_name: string;
+    is_system: number;
+    action_count: number;
+    raw_events_count: number;
+    duplicate_events_count: number;
+    unique_orders_set: Set<string>;
+    confirmed_orders_set: Set<string>;
+    printed_events_count: number;
+    canceled_orders_set: Set<string>;
+    canceled_events_count: number;
+    extra_phones_added_set: Set<string>;
+    status_changes_count: number;
+    actions_breakdown: Record<string, number>;
+  }>();
+
+  for (const ev of deduplicatedEvents) {
+    const actor = ev.actor_name || 'غير محدد';
+    let stat = empStatsMap.get(actor);
+    if (!stat) {
+      stat = {
+        actor_name: actor,
+        is_system: ev.is_system_actor === 1 || ev.is_system_actor === true ? 1 : 0,
+        action_count: 0,
+        raw_events_count: 0,
+        duplicate_events_count: 0,
+        unique_orders_set: new Set<string>(),
+        confirmed_orders_set: new Set<string>(),
+        printed_events_count: 0,
+        canceled_orders_set: new Set<string>(),
+        canceled_events_count: 0,
+        extra_phones_added_set: new Set<string>(),
+        status_changes_count: 0,
+        actions_breakdown: {},
+      };
+      empStatsMap.set(actor, stat);
     }
-    empBreakdownMap.get(r.actor_name)![r.action_type] = r.c;
+
+    stat.raw_events_count++;
+    const orderKey = ev.order_id
+      ? `ORD_ID_${ev.order_id}`
+      : ev.vendoor_order_id
+      ? `VEND_ID_${ev.vendoor_order_id}`
+      : ev.order_code && ev.order_code.trim()
+      ? `CODE_${ev.order_code.trim().toLowerCase()}`
+      : null;
+
+    if (orderKey) {
+      stat.unique_orders_set.add(orderKey);
+    }
+
+    if (!ev.is_counted) {
+      stat.duplicate_events_count++;
+      continue;
+    }
+
+    // Real, counted operational action
+    stat.action_count++;
+    stat.actions_breakdown[ev.action_type] = (stat.actions_breakdown[ev.action_type] || 0) + 1;
+
+    if (ev.to_status === 'Printed') {
+      stat.printed_events_count++;
+      if (orderKey) stat.confirmed_orders_set.add(orderKey);
+    } else if (ev.to_status === 'Canceled') {
+      stat.canceled_events_count++;
+      if (orderKey) stat.canceled_orders_set.add(orderKey);
+    }
+
+    if (ev.action_type === 'status_change') {
+      stat.status_changes_count++;
+    }
+
+    const isExtraPhoneAdd = Boolean(
+      ev.action_type === 'extra_phone_added' ||
+      (ev.details_json && ev.details_json.includes('"extraPhoneOperation":"ADDITION"')) ||
+      (ev.field_name === 'الهاتف الإضافي' && (!ev.old_value || !ev.old_value.trim()) && ev.new_value && ev.new_value.trim())
+    );
+    if (isExtraPhoneAdd && orderKey) {
+      stat.extra_phones_added_set.add(orderKey);
+    }
   }
 
-  const employees: LogsIntelligenceReport['employees'] = rawEmployees.map((emp) => {
-    const isSys = emp.is_system_actor === 1;
-    let actorType: 'STAFF' | 'SYSTEM' | 'UNKNOWN' = isSys ? 'SYSTEM' : 'STAFF';
-    if (!emp.actor_name || emp.actor_name === 'غير محدد' || emp.actor_name === 'Unknown') {
-      actorType = 'UNKNOWN';
-    }
-
-    return {
-      actor_name: emp.actor_name || 'غير محدد',
-      is_system: emp.is_system_actor,
-      actor_type: actorType,
-      action_count: emp.action_count || 0,
-      unique_orders: emp.unique_orders || 0,
-      confirmed_orders_count: emp.confirmed_orders_count || 0,
-      canceled_orders_count: emp.canceled_orders_count || 0,
-      extra_phones_added_count: emp.extra_phones_added_count || 0,
-      status_changes_count: emp.status_changes_count || 0,
-      actions_breakdown: empBreakdownMap.get(emp.actor_name) || {},
-    };
-  });
+  const employees: LogsIntelligenceReport['employees'] = Array.from(empStatsMap.values())
+    .map(st => {
+      const isSys = st.is_system === 1;
+      let actorType: 'STAFF' | 'SYSTEM' | 'UNKNOWN' = isSys ? 'SYSTEM' : 'STAFF';
+      if (!st.actor_name || st.actor_name === 'غير محدد' || st.actor_name === 'Unknown') {
+        actorType = 'UNKNOWN';
+      }
+      return {
+        actor_name: st.actor_name,
+        is_system: st.is_system,
+        actor_type: actorType,
+        action_count: st.action_count,
+        raw_events_count: st.raw_events_count,
+        duplicate_events_count: st.duplicate_events_count,
+        unique_orders: st.unique_orders_set.size,
+        confirmed_orders_count: st.confirmed_orders_set.size,
+        printed_events_count: st.printed_events_count,
+        canceled_orders_count: st.canceled_orders_set.size,
+        canceled_events_count: st.canceled_events_count,
+        extra_phones_added_count: st.extra_phones_added_set.size,
+        status_changes_count: st.status_changes_count,
+        actions_breakdown: st.actions_breakdown,
+      };
+    })
+    .sort((a, b) => b.action_count - a.action_count);
 
   // 5. Status Transitions Matrix
   const transitions: any[] = db.prepare(`
@@ -956,6 +1097,7 @@ export function generateLogsIntelligenceReport(startDateStr: string, endDateStr:
       printedEventsCount,
       canceledOrdersCount,
       canceledEventsCount,
+      cancelingOrdersCount,
       cancelingEventsCount,
       createdOrdersCount,
       createdEventsCount,
@@ -987,6 +1129,7 @@ export function getDrilldownLogs(params: {
   search?: string;
   page?: number;
   limit?: number;
+  viewType?: 'orders' | 'events';
 }) {
   const {
     pillar,
@@ -996,7 +1139,11 @@ export function getDrilldownLogs(params: {
     search,
     page = 1,
     limit = 25,
+    viewType,
   } = params;
+
+  const isOrderPillar = ['confirmed', 'printed', 'canceled', 'canceling', 'created'].includes(pillar);
+  const effectiveViewType: 'orders' | 'events' = viewType || (isOrderPillar ? 'orders' : 'events');
 
   const startInterval = getCairoDateInterval(startDate.slice(0, 10));
   const endInterval = getCairoDateInterval(endDate.slice(0, 10));
@@ -1038,6 +1185,10 @@ export function getDrilldownLogs(params: {
     conditions.push("(c.order_match_status = 'UNRESOLVED' OR c.action_type = 'other')");
   }
 
+  if (effectiveViewType === 'orders') {
+    conditions.push("(c.order_code IS NOT NULL AND TRIM(c.order_code) != '' OR c.order_id IS NOT NULL)");
+  }
+
   if (search && search.trim()) {
     const s = `%${search.trim()}%`;
     conditions.push('(c.order_code LIKE ? OR r.raw_action_text LIKE ? OR c.actor_name LIKE ? OR c.field_name LIKE ? OR c.new_value LIKE ?)');
@@ -1046,26 +1197,69 @@ export function getDrilldownLogs(params: {
 
   const whereClause = `WHERE ${conditions.join(' AND ')}`;
 
-  const total = (db.prepare(`
-    SELECT COUNT(*) as c
-    FROM canonical_activity_events c
-    LEFT JOIN raw_activity_events r ON c.raw_event_id = r.id
-    ${whereClause}
-  `).get(...sqlParams) as any)?.c || 0;
+  const orderIdentitySql = `COALESCE(
+    CASE WHEN c.order_id IS NOT NULL THEN 'ORD_ID_' || c.order_id END,
+    CASE WHEN r.vendoor_order_id IS NOT NULL THEN 'VEND_ID_' || r.vendoor_order_id END,
+    CASE WHEN c.order_code IS NOT NULL AND TRIM(c.order_code) != '' THEN 'CODE_' || LOWER(TRIM(c.order_code)) END
+  )`;
 
+  let total = 0;
+  let events: any[] = [];
   const offset = (page - 1) * limit;
-  const events = db.prepare(`
-    SELECT 
-      c.id, c.order_code, c.actor_name, c.action_type, c.from_status, c.to_status,
-      c.field_name, c.old_value, c.new_value, c.event_timestamp, c.is_system_actor,
-      COALESCE(r.raw_action_text, '') as raw_action_text,
-      c.details_json
-    FROM canonical_activity_events c
-    LEFT JOIN raw_activity_events r ON c.raw_event_id = r.id
-    ${whereClause}
-    ORDER BY c.event_timestamp DESC, c.id DESC
-    LIMIT ? OFFSET ?
-  `).all(...sqlParams, limit, offset);
+
+  if (effectiveViewType === 'orders') {
+    total = (db.prepare(`
+      SELECT COUNT(DISTINCT ${orderIdentitySql}) as c
+      FROM canonical_activity_events c
+      LEFT JOIN raw_activity_events r ON c.raw_event_id = r.id
+      ${whereClause}
+    `).get(...sqlParams) as any)?.c || 0;
+
+    events = db.prepare(`
+      SELECT 
+        MAX(c.id) as id,
+        c.order_code,
+        MAX(c.actor_name) as actor_name,
+        MAX(c.action_type) as action_type,
+        MAX(c.from_status) as from_status,
+        MAX(c.to_status) as to_status,
+        MAX(c.field_name) as field_name,
+        MAX(c.old_value) as old_value,
+        MAX(c.new_value) as new_value,
+        MAX(c.event_timestamp) as event_timestamp,
+        MAX(c.is_system_actor) as is_system_actor,
+        COALESCE(MAX(r.raw_action_text), '') as raw_action_text,
+        MAX(c.details_json) as details_json,
+        COUNT(*) as events_count_for_order
+      FROM canonical_activity_events c
+      LEFT JOIN raw_activity_events r ON c.raw_event_id = r.id
+      ${whereClause}
+      GROUP BY ${orderIdentitySql}
+      ORDER BY MAX(c.event_timestamp) DESC
+      LIMIT ? OFFSET ?
+    `).all(...sqlParams, limit, offset);
+  } else {
+    total = (db.prepare(`
+      SELECT COUNT(*) as c
+      FROM canonical_activity_events c
+      LEFT JOIN raw_activity_events r ON c.raw_event_id = r.id
+      ${whereClause}
+    `).get(...sqlParams) as any)?.c || 0;
+
+    events = db.prepare(`
+      SELECT 
+        c.id, c.order_code, c.actor_name, c.action_type, c.from_status, c.to_status,
+        c.field_name, c.old_value, c.new_value, c.event_timestamp, c.is_system_actor,
+        COALESCE(r.raw_action_text, '') as raw_action_text,
+        c.details_json,
+        1 as events_count_for_order
+      FROM canonical_activity_events c
+      LEFT JOIN raw_activity_events r ON c.raw_event_id = r.id
+      ${whereClause}
+      ORDER BY c.event_timestamp DESC, c.id DESC
+      LIMIT ? OFFSET ?
+    `).all(...sqlParams, limit, offset);
+  }
 
   return {
     events,
@@ -1073,5 +1267,6 @@ export function getDrilldownLogs(params: {
     page,
     limit,
     totalPages: Math.ceil(total / limit) || 1,
+    viewType: effectiveViewType,
   };
 }

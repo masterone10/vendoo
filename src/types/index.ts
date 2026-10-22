@@ -312,6 +312,7 @@ export interface LogsIntelligenceReport {
     printedEventsCount: number;
     canceledOrdersCount: number;
     canceledEventsCount: number;
+    cancelingOrdersCount: number;
     cancelingEventsCount: number;
     createdOrdersCount: number;
     createdEventsCount: number;
@@ -329,8 +330,13 @@ export interface LogsIntelligenceReport {
     totalLogs: number;
     uniqueOrdersTouched: number;
     createdOrdersCount: number;
+    createdEventsCount?: number;
     confirmedOrdersCount: number;
+    printedEventsCount?: number;
     canceledOrdersCount: number;
+    canceledEventsCount?: number;
+    cancelingOrdersCount?: number;
+    cancelingEventsCount?: number;
     extraPhonesAddedCount: number;
     activeEmployeesCount: number;
     coverageStatus: string;
@@ -343,9 +349,13 @@ export interface LogsIntelligenceReport {
     is_system: number;
     actor_type: 'STAFF' | 'SYSTEM' | 'UNKNOWN';
     action_count: number;
+    raw_events_count?: number;
+    duplicate_events_count?: number;
     unique_orders: number;
     confirmed_orders_count: number;
+    printed_events_count?: number;
     canceled_orders_count: number;
+    canceled_events_count?: number;
     extra_phones_added_count: number;
     status_changes_count: number;
     actions_breakdown: Record<string, number>;

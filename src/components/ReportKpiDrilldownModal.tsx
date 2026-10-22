@@ -63,6 +63,8 @@ export const ReportKpiDrilldownModal: React.FC<ReportKpiDrilldownModalProps> = (
   reportData,
   onSelectOrder,
 }) => {
+  const isOrderPillar = ['confirmed', 'printed', 'canceled', 'canceling', 'created'].includes(pillar || '');
+  const [viewType, setViewType] = useState<'orders' | 'events'>('orders');
   const [logEvents, setLogEvents] = useState<any[]>([]);
   const [total, setTotal] = useState<number>(0);
   const [page, setPage] = useState<number>(1);
@@ -77,6 +79,7 @@ export const ReportKpiDrilldownModal: React.FC<ReportKpiDrilldownModalProps> = (
       setPage(1);
       setSearchTerm('');
       setActiveSearch('');
+      setViewType(isOrderPillar ? 'orders' : 'events');
     }
   }, [isOpen, pillar, actorName]);
 
@@ -84,7 +87,7 @@ export const ReportKpiDrilldownModal: React.FC<ReportKpiDrilldownModalProps> = (
     if (isOpen && pillar) {
       fetchLogs();
     }
-  }, [isOpen, pillar, actorName, page, activeSearch, startDate, endDate]);
+  }, [isOpen, pillar, actorName, page, activeSearch, startDate, endDate, viewType]);
 
   async function fetchLogs() {
     if (!pillar) return;
@@ -94,6 +97,7 @@ export const ReportKpiDrilldownModal: React.FC<ReportKpiDrilldownModalProps> = (
       if (startDate) params.set('startDate', startDate);
       if (endDate) params.set('endDate', endDate);
       params.set('pillar', pillar);
+      params.set('viewType', viewType);
       params.set('page', String(page));
       params.set('limit', '25');
 
@@ -136,6 +140,7 @@ export const ReportKpiDrilldownModal: React.FC<ReportKpiDrilldownModalProps> = (
     if (startDate) params.set('startDate', startDate);
     if (endDate) params.set('endDate', endDate);
     if (pillar) params.set('pillar', pillar);
+    params.set('viewType', viewType);
     window.location.href = `/api/reports/logs-export?${params.toString()}`;
   }
 
@@ -226,7 +231,7 @@ export const ReportKpiDrilldownModal: React.FC<ReportKpiDrilldownModalProps> = (
               <div className="flex items-center gap-2">
                 <h2 className="text-xl font-bold text-slate-100">{meta.title}</h2>
                 <span className="text-xs px-2.5 py-0.5 rounded-full bg-slate-800 text-slate-300 font-mono">
-                  {total.toLocaleString()} سجل موثق
+                  {total.toLocaleString()} {viewType === 'orders' ? 'طلب فريد' : 'حركة مسجلة'}
                 </span>
               </div>
               <p className="text-xs text-slate-400 mt-0.5 font-sans">
@@ -254,18 +259,47 @@ export const ReportKpiDrilldownModal: React.FC<ReportKpiDrilldownModalProps> = (
           </div>
         </div>
 
-        {/* Toolbar: Search */}
+        {/* Toolbar: Search and View Mode */}
         <div className="p-4 border-b border-slate-800/80 bg-slate-950/40 flex flex-wrap items-center justify-between gap-3">
-          <form onSubmit={handleSearchSubmit} className="flex-1 max-w-md relative">
-            <Search className="w-4 h-4 text-slate-500 absolute right-3 top-2.5" />
-            <input
-              type="text"
-              value={searchTerm}
-              onChange={(e) => setSearchTerm(e.target.value)}
-              placeholder="بحث في كود الطلب، اسم المنفذ، نص الحركة، أو القيم..."
-              className="w-full bg-slate-900 border border-slate-700/60 rounded-xl pr-9 pl-4 py-2 text-xs text-slate-200 placeholder-slate-500 focus:outline-none focus:border-amber-500"
-            />
-          </form>
+          <div className="flex items-center gap-3 flex-1 max-w-xl">
+            <form onSubmit={handleSearchSubmit} className="flex-1 relative">
+              <Search className="w-4 h-4 text-slate-500 absolute right-3 top-2.5" />
+              <input
+                type="text"
+                value={searchTerm}
+                onChange={(e) => setSearchTerm(e.target.value)}
+                placeholder="بحث في كود الطلب، اسم المنفذ، نص الحركة، أو القيم..."
+                className="w-full bg-slate-900 border border-slate-700/60 rounded-xl pr-9 pl-4 py-2 text-xs text-slate-200 placeholder-slate-500 focus:outline-none focus:border-amber-500"
+              />
+            </form>
+
+            {isOrderPillar && (
+              <div className="flex items-center p-0.5 bg-slate-900 border border-slate-700/60 rounded-xl shrink-0 font-sans text-xs">
+                <button
+                  type="button"
+                  onClick={() => { setViewType('orders'); setPage(1); }}
+                  className={`px-3 py-1.5 rounded-lg transition-all ${
+                    viewType === 'orders'
+                      ? 'bg-amber-500 text-slate-950 font-bold shadow-sm'
+                      : 'text-slate-400 hover:text-slate-200'
+                  }`}
+                >
+                  الطلبات الفريدة
+                </button>
+                <button
+                  type="button"
+                  onClick={() => { setViewType('events'); setPage(1); }}
+                  className={`px-3 py-1.5 rounded-lg transition-all ${
+                    viewType === 'events'
+                      ? 'bg-amber-500 text-slate-950 font-bold shadow-sm'
+                      : 'text-slate-400 hover:text-slate-200'
+                  }`}
+                >
+                  جميع الحركات
+                </button>
+              </div>
+            )}
+          </div>
 
           <div className="flex items-center gap-2 text-xs text-slate-400 font-mono">
             <span>الصفحة {page} من {totalPages}</span>
@@ -292,6 +326,7 @@ export const ReportKpiDrilldownModal: React.FC<ReportKpiDrilldownModalProps> = (
                   <tr className="bg-slate-950/80 text-slate-400 border-b border-slate-800 font-sans">
                     <th className="py-3 px-3">#</th>
                     <th className="py-3 px-3">كود الطلب</th>
+                    {viewType === 'orders' && <th className="py-3 px-3">حركات الطلب</th>}
                     <th className="py-3 px-3">التوقيت (القاهرة)</th>
                     <th className="py-3 px-3">المنفذ</th>
                     <th className="py-3 px-3">نوع الإجراء</th>
@@ -337,6 +372,13 @@ export const ReportKpiDrilldownModal: React.FC<ReportKpiDrilldownModalProps> = (
                             <span className="text-slate-500 font-sans">عام / غير محدد</span>
                           )}
                         </td>
+                        {viewType === 'orders' && (
+                          <td className="py-3 px-3">
+                            <span className="px-2 py-0.5 rounded-md bg-slate-800 text-amber-400 text-[11px] font-mono border border-slate-700/60">
+                              {ev.events_count_for_order || 1} حركة
+                            </span>
+                          </td>
+                        )}
                         <td className="py-3 px-3 text-slate-300 whitespace-nowrap text-[11px]">
                           {ev.event_timestamp ? ev.event_timestamp.replace('T', ' ').slice(0, 19) : '—'}
                         </td>

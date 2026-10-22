@@ -191,7 +191,7 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
             <AlertTriangle className="w-3.5 h-3.5 text-rose-400" />
             <span>مؤشرات المخاطر الحرجة (محرك التنبيهات المباشر)</span>
           </h3>
-          <span className="text-[11px] text-slate-500">فحص فوري عند انتقال الطلب إلى التأكيد</span>
+          <span className="text-[11px] text-slate-500">للطلبات المطبوعة في اليوم المختار ({selectedDate || 'اليوم'})</span>
         </div>
 
         <div className="grid grid-cols-1 md:grid-cols-4 gap-3">
@@ -215,7 +215,7 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
               {riskIndicators.multiMerchantPrinted}
             </div>
             <p className="mt-1.5 text-[11px] text-slate-400 leading-relaxed">
-              طلبات مؤكدة تحتوي منتجات من أكثر من كود مخزن مستقل.
+              طلبات مطبوعة لليوم المختار تحتوي منتجات من أكثر من كود مخزن مستقل.
             </p>
           </div>
 
@@ -232,7 +232,7 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
               {riskIndicators.missingExtraPhonePrinted}
             </div>
             <p className="mt-1.5 text-[11px] text-slate-400 leading-relaxed">
-              طلبات مطبوعة لم يسجل بها هاتف إضافي أو بصيغة غير صالحة.
+              طلبات مطبوعة لليوم المختار لم يسجل بها هاتف إضافي أو بصيغة غير صالحة.
             </p>
           </div>
 
@@ -249,7 +249,7 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
               {riskIndicators.lowDeliveryRatePrinted}
             </div>
             <p className="mt-1.5 text-[11px] text-slate-400 leading-relaxed">
-              عملاء لديهم سجل تاريخي بنسبة استلام منخفضة (&lt; 70%).
+              عملاء لديهم سجل تاريخي بنسبة استلام منخفضة (&lt; 70%) لطلبات اليوم المختار.
             </p>
           </div>
 
