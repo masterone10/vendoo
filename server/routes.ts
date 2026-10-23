@@ -1320,14 +1320,24 @@ apiRouter.get('/reports/logs-intelligence', async (req: Request, res: Response) 
     let jobStatus = getRangeJobStatus(sDate, eDate);
 
     const shouldAutoFetch = autoFetch !== 'false';
-    if (shouldAutoFetch && (!jobStatus || jobStatus.stage === 'FAILED' || jobStatus.stage === 'IDLE')) {
+    const isJobActive =
+      jobStatus &&
+      (jobStatus.stage === 'CHECKING_STORAGE' ||
+        jobStatus.stage === 'FETCHING_VENDOOR' ||
+        jobStatus.stage === 'SAVING_RECORDS' ||
+        jobStatus.stage === 'ANALYZING_ACTIONS' ||
+        jobStatus.stage === 'COMPUTING_METRICS' ||
+        jobStatus.stage === 'PREPARING_REPORT');
+
+    let report = generateLogsIntelligenceReport(sDate, eDate);
+
+    if (shouldAutoFetch && !isJobActive && (!report.coverage.isFullyComplete || !jobStatus)) {
       ensureCoverageForRange(sDate, eDate).catch(err => {
         console.error(`[LogsIntelligence] Auto-fetch error for ${jobKey}:`, err.message);
       });
       jobStatus = getRangeJobStatus(sDate, eDate);
     }
 
-    const report = generateLogsIntelligenceReport(sDate, eDate);
     if (
       jobStatus &&
       (jobStatus.stage === 'CHECKING_STORAGE' ||

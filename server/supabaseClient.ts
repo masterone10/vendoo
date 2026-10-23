@@ -47,12 +47,17 @@ export function getSupabasePool(): pg.Pool {
         rejectUnauthorized: false, // Required for Supabase pooler connections in cloud containers
       },
       max: 10,
-      idleTimeoutMillis: 30000,
-      connectionTimeoutMillis: 10000,
+      idleTimeoutMillis: 15000,
+      connectionTimeoutMillis: 25000,
+      keepAlive: true,
+      keepAliveInitialDelayMillis: 10000,
     });
 
     pool.on('error', (err) => {
-      console.error('[Supabase Pool Error]', err.message);
+      console.warn('[Supabase Pool Notice]', err.message);
+      if (err.message.includes('Connection terminated') || err.message.includes('timeout')) {
+        pool = null;
+      }
     });
   }
 
@@ -60,18 +65,36 @@ export function getSupabasePool(): pg.Pool {
 }
 
 /**
- * Execute a SQL query on Supabase PostgreSQL with parameters
+ * Execute a SQL query on Supabase PostgreSQL with parameters and automatic transient retry
  */
 export async function pgQuery<T extends pg.QueryResultRow = any>(text: string, params: any[] = []): Promise<pg.QueryResult<T>> {
-  const p = getSupabasePool();
-  const start = Date.now();
-  try {
-    const res = await p.query<T>(text, params);
-    return res;
-  } catch (err: any) {
-    console.error(`[Supabase Query Error] ${err.message} (SQL: ${text.slice(0, 100)}...)`);
-    throw err;
+  let lastErr: any = null;
+
+  for (let attempt = 1; attempt <= 2; attempt++) {
+    const p = getSupabasePool();
+    try {
+      const res = await p.query<T>(text, params);
+      return res;
+    } catch (err: any) {
+      lastErr = err;
+      const isTransient =
+        err.message?.includes('Connection terminated') ||
+        err.message?.includes('timeout') ||
+        err.message?.includes('ECONNRESET') ||
+        err.code === '57P01';
+
+      if (isTransient && attempt < 2) {
+        console.warn(`[Supabase Query Retry] Transient pool issue on attempt ${attempt}, re-acquiring connection...`);
+        pool = null;
+        await new Promise((r) => setTimeout(r, 400));
+        continue;
+      }
+      break;
+    }
   }
+
+  console.warn(`[Supabase Query Warning] ${lastErr.message} (SQL: ${text.slice(0, 100)}...)`);
+  throw lastErr;
 }
 
 const REQUIRED_TABLES = [
@@ -401,11 +424,25 @@ export async function fetchDayLogsFromSupabase(
     };
   }
 
+  const cleanDate = dateStr.trim().slice(0, 10);
+
+  // CLOUD ARCHIVE POLICY: Remote archive begins from 2026-10-23.
+  // Days prior to 2026-10-23 are stored locally in SQLite and not queried from remote.
+  if (cleanDate < '2026-10-23') {
+    return {
+      success: true,
+      recordsRestored: 0,
+      rawRestored: 0,
+      canonicalRestored: 0,
+      duplicates: 0,
+      failedWrites: 0,
+    };
+  }
+
   const { db, getCairoDateInterval, saveCoverageRecord } = await import('./db.ts');
   const { parseLogActionDetails } = await import('./logDetailsParser.ts');
-  const cleanDate = dateStr.trim().slice(0, 10);
   const interval = getCairoDateInterval(cleanDate);
-  const batchSize = Math.max(100, Math.min(2000, options?.batchSize || 1000));
+  const batchSize = Math.max(200, Math.min(3000, options?.batchSize || 2000));
   const maxRecords = options?.maxRecords || 100000;
 
   let totalRawRestored = 0;
@@ -485,25 +522,37 @@ export async function fetchDayLogsFromSupabase(
       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'SUPABASE_ARCHIVE')
     `);
 
-    // Stream/paginate in batches using fast index scan on event_timestamp
-    let offset = 0;
+    // Stream/paginate in batches using fast primary key keyset index scan on id
+    let lastSeenId = 0;
     let fetchedTotal = 0;
     const fetchLimit = Math.min(totalInRemote, maxRecords);
 
     while (fetchedTotal < fetchLimit) {
       const currentBatchLimit = Math.min(batchSize, fetchLimit - fetchedTotal);
-      const rawRes = await pgQuery(`
+      const rawRes = await pgQuery<{
+        id: number;
+        source_hash: string;
+        order_code: string | null;
+        actor_name: string | null;
+        raw_action_text: string | null;
+        cairo_event_time: string | null;
+        storage_tier: string | null;
+        page_source: string | null;
+        is_duplicate: boolean | null;
+      }>(`
         SELECT id, source_hash, order_code, actor_name, raw_action_text,
                to_char(event_timestamp AT TIME ZONE 'Africa/Cairo', 'YYYY-MM-DD HH24:MI:SS') as cairo_event_time,
                storage_tier, page_source, is_duplicate
         FROM raw_activity_events
         WHERE event_timestamp >= $1::timestamptz 
           AND event_timestamp < $2::timestamptz
-        ORDER BY event_timestamp ASC
-        OFFSET $3 LIMIT $4
-      `, [startTz, endTz, offset, currentBatchLimit]);
+          AND id > $3
+        ORDER BY id ASC
+        LIMIT $4
+      `, [startTz, endTz, lastSeenId, currentBatchLimit]);
 
       if (!rawRes.rows || rawRes.rows.length === 0) break;
+      lastSeenId = rawRes.rows[rawRes.rows.length - 1].id;
 
       db.exec('BEGIN TRANSACTION;');
       try {
@@ -603,7 +652,6 @@ export async function fetchDayLogsFromSupabase(
         throw txErr;
       }
 
-      offset += rawRes.rows.length;
       fetchedTotal += rawRes.rows.length;
       options?.onProgress?.(fetchedTotal, totalInRemote);
     }
@@ -650,7 +698,7 @@ export async function fetchDayLogsFromSupabase(
       failedWrites,
     };
   } catch (err: any) {
-    console.error(`[SupabaseClient] Error restoring day ${cleanDate}:`, err.message);
+    console.warn(`[SupabaseClient Warning] Error restoring day ${cleanDate}:`, err.message);
     return {
       success: false,
       recordsRestored: 0,

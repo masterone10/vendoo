@@ -17,7 +17,7 @@ test('Automatic Vendoor Pull & Smart Resumption Tests', async (t) => {
 
   // Mock methods to run reliably and offline
   vendoorClient.isConfigured = () => true;
-  vendoorClient.exportSystemLogsExcel = async () => null;
+  vendoorClient.exportSystemLogsExcel = (async () => null as any) as any;
   vendoorClient.fetchSystemLogs = async (page: number, sDate: string, _eDate: string) => {
     const entry: LogEntry = {
       index: page,

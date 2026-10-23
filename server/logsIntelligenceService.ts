@@ -124,7 +124,7 @@ export async function ensureCoverageForRange(
     const interval = getCairoDateInterval(date);
 
     const cov: any = db.prepare(`
-      SELECT completion_status, data_source FROM historical_coverage
+      SELECT completion_status, data_source, pages_read, pages_discovered FROM historical_coverage
       WHERE period_date = ? AND source_domain = 'logs'
     `).get(date);
 
@@ -146,7 +146,7 @@ export async function ensureCoverageForRange(
 
     const isDayVerifiedComplete = Boolean(
       cov && (
-        cov.completion_status === 'COMPLETE' ||
+        (cov.completion_status === 'COMPLETE' && !(cov.pages_discovered > 1 && cov.pages_read < cov.pages_discovered)) ||
         cov.completion_status === 'EMPTY_VERIFIED' ||
         ((cov.data_source === 'EXCEL_IMPORT' || cov.data_source === 'CSV_IMPORT') && cov.completion_status === 'UNVERIFIED_SOURCE')
       )
@@ -164,6 +164,8 @@ export async function ensureCoverageForRange(
   if (missingDates.length > 0 && isSupabaseConfigured()) {
     for (let i = missingDates.length - 1; i >= 0; i--) {
       const d = missingDates[i];
+      if (d < '2026-10-23') continue; // Remote archive strictly begins from 2026-10-23
+
       job.stage = 'CHECKING_STORAGE';
       job.stageLabelAr = `جاري استرجاع اللوجز من Supabase (${d})`;
       onProgress?.(job);
@@ -214,7 +216,7 @@ export async function ensureCoverageForRange(
     let dayPagesTotal = 1;
     let dayPagesFetched = 0;
     let dayEventsSaved = 0;
-    let dayStatus: 'COMPLETE' | 'PARTIAL' | 'FAILED' = 'COMPLETE';
+    let dayStatus: 'COMPLETE' | 'PARTIAL' | 'FAILED' | 'EMPTY_VERIFIED' = 'COMPLETE';
     let dayError: string | null = null;
 
     try {
@@ -343,6 +345,26 @@ export async function ensureCoverageForRange(
         job.stageLabelAr = `جاري حفظ السجلات (${dayPagesFetched}/${dayPagesTotal})`;
         onProgress?.(job);
 
+        // Check for Case H: Empty Day Verified
+        if (p1.entries.length === 0 && dayPagesTotal <= 1) {
+          dayStatus = 'EMPTY_VERIFIED';
+          db.prepare(`
+            INSERT INTO historical_coverage (
+              period_date, source_domain, storage_tier, pages_discovered, pages_read,
+              records_saved, completion_status, last_attempted_at, completed_at, verified_at
+            ) VALUES (?, 'logs', 'HOT', 1, 1, 0, 'EMPTY_VERIFIED', ?, ?, ?)
+            ON CONFLICT(source_domain, period_date) DO UPDATE SET
+              pages_discovered = 1,
+              pages_read = 1,
+              records_saved = 0,
+              completion_status = 'EMPTY_VERIFIED',
+              last_attempted_at = excluded.last_attempted_at,
+              completed_at = excluded.completed_at,
+              verified_at = excluded.verified_at
+          `).run(date, new Date().toISOString(), new Date().toISOString(), new Date().toISOString());
+          continue;
+        }
+
         const p1Res = persistLogEntries(p1.entries, interval);
         dayEventsSaved += p1Res.saved;
         totalSaved += p1Res.saved;
@@ -466,7 +488,20 @@ export async function ensureCoverageForRange(
   job.stageLabelAr = 'جاري تجهيز التقرير النهائي';
   onProgress?.(job);
 
-  const finalStatus: FetchStage = hasFailedPage ? (totalSaved > 0 ? 'PARTIAL' : 'FAILED') : 'COMPLETE';
+  const verifiedCovCount = (db.prepare(`
+    SELECT COUNT(*) as c FROM historical_coverage
+    WHERE period_date >= ? AND period_date <= ? AND source_domain = 'logs'
+      AND (completion_status = 'COMPLETE' OR completion_status = 'EMPTY_VERIFIED')
+      AND NOT (pages_discovered > 1 AND pages_read < pages_discovered)
+  `).get(start, end) as any)?.c || 0;
+
+  const isAllStrictlyComplete = !hasFailedPage && verifiedCovCount === dates.length;
+  const finalStatus: FetchStage = isAllStrictlyComplete
+    ? 'COMPLETE'
+    : (totalSaved > 0 || verifiedCovCount > 0)
+    ? 'PARTIAL'
+    : 'FAILED';
+
   job.stage = finalStatus;
   job.stageLabelAr =
     finalStatus === 'COMPLETE'
@@ -614,7 +649,7 @@ export function generateLogsIntelligenceReport(startDateStr: string, endDateStr:
 
   // 1. Coverage Information
   const covRows: any[] = db.prepare(`
-    SELECT period_date, completion_status, pages_read, records_saved, verified_at, completed_at
+    SELECT period_date, completion_status, pages_read, pages_discovered, records_saved, verified_at, completed_at
     FROM historical_coverage
     WHERE period_date >= ? AND period_date <= ? AND source_domain = 'logs'
   `).all(start, end);
@@ -655,9 +690,17 @@ export function generateLogsIntelligenceReport(startDateStr: string, endDateStr:
         missingDays++;
       }
     } else {
-      if (cov.completion_status === 'COMPLETE' || cov.completion_status === 'EMPTY_VERIFIED') {
+      const isCompleteVerified =
+        (cov.completion_status === 'COMPLETE' || cov.completion_status === 'EMPTY_VERIFIED') &&
+        !(cov.pages_discovered > 1 && cov.pages_read < cov.pages_discovered);
+
+      if (isCompleteVerified) {
         completeDays++;
-      } else if (cov.completion_status === 'PARTIAL' || cov.completion_status === 'UNVERIFIED_SOURCE') {
+      } else if (
+        cov.completion_status === 'PARTIAL' ||
+        cov.completion_status === 'UNVERIFIED_SOURCE' ||
+        (cov.pages_discovered > 1 && cov.pages_read < cov.pages_discovered)
+      ) {
         partialDays++;
       } else if (cov.completion_status === 'FAILED') {
         failedDays++;

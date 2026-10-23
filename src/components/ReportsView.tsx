@@ -455,14 +455,15 @@ export const ReportsView: React.FC<ReportsViewProps> = ({ onSelectOrder }) => {
 
           if (data.job.stage === 'COMPLETE' || data.job.stage === 'PARTIAL') {
             clearInterval(pollIntervalRef.current);
+            pollIntervalRef.current = null;
             // Refresh final report data
-            const repRes = await fetch(`/api/reports/logs-intelligence?startDate=${encodeURIComponent(s)}&endDate=${encodeURIComponent(e)}&autoFetch=false`);
-            if (parentRequestId !== requestIdRef.current) return;
+            try {
+              const repRes = await fetch(`/api/reports/logs-intelligence?startDate=${encodeURIComponent(s)}&endDate=${encodeURIComponent(e)}&autoFetch=false`);
+              if (parentRequestId !== requestIdRef.current) return;
 
-            const repCt = repRes.headers.get('content-type') || '';
-            const repText = await repRes.text();
-            if (repCt.includes('application/json') || repText.startsWith('{')) {
-              try {
+              const repCt = repRes.headers.get('content-type') || '';
+              const repText = await repRes.text();
+              if (repCt.includes('application/json') || repText.startsWith('{')) {
                 const repData = JSON.parse(repText);
                 if (parentRequestId !== requestIdRef.current) return;
 
@@ -481,13 +482,22 @@ export const ReportsView: React.FC<ReportsViewProps> = ({ onSelectOrder }) => {
                   } else {
                     setViewState('success');
                   }
+
+                  if (calendarMode === 'single' || s === e) {
+                    fetchDayStatus(s);
+                  }
                   return;
                 }
-              } catch {
-                // fall through
+              }
+            } catch (err) {
+              console.warn('Error refreshing final report after job complete:', err);
+            } finally {
+              setLoading(false);
+              setViewState('success');
+              if (calendarMode === 'single' || s === e) {
+                fetchDayStatus(s);
               }
             }
-            setLoading(false);
           }
         }
       } catch (pollErr) {
@@ -1037,14 +1047,34 @@ export const ReportsView: React.FC<ReportsViewProps> = ({ onSelectOrder }) => {
                 ? 'يتم تخزين السجلات في قاعدة البيانات المحلية والتحقق من مطابقتها وعدم تكرارها'
                 : 'يفحص النظام اللوجز المحفوظة محلياً ويجلب الصفحات الناقصة من Vendoor مباشرةً لضمان دقة المؤشرات التاريخية'}
             </p>
-            {jobStatus && jobStatus.pagesTotal > 0 && jobStatus.pagesFetched > 0 && (
-              <div className="pt-2 flex items-center justify-center gap-3 text-xs font-mono text-slate-300">
-                <span className="px-2 py-0.5 rounded bg-slate-950 border border-slate-800">
-                  الصفحة {jobStatus.pagesFetched} من {jobStatus.pagesTotal}
-                </span>
-                <span className="px-2 py-0.5 rounded bg-slate-950 border border-slate-800 text-emerald-400">
-                  {jobStatus.eventsSaved.toLocaleString()} حركة محفوظة
-                </span>
+            {jobStatus && (
+              <div className="pt-2 w-full max-w-md mx-auto space-y-2">
+                {jobStatus.pagesTotal > 0 && (
+                  <div className="w-full bg-slate-950 rounded-full h-2 border border-slate-800 overflow-hidden">
+                    <div
+                      className="bg-gradient-to-r from-amber-500 via-sky-400 to-emerald-400 h-2 rounded-full transition-all duration-300"
+                      style={{
+                        width: `${Math.min(
+                          100,
+                          Math.max(
+                            8,
+                            Math.round(
+                              ((jobStatus.pagesFetched || 0) / Math.max(1, jobStatus.pagesTotal)) * 100
+                            )
+                          )
+                        )}%`,
+                      }}
+                    />
+                  </div>
+                )}
+                <div className="flex items-center justify-between text-xs font-mono text-slate-300">
+                  <span className="px-2 py-0.5 rounded bg-slate-950 border border-slate-800">
+                    الصفحة {jobStatus.pagesFetched || 0} من {jobStatus.pagesTotal || 1}
+                  </span>
+                  <span className="px-2 py-0.5 rounded bg-slate-950 border border-slate-800 text-emerald-400 font-semibold">
+                    {(jobStatus.eventsSaved || 0).toLocaleString()} حركة محفوظة
+                  </span>
+                </div>
               </div>
             )}
           </div>

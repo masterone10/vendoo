@@ -222,8 +222,13 @@ export async function resolveHistoricalDay(
 
     // -------------------------------------------------------------------------
     // Case C: Day already exists locally in SQLite and is complete
+    // Strict Rule: Must have completion_status === 'COMPLETE' and not have pages_read < pages_discovered
     // -------------------------------------------------------------------------
-    if (!forceRefetch && hasLocalData && cov?.completion_status === 'COMPLETE') {
+    const isStrictlyComplete =
+      cov?.completion_status === 'COMPLETE' &&
+      !(cov.pages_discovered > 1 && cov.pages_read < cov.pages_discovered);
+
+    if (!forceRefetch && hasLocalData && isStrictlyComplete) {
       // Sync to Supabase in background if missing remote verification (only for dates >= 2026-10-23)
       if (cleanDate >= '2026-10-23' && isSupabaseConfigured() && cov?.remote_archive_status !== 'REMOTE_VERIFIED') {
         syncDayLogsToSupabase(cleanDate).catch(() => {});
@@ -246,11 +251,17 @@ export async function resolveHistoricalDay(
     }
 
     // -------------------------------------------------------------------------
-    // Case F: Partial data exists locally
-    // Rule: If autoFetchMissing is enabled (default), automatically complete missing pages from Vendoor!
+    // Case F: Partial data exists locally (PARTIAL status or pages_read < pages_discovered)
+    // Rule: If autoFetchMissing is enabled (default: true), automatically complete missing pages from Vendoor!
     // Only if autoFetchMissing is explicitly false do we return USE_PARTIAL_LOCAL.
     // -------------------------------------------------------------------------
-    if (!forceRefetch && hasLocalData && (cov?.completion_status === 'PARTIAL' || !cov)) {
+    const isPartialCoverage =
+      hasLocalData &&
+      (cov?.completion_status === 'PARTIAL' ||
+        !cov ||
+        (cov?.pages_discovered > 1 && cov?.pages_read < cov?.pages_discovered));
+
+    if (!forceRefetch && isPartialCoverage) {
       if (!autoFetchMissing) {
         return {
           date: cleanDate,
@@ -455,7 +466,7 @@ export async function resolveHistoricalDay(
               const batchRes = await importBatchLogFiles([
                 { fileName: `vendoor_logs_${cleanDate}.xlsx`, buffer: excelBuf }
               ]);
-              if (batchRes && batchRes.discoveredDates.some(d => d.date === cleanDate && d.savedCount > 0)) {
+              if (batchRes && batchRes.discoveredDates.some(d => d.date === cleanDate && (d.savedCount > 0 || d.rowsCount > 0))) {
                 bulkLoaded = true;
                 pagesRead = pagesDiscovered;
               }
@@ -516,10 +527,11 @@ export async function resolveHistoricalDay(
       fetchError = err.message;
     }
 
-    // Determine final status
-    const finalStatus: 'COMPLETE' | 'PARTIAL' | 'FAILED' = isPartial
-      ? recordsSavedThisPass > 0 ? 'PARTIAL' : 'FAILED'
-      : 'COMPLETE';
+    // Determine final status: Strictly complete only if !isPartial and all pages were read
+    const isTrulyComplete = !isPartial && pagesRead >= pagesDiscovered;
+    const finalStatus: 'COMPLETE' | 'PARTIAL' | 'FAILED' = isTrulyComplete
+      ? 'COMPLETE'
+      : (recordsSavedThisPass > 0) ? 'PARTIAL' : 'FAILED';
 
     // Query updated totals
     const finalRawCount = (db.prepare(`
