@@ -41,6 +41,19 @@ import { ReportKpiDrilldownModal, DrilldownPillar } from './ReportKpiDrilldownMo
 import { BatchLogsImportModal } from './BatchLogsImportModal';
 import { LogsIntelligenceReport, RangeJobState, HistoricalDayStatus } from '../types';
 
+export type ReportViewState = 'idle' | 'loading' | 'success' | 'empty' | 'partial' | 'error';
+
+export interface ReportErrorDetails {
+  code: string;
+  message: string;
+  category: 'NETWORK' | 'SERVER_ERROR' | 'INVALID_RESPONSE' | 'BAD_REQUEST' | 'NOT_FOUND' | 'COVERAGE_INCOMPLETE';
+  periodLabel: string;
+  startDate: string;
+  endDate: string;
+  requestId?: string;
+  retryable: boolean;
+}
+
 interface ReportsViewProps {
   onSelectOrder?: (orderCode: string) => void;
 }
@@ -56,6 +69,14 @@ export const ReportsView: React.FC<ReportsViewProps> = ({ onSelectOrder }) => {
 
   // Quick preset button active state
   const [activePreset, setActivePreset] = useState<'today' | 'yesterday' | 'week' | 'custom'>('today');
+
+  // Explicit View State: idle | loading | success | empty | partial | error
+  const [viewState, setViewState] = useState<ReportViewState>('idle');
+  const [errorDetails, setErrorDetails] = useState<ReportErrorDetails | null>(null);
+
+  // Request counter and abort controller to prevent race conditions
+  const requestIdRef = useRef<number>(0);
+  const abortControllerRef = useRef<AbortController | null>(null);
 
   // Intelligence Report state
   const [report, setReport] = useState<LogsIntelligenceReport | null>(null);
@@ -152,44 +173,148 @@ export const ReportsView: React.FC<ReportsViewProps> = ({ onSelectOrder }) => {
   }
 
   async function fetchReport(s: string, e: string, forceFetch = false) {
+    // 1. Increment request ID to cancel/supersede any pending in-flight request
+    requestIdRef.current += 1;
+    const currentRequestId = requestIdRef.current;
+
+    // 2. Abort previous fetch if running
+    if (abortControllerRef.current) {
+      abortControllerRef.current.abort();
+    }
+    const abortController = new AbortController();
+    abortControllerRef.current = abortController;
+
+    // 3. Clear any existing poll interval
+    if (pollIntervalRef.current) {
+      clearInterval(pollIntervalRef.current);
+      pollIntervalRef.current = null;
+    }
+
     setLoading(true);
+    setViewState('loading');
+    setErrorDetails(null);
+
+    const periodString = s === e ? s : `${s} إلى ${e}`;
+
     try {
       const url = forceFetch
         ? `/api/reports/logs-fetch`
-        : `/api/reports/logs-intelligence?startDate=${s}&endDate=${e}&autoFetch=true`;
+        : `/api/reports/logs-intelligence?startDate=${encodeURIComponent(s)}&endDate=${encodeURIComponent(e)}&autoFetch=true`;
 
-      let res;
+      let res: Response;
       if (forceFetch) {
         res = await fetch(url, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ startDate: s, endDate: e, force: true }),
+          signal: abortController.signal,
         });
       } else {
-        res = await fetch(url);
+        res = await fetch(url, {
+          signal: abortController.signal,
+        });
       }
 
+      // Check if this request was superseded by a newer one
+      if (currentRequestId !== requestIdRef.current) {
+        return;
+      }
+
+      const rawText = await res.text();
       const ct = res.headers.get('content-type') || '';
-      if (!ct.includes('application/json')) {
-        const text = await res.text();
-        console.warn(`Non-JSON response fetching report (${res.status}):`, text.slice(0, 100));
+      const trimmedText = rawText.trim();
+      const isHtml =
+        trimmedText.startsWith('<!doctype') ||
+        trimmedText.startsWith('<!DOCTYPE') ||
+        trimmedText.startsWith('<html') ||
+        trimmedText.startsWith('<HTML') ||
+        (trimmedText.includes('<html') && trimmedText.includes('</html>'));
+
+      // If response is HTML or not JSON
+      if (isHtml || (!ct.includes('application/json') && !trimmedText.startsWith('{'))) {
+        setViewState('error');
+        setErrorDetails({
+          code: 'INVALID_RESPONSE_FORMAT',
+          message: 'الخادم أرجع استجابة غير متوقعة بدل بيانات التقرير',
+          category: 'INVALID_RESPONSE',
+          periodLabel: periodString,
+          startDate: s,
+          endDate: e,
+          retryable: true,
+        });
         setLoading(false);
         return;
       }
 
       let json: any = null;
       try {
-        json = await res.json();
+        json = JSON.parse(rawText);
       } catch (parseErr) {
-        console.warn('Failed to parse JSON for report:', parseErr);
+        setViewState('error');
+        setErrorDetails({
+          code: 'JSON_PARSE_ERROR',
+          message: 'الخادم أرجع استجابة غير قابلة للقراءة كبيانات تقرير صالحة',
+          category: 'INVALID_RESPONSE',
+          periodLabel: periodString,
+          startDate: s,
+          endDate: e,
+          retryable: true,
+        });
         setLoading(false);
         return;
       }
-      if (json.success && json.report) {
-        setReport(json.report);
+
+      // Handle non-OK HTTP status
+      if (!res.ok) {
+        let cat: ReportErrorDetails['category'] = 'SERVER_ERROR';
+        let fallbackMsg = 'حدث خطأ في معالجة بيانات التقرير في الخادم';
+        if (res.status === 400) {
+          cat = 'BAD_REQUEST';
+          fallbackMsg = 'معايير التاريخ أو المدخلات المحددة غير صالحة';
+        } else if (res.status === 404) {
+          cat = 'NOT_FOUND';
+          fallbackMsg = 'مسار التقرير المطلوب غير موجود في النظام';
+        }
+
+        setViewState('error');
+        setErrorDetails({
+          code: json?.error?.code || `HTTP_${res.status}`,
+          message: json?.error?.message || fallbackMsg,
+          category: cat,
+          periodLabel: periodString,
+          startDate: s,
+          endDate: e,
+          requestId: json?.error?.requestId,
+          retryable: json?.error?.retryable ?? (res.status >= 500),
+        });
+        setLoading(false);
+        return;
+      }
+
+      // Handle backend logical error (success: false)
+      if (!json.success) {
+        setViewState('error');
+        setErrorDetails({
+          code: json.error?.code || 'REPORT_LOAD_FAILED',
+          message: json.error?.message || 'تعذر تحميل التقرير للفترة المحددة',
+          category: json.error?.code === 'REPORT_ROUTE_NOT_FOUND' ? 'NOT_FOUND' : 'SERVER_ERROR',
+          periodLabel: periodString,
+          startDate: s,
+          endDate: e,
+          requestId: json.error?.requestId,
+          retryable: json.error?.retryable !== false,
+        });
+        setLoading(false);
+        return;
+      }
+
+      // Successful report received
+      if (json.report) {
+        const rep: LogsIntelligenceReport = json.report;
+        setReport(rep);
         setJobStatus(json.jobStatus || null);
 
-        // If job is running, start polling status
+        // Check if job is still in progress
         const isRunning =
           json.jobStatus &&
           (json.jobStatus.stage === 'CHECKING_STORAGE' ||
@@ -200,39 +325,152 @@ export const ReportsView: React.FC<ReportsViewProps> = ({ onSelectOrder }) => {
             json.jobStatus.stage === 'PREPARING_REPORT');
 
         if (isRunning) {
-          startPolling(s, e);
+          setViewState('loading');
+          startPolling(s, e, currentRequestId);
         } else {
           setLoading(false);
+          const totalLogs = rep.metrics?.totalLogs ?? 0;
+          const uniqueOrders = rep.metrics?.uniqueOrdersTouched ?? 0;
+          const hasData = totalLogs > 0 || uniqueOrders > 0;
+
+          if (!hasData) {
+            setViewState('empty');
+          } else if (rep.status === 'PARTIAL' || (rep.coverage && !rep.coverage.isFullyComplete)) {
+            setViewState('partial');
+          } else {
+            setViewState('success');
+          }
         }
       } else {
         setLoading(false);
+        setViewState('error');
+        setErrorDetails({
+          code: 'EMPTY_REPORT_PAYLOAD',
+          message: 'لم يتم العثور على حزمة بيانات التقرير في استجابة الخادم',
+          category: 'SERVER_ERROR',
+          periodLabel: periodString,
+          startDate: s,
+          endDate: e,
+          retryable: true,
+        });
       }
-    } catch (err) {
+    } catch (err: any) {
+      if (err.name === 'AbortError') {
+        // Request was aborted by a newer request, do nothing
+        return;
+      }
+      if (currentRequestId !== requestIdRef.current) {
+        return;
+      }
       console.error('Error fetching logs intelligence report:', err);
       setLoading(false);
+      setViewState('error');
+      setErrorDetails({
+        code: 'NETWORK_FETCH_FAILED',
+        message: 'تعذر الاتصال بالخادم، يرجى التحقق من اتصال الشبكة وإعادة المحاولة',
+        category: 'NETWORK',
+        periodLabel: periodString,
+        startDate: s,
+        endDate: e,
+        retryable: true,
+      });
     }
   }
 
-  function startPolling(s: string, e: string) {
+  function startPolling(s: string, e: string, parentRequestId: number) {
     if (pollIntervalRef.current) clearInterval(pollIntervalRef.current);
 
     pollIntervalRef.current = setInterval(async () => {
+      // Abort if another request started
+      if (parentRequestId !== requestIdRef.current) {
+        if (pollIntervalRef.current) clearInterval(pollIntervalRef.current);
+        return;
+      }
+
       try {
-        const res = await fetch(`/api/reports/logs-status?startDate=${s}&endDate=${e}`);
+        const res = await fetch(`/api/reports/logs-status?startDate=${encodeURIComponent(s)}&endDate=${encodeURIComponent(e)}`);
+        if (parentRequestId !== requestIdRef.current) return;
+
         const ct = res.headers.get('content-type') || '';
-        if (!ct.includes('application/json')) return;
-        const data = await res.json();
+        const rawText = await res.text();
+        const trimmed = rawText.trim();
+        const isHtml = trimmed.startsWith('<!doctype') || trimmed.startsWith('<html') || trimmed.includes('<html');
+
+        if (isHtml || (!ct.includes('application/json') && !trimmed.startsWith('{'))) {
+          clearInterval(pollIntervalRef.current);
+          setLoading(false);
+          setViewState('error');
+          setErrorDetails({
+            code: 'INVALID_RESPONSE_FORMAT',
+            message: 'الخادم أرجع استجابة غير متوقعة أثناء متابعة حالة التقرير',
+            category: 'INVALID_RESPONSE',
+            periodLabel: s === e ? s : `${s} إلى ${e}`,
+            startDate: s,
+            endDate: e,
+            retryable: true,
+          });
+          return;
+        }
+
+        let data: any = null;
+        try {
+          data = JSON.parse(rawText);
+        } catch {
+          return;
+        }
+
+        if (parentRequestId !== requestIdRef.current) return;
+
         if (data.success && data.job) {
           setJobStatus(data.job);
-          if (data.job.stage === 'COMPLETE' || data.job.stage === 'PARTIAL' || data.job.stage === 'FAILED') {
+          if (data.job.stage === 'FAILED') {
+            clearInterval(pollIntervalRef.current);
+            setLoading(false);
+            setViewState('error');
+            setErrorDetails({
+              code: 'LOG_JOB_FAILED',
+              message: data.job.error || 'تعذر إكمال عملية جلب وتحليل اللوجز بنجاح',
+              category: 'SERVER_ERROR',
+              periodLabel: s === e ? s : `${s} إلى ${e}`,
+              startDate: s,
+              endDate: e,
+              retryable: true,
+            });
+            return;
+          }
+
+          if (data.job.stage === 'COMPLETE' || data.job.stage === 'PARTIAL') {
             clearInterval(pollIntervalRef.current);
             // Refresh final report data
-            const repRes = await fetch(`/api/reports/logs-intelligence?startDate=${s}&endDate=${e}&autoFetch=false`);
+            const repRes = await fetch(`/api/reports/logs-intelligence?startDate=${encodeURIComponent(s)}&endDate=${encodeURIComponent(e)}&autoFetch=false`);
+            if (parentRequestId !== requestIdRef.current) return;
+
             const repCt = repRes.headers.get('content-type') || '';
-            if (repCt.includes('application/json')) {
-              const repData = await repRes.json();
-              if (repData.success && repData.report) {
-                setReport(repData.report);
+            const repText = await repRes.text();
+            if (repCt.includes('application/json') || repText.startsWith('{')) {
+              try {
+                const repData = JSON.parse(repText);
+                if (parentRequestId !== requestIdRef.current) return;
+
+                if (repData.success && repData.report) {
+                  const rep = repData.report;
+                  setReport(rep);
+                  setLoading(false);
+                  const totalLogs = rep.metrics?.totalLogs ?? 0;
+                  const uniqueOrders = rep.metrics?.uniqueOrdersTouched ?? 0;
+                  const hasData = totalLogs > 0 || uniqueOrders > 0;
+
+                  if (!hasData) {
+                    setViewState('empty');
+                  } else if (rep.status === 'PARTIAL' || (rep.coverage && !rep.coverage.isFullyComplete)) {
+                    setViewState('partial');
+                  } else {
+                    setViewState('success');
+                  }
+                  return;
+                }
+              } catch {
+                // fall through
               }
             }
             setLoading(false);
@@ -240,6 +478,20 @@ export const ReportsView: React.FC<ReportsViewProps> = ({ onSelectOrder }) => {
         }
       } catch (pollErr) {
         console.error('Error polling logs status:', pollErr);
+        if (parentRequestId === requestIdRef.current) {
+          clearInterval(pollIntervalRef.current);
+          setLoading(false);
+          setViewState('error');
+          setErrorDetails({
+            code: 'POLLING_FAILED',
+            message: 'تعذر الاتصال بالخادم أثناء متابعة فحص اللوجز',
+            category: 'NETWORK',
+            periodLabel: s === e ? s : `${s} إلى ${e}`,
+            startDate: s,
+            endDate: e,
+            retryable: true,
+          });
+        }
       }
     }, 1500);
   }
@@ -759,9 +1011,172 @@ export const ReportsView: React.FC<ReportsViewProps> = ({ onSelectOrder }) => {
         </div>
       )}
 
+      {/* 2.5 ERROR STATE: Clear, unambiguous failure and recovery path */}
+      {viewState === 'error' && !isFetchingLogs && (
+        <div className="bg-rose-950/20 border-2 border-rose-500/40 rounded-3xl p-6 lg:p-8 shadow-2xl backdrop-blur-md animate-in fade-in zoom-in-95 duration-300">
+          <div className="flex flex-col md:flex-row items-start md:items-center justify-between gap-6 pb-6 border-b border-rose-500/20">
+            <div className="flex items-start gap-4">
+              <div className="p-3.5 rounded-2xl bg-rose-500/20 text-rose-400 border border-rose-500/30 shadow-inner shrink-0">
+                <AlertCircle className="w-8 h-8" />
+              </div>
+              <div className="space-y-1.5">
+                <div className="flex flex-wrap items-center gap-2.5">
+                  <h2 className="text-xl font-bold text-rose-200">
+                    تعذر تحميل التقرير
+                  </h2>
+                  <span className="px-3 py-1 rounded-full text-xs font-semibold bg-rose-500/20 text-rose-300 border border-rose-500/30">
+                    {errorDetails?.category === 'NETWORK'
+                      ? 'مشكلة في اتصال الشبكة'
+                      : errorDetails?.category === 'INVALID_RESPONSE'
+                      ? 'استجابة غير متوقعة من الخادم'
+                      : errorDetails?.category === 'BAD_REQUEST'
+                      ? 'معايير تاريخ غير صالحة'
+                      : errorDetails?.category === 'NOT_FOUND'
+                      ? 'مسار التقرير غير موجود'
+                      : 'فشل في معالجة التقرير'}
+                  </span>
+                </div>
+                <p className="text-sm text-rose-300/90 font-sans leading-relaxed">
+                  لم نتمكن من جلب بيانات التقرير للفترة المحددة. بيانات التقرير لم يتم التحقق من تحميلها بنجاح.
+                </p>
+              </div>
+            </div>
+
+            {/* Action buttons: Retry and Force Fetch */}
+            <div className="flex flex-wrap items-center gap-3 w-full md:w-auto">
+              <button
+                onClick={() => fetchReport(effectiveStart, effectiveEnd, false)}
+                disabled={loading}
+                className="flex-1 md:flex-none flex items-center justify-center gap-2 px-5 py-3 rounded-xl bg-rose-600 hover:bg-rose-500 text-white font-bold text-sm shadow-lg shadow-rose-950/50 transition disabled:opacity-50"
+              >
+                <RefreshCw className={`w-4 h-4 ${loading ? 'animate-spin' : ''}`} />
+                <span>إعادة المحاولة</span>
+              </button>
+              <button
+                onClick={() => fetchReport(effectiveStart, effectiveEnd, true)}
+                disabled={loading}
+                className="flex-1 md:flex-none flex items-center justify-center gap-2 px-4 py-3 rounded-xl bg-slate-800 hover:bg-slate-700 text-slate-200 border border-slate-700 font-semibold text-xs transition disabled:opacity-50"
+              >
+                <span>فحص وسحب مباشر من Vendoor</span>
+              </button>
+            </div>
+          </div>
+
+          {/* Diagnostic Details Grid */}
+          <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-3.5 mt-6 text-xs">
+            <div className="bg-slate-900/80 p-3.5 rounded-xl border border-rose-500/20">
+              <span className="text-slate-400 block mb-1">الفترة المستهدفة:</span>
+              <span className="font-mono font-bold text-slate-200">
+                {errorDetails?.periodLabel || `${effectiveStart} إلى ${effectiveEnd}`}
+              </span>
+            </div>
+
+            <div className="bg-slate-900/80 p-3.5 rounded-xl border border-rose-500/20 sm:col-span-2">
+              <span className="text-slate-400 block mb-1">سبب تعذر الجلب:</span>
+              <span className="font-sans font-semibold text-rose-300">
+                {errorDetails?.message || 'تعذر تحميل بيانات التقرير'}
+              </span>
+            </div>
+
+            <div className="bg-slate-900/80 p-3.5 rounded-xl border border-rose-500/20">
+              <span className="text-slate-400 block mb-1">كود التشخيص / المعرف:</span>
+              <span className="font-mono text-slate-300">
+                {errorDetails?.code || 'UNKNOWN_ERROR'}
+                {errorDetails?.requestId ? ` • #${errorDetails.requestId.slice(0, 8)}` : ''}
+              </span>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* 2.6 EMPTY STATE: Valid response with 0 matching logs */}
+      {viewState === 'empty' && !isFetchingLogs && (
+        <div className="bg-slate-900 border border-slate-800 rounded-3xl p-8 lg:p-12 shadow-xl text-center max-w-2xl mx-auto space-y-4 animate-in fade-in duration-300">
+          <div className="w-16 h-16 rounded-2xl bg-amber-500/10 text-amber-400 border border-amber-500/20 flex items-center justify-center mx-auto">
+            <Calendar className="w-8 h-8" />
+          </div>
+          <div className="space-y-2">
+            <h2 className="text-lg font-bold text-slate-100">
+              لا توجد حركات مسجلة للفترة المحددة
+            </h2>
+            <p className="text-xs text-slate-400 max-w-md mx-auto leading-relaxed">
+              تم فحص قاعدة البيانات بنجاح للفترة{' '}
+              <span className="text-amber-400 font-mono font-bold">
+                {report?.periodLabel || `${effectiveStart} إلى ${effectiveEnd}`}
+              </span>
+              ، ولكن لم يتم تسجيل أي أحداث أو حركات في هذا النطاق الزمني.
+            </p>
+          </div>
+
+          <div className="pt-3 flex flex-wrap items-center justify-center gap-3">
+            <button
+              onClick={() => fetchReport(effectiveStart, effectiveEnd, true)}
+              disabled={loading}
+              className="flex items-center gap-2 px-4 py-2.5 rounded-xl bg-amber-500 text-slate-950 font-bold text-xs shadow hover:bg-amber-400 transition"
+            >
+              <RefreshCw className="w-4 h-4" />
+              <span>فحص وجلب من Vendoor مباشرة</span>
+            </button>
+            <button
+              onClick={handlePresetToday}
+              className="px-4 py-2.5 rounded-xl bg-slate-800 hover:bg-slate-700 text-slate-200 border border-slate-700 font-medium text-xs transition"
+            >
+              عرض تقرير اليوم الحالي
+            </button>
+            <button
+              onClick={() => setShowImportModal(true)}
+              className="px-4 py-2.5 rounded-xl bg-purple-500/10 hover:bg-purple-500/20 text-purple-300 border border-purple-500/30 font-medium text-xs transition"
+            >
+              استيراد لوجز (Excel / CSV)
+            </button>
+          </div>
+        </div>
+      )}
+
+      {/* 2.7 PARTIAL COVERAGE ALERT: Visible warning when report coverage is incomplete */}
+      {viewState === 'partial' && report && (
+        <div className="bg-amber-950/20 border-2 border-amber-500/40 rounded-2xl p-4 lg:p-5 shadow-lg flex flex-col md:flex-row items-start md:items-center justify-between gap-4 animate-in fade-in duration-300">
+          <div className="flex items-start gap-3">
+            <div className="p-2.5 rounded-xl bg-amber-500/20 text-amber-400 border border-amber-500/30 shrink-0">
+              <AlertTriangle className="w-6 h-6" />
+            </div>
+            <div>
+              <div className="flex items-center gap-2">
+                <h3 className="text-sm font-bold text-amber-200">
+                  تنبيه: بيانات التقرير ذات تغطية جزئية
+                </h3>
+                <span className="px-2.5 py-0.5 rounded-full text-[11px] font-sans font-bold bg-amber-500/20 text-amber-300 border border-amber-500/30">
+                  {report.coverage.completeDays} من {report.coverage.totalDays} يوم
+                </span>
+              </div>
+              <p className="text-xs text-amber-300/80 mt-1 font-sans">
+                الأرقام والمؤشرات المعروضة أدناه تغطي الأيام المتوفرة فقط.
+                {report.coverage.missingDays > 0 && (
+                  <span className="block mt-1 text-[11px] text-amber-400 font-mono">
+                    عدد الأيام الناقصة أو غير المكتملة: {report.coverage.missingDays} يوم
+                  </span>
+                )}
+              </p>
+            </div>
+          </div>
+
+          <div className="flex items-center gap-2 w-full md:w-auto">
+            <button
+              onClick={() => fetchReport(effectiveStart, effectiveEnd, true)}
+              disabled={loading}
+              className="flex-1 md:flex-none flex items-center justify-center gap-1.5 px-4 py-2 rounded-xl bg-amber-500 hover:bg-amber-400 text-slate-950 font-bold text-xs shadow transition disabled:opacity-50"
+            >
+              <RefreshCw className={`w-3.5 h-3.5 ${loading ? 'animate-spin' : ''}`} />
+              <span>استكمال الأيام الناقصة من Vendoor</span>
+            </button>
+          </div>
+        </div>
+      )}
+
       {/* 3. EXECUTIVE QUESTIONS & ANSWERS KPI CARDS (CLICKABLE FOR DRILLDOWN) */}
-      {report && (
-        <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-5 gap-4">
+      {(viewState === 'success' || viewState === 'partial') && report && (
+        <>
+          <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-5 gap-4">
           {/* Card 1: What happened? Total Logs & Unique Orders Touched */}
           <div
             onClick={() => setDrilldownPillar('all')}
@@ -894,9 +1309,8 @@ export const ReportsView: React.FC<ReportsViewProps> = ({ onSelectOrder }) => {
             </div>
           </div>
         </div>
-      )}
 
-      {/* 4. Navigation Tabs */}
+        {/* 4. Navigation Tabs */}
       <div className="border-b border-slate-800 flex items-center gap-2 overflow-x-auto text-xs font-sans">
         <button
           onClick={() => setActiveTab('overview')}
@@ -974,8 +1388,7 @@ export const ReportsView: React.FC<ReportsViewProps> = ({ onSelectOrder }) => {
       </div>
 
       {/* 5. Tab Content */}
-      {report && (
-        <div>
+      <div className="mt-4">
           {/* Tab 1: Overview */}
           {activeTab === 'overview' && (
             <div className="space-y-6">
@@ -1552,7 +1965,8 @@ export const ReportsView: React.FC<ReportsViewProps> = ({ onSelectOrder }) => {
             </div>
           )}
         </div>
-      )}
+      </>
+    )}
 
       {/* 6. Drilldown Modal */}
       <ReportKpiDrilldownModal

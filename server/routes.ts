@@ -1242,6 +1242,13 @@ apiRouter.post('/alerts/:id/resolve', (req: Request, res: Response) => {
 });
 
 // 10b. Logs-Only Intelligence Report (Single Day, Week, or Custom Period)
+function isValidReportDateString(d: string): boolean {
+  if (!d || !/^\d{4}-\d{2}-\d{2}$/.test(d)) return false;
+  const parsed = Date.parse(`${d}T00:00:00Z`);
+  return !isNaN(parsed);
+}
+
+// 10. Intelligent Activity Reports & Log Analytics
 apiRouter.get('/reports/logs-intelligence', async (req: Request, res: Response) => {
   try {
     const { startDate, endDate, period, autoFetch = 'true' } = req.query;
@@ -1271,6 +1278,43 @@ apiRouter.get('/reports/logs-intelligence', async (req: Request, res: Response) 
     if (!sDate) sDate = getCairoDateString();
     if (!eDate) eDate = sDate;
 
+    // Validate date format strictly
+    if (!isValidReportDateString(sDate)) {
+      return res.status(400).json({
+        success: false,
+        error: {
+          code: 'INVALID_START_DATE',
+          message: `تاريخ البداية '${sDate}' غير صالح. يجب استخدام صيغة YYYY-MM-DD`,
+          retryable: false,
+          requestId: crypto.randomUUID(),
+        },
+      });
+    }
+
+    if (!isValidReportDateString(eDate)) {
+      return res.status(400).json({
+        success: false,
+        error: {
+          code: 'INVALID_END_DATE',
+          message: `تاريخ النهاية '${eDate}' غير صالح. يجب استخدام صيغة YYYY-MM-DD`,
+          retryable: false,
+          requestId: crypto.randomUUID(),
+        },
+      });
+    }
+
+    if (sDate > eDate) {
+      return res.status(400).json({
+        success: false,
+        error: {
+          code: 'INVALID_DATE_RANGE',
+          message: `تاريخ بداية التقرير (${sDate}) لا يمكن أن يكون بعد تاريخ نهايته (${eDate})`,
+          retryable: false,
+          requestId: crypto.randomUUID(),
+        },
+      });
+    }
+
     // Check if autoFetch is requested and if coverage is missing
     const jobKey = `${sDate}_${eDate}`;
     let jobStatus = getRangeJobStatus(sDate, eDate);
@@ -1298,7 +1342,17 @@ apiRouter.get('/reports/logs-intelligence', async (req: Request, res: Response) 
 
     res.json({ success: true, report, jobStatus });
   } catch (err: any) {
-    res.status(500).json({ error: err.message });
+    const requestId = crypto.randomUUID();
+    console.error(`[LogsIntelligence API Error] [${requestId}]:`, err);
+    res.status(500).json({
+      success: false,
+      error: {
+        code: 'REPORT_GENERATION_FAILED',
+        message: 'تعذر إنشاء تقرير اللوجز الذكي بسبب خطأ داخلي في الخادم',
+        retryable: true,
+        requestId,
+      },
+    });
   }
 });
 
@@ -1308,10 +1362,33 @@ apiRouter.get('/reports/logs-status', (req: Request, res: Response) => {
     const { startDate, endDate } = req.query;
     const sDate = ((startDate as string) || getCairoDateString()).slice(0, 10);
     const eDate = ((endDate as string) || sDate).slice(0, 10);
+
+    if (!isValidReportDateString(sDate) || !isValidReportDateString(eDate)) {
+      return res.status(400).json({
+        success: false,
+        error: {
+          code: 'INVALID_DATE_INPUT',
+          message: 'التاريخ المدخل لحالة التقرير غير صالح',
+          retryable: false,
+          requestId: crypto.randomUUID(),
+        },
+      });
+    }
+
     const job = getRangeJobStatus(sDate, eDate);
     res.json({ success: true, job });
   } catch (err: any) {
-    res.status(500).json({ error: err.message });
+    const requestId = crypto.randomUUID();
+    console.error(`[LogsStatus API Error] [${requestId}]:`, err);
+    res.status(500).json({
+      success: false,
+      error: {
+        code: 'REPORT_STATUS_ERROR',
+        message: 'تعذر التحقق من حالة جلب التقرير',
+        retryable: true,
+        requestId,
+      },
+    });
   }
 });
 
@@ -1321,11 +1398,34 @@ apiRouter.post('/reports/logs-fetch', async (req: Request, res: Response) => {
     const { startDate, endDate, force } = req.body;
     const sDate = ((startDate as string) || getCairoDateString()).slice(0, 10);
     const eDate = ((endDate as string) || sDate).slice(0, 10);
+
+    if (!isValidReportDateString(sDate) || !isValidReportDateString(eDate)) {
+      return res.status(400).json({
+        success: false,
+        error: {
+          code: 'INVALID_DATE_INPUT',
+          message: 'التاريخ المدخل لإعادة الجلب غير صالح',
+          retryable: false,
+          requestId: crypto.randomUUID(),
+        },
+      });
+    }
+
     const job = await ensureCoverageForRange(sDate, eDate, undefined, Boolean(force ?? true));
     const report = generateLogsIntelligenceReport(sDate, eDate);
     res.json({ success: true, job, report });
   } catch (err: any) {
-    res.status(500).json({ error: err.message });
+    const requestId = crypto.randomUUID();
+    console.error(`[LogsFetch API Error] [${requestId}]:`, err);
+    res.status(500).json({
+      success: false,
+      error: {
+        code: 'REPORT_FETCH_FAILED',
+        message: 'تعذر جلب لوجز الفترة من المصدر',
+        retryable: true,
+        requestId,
+      },
+    });
   }
 });
 
@@ -1334,10 +1434,33 @@ apiRouter.get('/reports/day-status', async (req: Request, res: Response) => {
   try {
     const rawDate = typeof req.query.date === 'string' ? req.query.date.trim().slice(0, 10) : '';
     const targetDate = rawDate || getCairoDateString();
+
+    if (!isValidReportDateString(targetDate)) {
+      return res.status(400).json({
+        success: false,
+        error: {
+          code: 'INVALID_DATE_INPUT',
+          message: 'تاريخ فحص اليوم غير صالح',
+          retryable: false,
+          requestId: crypto.randomUUID(),
+        },
+      });
+    }
+
     const result = await resolveHistoricalDay(targetDate, { autoFetchMissing: false });
     res.json({ success: true, dayStatus: result });
   } catch (err: any) {
-    res.status(500).json({ success: false, error: err.message });
+    const requestId = crypto.randomUUID();
+    console.error(`[DayStatus API Error] [${requestId}]:`, err);
+    res.status(500).json({
+      success: false,
+      error: {
+        code: 'DAY_STATUS_ERROR',
+        message: 'تعذر فحص حالة اليوم التاريخي',
+        retryable: true,
+        requestId,
+      },
+    });
   }
 });
 
@@ -1346,8 +1469,15 @@ apiRouter.post('/reports/day-action', async (req: Request, res: Response) => {
   try {
     const { date, action } = req.body;
     if (!date) {
-      res.status(400).json({ success: false, error: 'date is required' });
-      return;
+      return res.status(400).json({
+        success: false,
+        error: {
+          code: 'MISSING_DATE',
+          message: 'حقل التاريخ (date) مطلوب لتنفيذ إجراء اليوم',
+          retryable: false,
+          requestId: crypto.randomUUID(),
+        },
+      });
     }
     const cleanDate = String(date).slice(0, 10);
 

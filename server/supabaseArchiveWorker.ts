@@ -362,7 +362,7 @@ export async function triggerArchivePass(): Promise<{
       }
     }
 
-    const rawLogsRemaining = (db.prepare('SELECT count(*) as c FROM raw_activity_events WHERE id > ?').get(currentRawCheckpointId) as any)?.c || 0;
+    const rawLogsRemaining = (db.prepare("SELECT count(*) as c FROM raw_activity_events WHERE id > ? AND event_timestamp >= '2026-10-23 00:00:00'").get(currentRawCheckpointId) as any)?.c || 0;
     status.rawLogsArchivedThisPass = rawLogsArchived;
     status.rawLogsRemaining = rawLogsRemaining;
 

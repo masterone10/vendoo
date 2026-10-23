@@ -35,19 +35,43 @@ app.use(express.urlencoded({ extended: true, limit: '50mb' }));
 // Initialize SQLite database
 initDatabase();
 
+// Support /reports and /reports/* directly if requested without /api prefix
+app.use('/reports', (req, res, next) => {
+  req.url = '/reports' + req.url;
+  apiRouter(req, res, next);
+});
+
 // Mount API routes
 app.use('/api', apiRouter);
 
-// Prevent unmatched /api routes from falling through to Vite HTML
-app.use('/api', (_req, res) => {
-  res.status(404).json({ success: false, error: 'API route not found' });
+// Prevent unmatched /api and /reports routes from falling through to Vite HTML
+app.use(['/api', '/reports'], (req, res) => {
+  const requestId = crypto.randomUUID();
+  res.status(404).json({
+    success: false,
+    error: {
+      code: 'REPORT_ROUTE_NOT_FOUND',
+      message: `مسار التقرير المطلوب '${req.originalUrl}' غير موجود (404)`,
+      retryable: false,
+      requestId,
+    },
+  });
 });
 
-// Global API error handler ensuring any exception returns JSON instead of Express HTML
+// Global API error handler ensuring any exception returns standardized JSON instead of Express HTML
 app.use((err: any, _req: express.Request, res: express.Response, _next: express.NextFunction) => {
-  console.error('[API Unhandled Error]', err);
+  const requestId = crypto.randomUUID();
+  console.error(`[API Unhandled Error] [${requestId}]:`, err);
   if (!res.headersSent) {
-    res.status(500).json({ success: false, error: err?.message || 'Internal server error' });
+    res.status(500).json({
+      success: false,
+      error: {
+        code: 'REPORT_INTERNAL_ERROR',
+        message: 'حدث خطأ داخلي في الخادم أثناء إنشاء بيانات التقرير',
+        retryable: true,
+        requestId,
+      },
+    });
   }
 });
 
@@ -55,12 +79,12 @@ async function startServer() {
   const isProduction = process.env.NODE_ENV === 'production';
 
   if (!isProduction) {
-    // Vite Dev Server middleware
+    // Vite Dev Server middleware with HMR disabled to avoid WebSocket closed errors in AI Studio iframe
     const { createServer } = await import('vite');
     const vite = await createServer({
       server: {
         middlewareMode: true,
-        hmr: process.env.DISABLE_HMR === 'true' ? false : undefined,
+        hmr: false,
       },
       appType: 'spa',
     });

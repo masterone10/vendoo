@@ -33,9 +33,10 @@ async function runCleanup() {
         DELETE FROM backup_20261021_canonical_activity_events
         WHERE ctid IN (SELECT ctid FROM to_del)
       `);
-      if (res.rowCount === 0) break;
-      bCanonDeletedTotal += res.rowCount;
-      console.log(`  backup_20261021_canonical_activity_events: deleted ${res.rowCount} rows (total: ${bCanonDeletedTotal.toLocaleString()})...`);
+      const count = res.rowCount || 0;
+      if (count === 0) break;
+      bCanonDeletedTotal += count;
+      console.log(`  backup_20261021_canonical_activity_events: deleted ${count} rows (total: ${bCanonDeletedTotal.toLocaleString()})...`);
     }
     console.log(`  ✅ Finished backup_20261021_canonical_activity_events: ${bCanonDeletedTotal.toLocaleString()} rows deleted.`);
   } catch (e: any) {
@@ -53,9 +54,10 @@ async function runCleanup() {
         DELETE FROM backup_20261021_raw_activity_events
         WHERE ctid IN (SELECT ctid FROM to_del)
       `);
-      if (res.rowCount === 0) break;
-      bRawDeletedTotal += res.rowCount;
-      console.log(`  backup_20261021_raw_activity_events: deleted ${res.rowCount} rows (total: ${bRawDeletedTotal.toLocaleString()})...`);
+      const count = res.rowCount || 0;
+      if (count === 0) break;
+      bRawDeletedTotal += count;
+      console.log(`  backup_20261021_raw_activity_events: deleted ${count} rows (total: ${bRawDeletedTotal.toLocaleString()})...`);
     }
     console.log(`  ✅ Finished backup_20261021_raw_activity_events: ${bRawDeletedTotal.toLocaleString()} rows deleted.`);
   } catch (e: any) {
@@ -75,9 +77,10 @@ async function runCleanup() {
       DELETE FROM canonical_activity_events
       WHERE id IN (SELECT id FROM to_del)
     `);
-    if (res.rowCount === 0) break;
-    canonDeletedTotal += res.rowCount;
-    console.log(`  canonical_activity_events: deleted ${res.rowCount} rows (total: ${canonDeletedTotal.toLocaleString()})...`);
+    const cCount = res.rowCount || 0;
+    if (cCount === 0) break;
+    canonDeletedTotal += cCount;
+    console.log(`  canonical_activity_events: deleted ${cCount} rows (total: ${canonDeletedTotal.toLocaleString()})...`);
   }
   console.log(`  ✅ Finished canonical_activity_events: ${canonDeletedTotal.toLocaleString()} rows deleted.`);
 
@@ -94,9 +97,10 @@ async function runCleanup() {
       DELETE FROM raw_activity_events
       WHERE id IN (SELECT id FROM to_del)
     `);
-    if (res.rowCount === 0) break;
-    rawDeletedTotal += res.rowCount;
-    console.log(`  raw_activity_events: deleted ${res.rowCount} rows (total: ${rawDeletedTotal.toLocaleString()})...`);
+    const rCount = res.rowCount || 0;
+    if (rCount === 0) break;
+    rawDeletedTotal += rCount;
+    console.log(`  raw_activity_events: deleted ${rCount} rows (total: ${rawDeletedTotal.toLocaleString()})...`);
   }
   console.log(`  ✅ Finished raw_activity_events: ${rawDeletedTotal.toLocaleString()} rows deleted.`);
 

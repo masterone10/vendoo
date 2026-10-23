@@ -578,18 +578,9 @@ class VendoorClient {
     const rows: ConfirmationRow[] = [];
 
     // Parse table rows
-    const trRegex = /<tr[^>]*>([\s\S]*?)<\/tr>/gi;
-    let match;
-    let isFirstRow = true;
-
-    while ((match = trRegex.exec(html)) !== null) {
-      const rowContent = match[1];
-      if (isFirstRow) {
-        // Skip table header
-        isFirstRow = false;
-        continue;
-      }
-
+    const trMatches = [...html.matchAll(/<tr[^>]*>([\s\S]*?)<\/tr>/gi)];
+    for (let i = 1; i < trMatches.length; i++) {
+      const rowContent = trMatches[i][1];
       const tdMatches = [...rowContent.matchAll(/<td[^>]*>([\s\S]*?)<\/td>/gi)].map(m =>
         m[1].replace(/<[^>]+>/g, '').trim()
       );
@@ -642,16 +633,10 @@ class VendoorClient {
     const entries: LogEntry[] = [];
 
     // Parse log table rows
-    const trRegex = /<tr>([\s\S]*?)<\/tr>/gi;
-    let match;
-    let isHeader = true;
-
-    while ((match = trRegex.exec(html)) !== null) {
-      const content = match[1];
-      if (isHeader) {
-        isHeader = false;
-        continue;
-      }
+    const logTrMatches = [...html.matchAll(/<tr>([\s\S]*?)<\/tr>/gi)];
+    for (let i = 1; i < logTrMatches.length; i++) {
+      const rowMatch = logTrMatches[i];
+      const content = rowMatch[1];
 
       const rawTds = [...content.matchAll(/<td[^>]*>([\s\S]*?)<\/td>/gi)];
       const tds = rawTds.map(m => m[1].replace(/<[^>]+>/g, '').trim());
@@ -670,7 +655,7 @@ class VendoorClient {
           eventTimestamp: tds[4],
           vendoorOrderId: extractedOrderId,
           orderHref: orderHrefMatch ? orderHrefMatch[1] : null,
-          rawHtml: match[0],
+          rawHtml: rowMatch[0],
         });
       }
     }
