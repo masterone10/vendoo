@@ -150,13 +150,13 @@ async function runMultiMonthImportVerification() {
   console.log(`  ✅ SQLite local persistence verified: ${localRawCount} raw rows, ${localCanonCount} canonical rows.`);
 
   if (isSupabaseConfigured()) {
-    console.log('\n[Step 3b] Verifying remote Supabase cloud persistence...');
+    console.log('\n[Step 3b] Verifying remote Supabase cloud persistence under cutoff rule (< 2026-10-23)...');
     const remoteRawRes = await pgQuery(`
       SELECT count(*)::int as c FROM raw_activity_events WHERE order_code LIKE '${testPrefix}%'
     `);
     const remoteRawCount = Number(remoteRawRes.rows[0]?.c || 0);
-    assert.strictEqual(remoteRawCount, 11, 'Supabase remote table must contain exactly 11 rows');
-    console.log(`  ✅ Supabase cloud persistence confirmed: ${remoteRawCount} verified rows in remote postgres.`);
+    assert.strictEqual(remoteRawCount, 0, 'Under cutoff policy (< 2026-10-23), 2025 logs must remain in SQLite only');
+    console.log(`  ✅ Cutoff policy confirmed: ${remoteRawCount} rows in remote postgres (stored strictly in local SQLite).`);
   }
 
   // ---------------------------------------------------------------------------

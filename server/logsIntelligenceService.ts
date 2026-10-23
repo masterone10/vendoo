@@ -241,93 +241,95 @@ export async function ensureCoverageForRange(
         `).get(interval.startCairo, interval.endCairo) as any)
       );
 
-      const canResume = Boolean(
-        !forceRefetch &&
-        hasLocalRaw &&
-        existingCov &&
-        existingCov.data_source === 'VENDOOR_FETCH' &&
-        existingCov.pages_read > 0 &&
-        existingCov.pages_discovered > existingCov.pages_read
-      );
+      // 1. PRIMARY FAST-PATH: Direct native single-day Excel export from Vendoor
+      // Sets start_date = date and end_date = date to download complete day movements in one pass
+      try {
+        job.stage = 'FETCHING_VENDOOR';
+        job.stageLabelAr = `جاري تصدير شيت إكسيل اليوم (${date}) من Vendoor...`;
+        onProgress?.(job);
 
-      if (canResume) {
-        try {
-          const fromPage = existingCov.pages_read + 1;
-          let toPage = existingCov.pages_discovered;
-          let allResumeSucceeded = true;
-
-          for (let p = fromPage; p <= toPage; p++) {
-            let pageFetched = false;
-            for (let attempt = 1; attempt <= 3; attempt++) {
-              try {
-                if (attempt === 1) await new Promise(r => setTimeout(r, 50));
-                job.stage = 'FETCHING_VENDOOR';
-                job.stageLabelAr = `جاري استكمال صفحة ${p} من ${toPage} لليوم (${date})${attempt > 1 ? ` (محاولة ${attempt}/3)` : ''}`;
-                onProgress?.(job);
-
-                const nextP = await vendoorClient.fetchSystemLogs(p, date, date);
-                if (nextP.totalPages > toPage) {
-                  toPage = nextP.totalPages;
-                }
-                const nextRes = persistLogEntries(nextP.entries, interval);
-                dayEventsSaved += nextRes.saved;
-                totalSaved += nextRes.saved;
-                job.eventsSaved = totalSaved;
-                pageFetched = true;
-                break;
-              } catch {
-                if (attempt < 3) await new Promise(r => setTimeout(r, 600 * attempt));
-              }
-            }
-            if (!pageFetched) {
-              allResumeSucceeded = false;
-              break;
-            }
-          }
-
-          if (allResumeSucceeded) {
-            dayPagesTotal = toPage;
-            dayPagesFetched = toPage;
-            totalPagesDiscovered += (toPage - existingCov.pages_read);
-            totalPagesRead += (toPage - existingCov.pages_read);
+        const excelBuf = await vendoorClient.exportSystemLogsExcel(date, date);
+        if (excelBuf && excelBuf.length > 200) {
+          const importRes = await importBatchLogFiles([
+            { fileName: `vendoor_logs_${date}.xlsx`, buffer: excelBuf },
+          ]);
+          if (importRes.success && importRes.totalSaved >= 0) {
+            dayEventsSaved = importRes.totalSaved;
+            totalSaved += importRes.totalSaved;
+            job.eventsSaved = totalSaved;
+            dayPagesTotal = 1;
+            dayPagesFetched = 1;
+            totalPagesDiscovered += 1;
+            totalPagesRead += 1;
             job.pagesTotal = Math.max(job.pagesTotal, totalPagesDiscovered);
             job.pagesFetched = totalPagesRead;
             bulkLoaded = true;
             dayStatus = 'COMPLETE';
           }
-        } catch {
-          bulkLoaded = false;
         }
+      } catch (excelErr: any) {
+        console.warn(`[LogsIntelligence] Direct single-day Excel export for ${date} skipped/failed: ${excelErr.message}, falling back to pagination...`);
+        bulkLoaded = false;
       }
 
       if (!bulkLoaded) {
-        try {
-          job.stage = 'FETCHING_VENDOOR';
-          job.stageLabelAr = `جاري استخراج لوجز ${date} عبر تصدير Vendoor السريع`;
-          onProgress?.(job);
+        const canResume = Boolean(
+          !forceRefetch &&
+          hasLocalRaw &&
+          existingCov &&
+          existingCov.data_source === 'VENDOOR_FETCH' &&
+          existingCov.pages_read > 0 &&
+          existingCov.pages_discovered > existingCov.pages_read
+        );
 
-          const excelBuf = await vendoorClient.exportSystemLogsExcel(date, date);
-          if (excelBuf && excelBuf.length > 500) {
-            const importRes = await importBatchLogFiles([
-              { fileName: `vendoor_logs_${date}.xlsx`, buffer: excelBuf },
-            ]);
-            if (importRes.success && importRes.totalSaved >= 0) {
-              dayEventsSaved = importRes.totalSaved;
-              totalSaved += importRes.totalSaved;
-              job.eventsSaved = totalSaved;
-              dayPagesTotal = 1;
-              dayPagesFetched = 1;
-              totalPagesDiscovered += 1;
-              totalPagesRead += 1;
+        if (canResume) {
+          try {
+            const fromPage = existingCov.pages_read + 1;
+            let toPage = existingCov.pages_discovered;
+            let allResumeSucceeded = true;
+
+            for (let p = fromPage; p <= toPage; p++) {
+              let pageFetched = false;
+              for (let attempt = 1; attempt <= 3; attempt++) {
+                try {
+                  if (attempt === 1) await new Promise(r => setTimeout(r, 50));
+                  job.stage = 'FETCHING_VENDOOR';
+                  job.stageLabelAr = `جاري استكمال صفحة ${p} من ${toPage} لليوم (${date})${attempt > 1 ? ` (محاولة ${attempt}/3)` : ''}`;
+                  onProgress?.(job);
+
+                  const nextP = await vendoorClient.fetchSystemLogs(p, date, date);
+                  if (nextP.totalPages > toPage) {
+                    toPage = nextP.totalPages;
+                  }
+                  const nextRes = persistLogEntries(nextP.entries, interval);
+                  dayEventsSaved += nextRes.saved;
+                  totalSaved += nextRes.saved;
+                  job.eventsSaved = totalSaved;
+                  pageFetched = true;
+                  break;
+                } catch {
+                  if (attempt < 3) await new Promise(r => setTimeout(r, 600 * attempt));
+                }
+              }
+              if (!pageFetched) {
+                allResumeSucceeded = false;
+                break;
+              }
+            }
+
+            if (allResumeSucceeded) {
+              dayPagesTotal = toPage;
+              dayPagesFetched = toPage;
+              totalPagesDiscovered += (toPage - existingCov.pages_read);
+              totalPagesRead += (toPage - existingCov.pages_read);
               job.pagesTotal = Math.max(job.pagesTotal, totalPagesDiscovered);
               job.pagesFetched = totalPagesRead;
               bulkLoaded = true;
               dayStatus = 'COMPLETE';
             }
+          } catch {
+            bulkLoaded = false;
           }
-        } catch {
-          // Fall back gracefully to paginated fetch
-          bulkLoaded = false;
         }
       }
 

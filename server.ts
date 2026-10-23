@@ -35,23 +35,40 @@ app.use(express.urlencoded({ extended: true, limit: '50mb' }));
 // Initialize SQLite database
 initDatabase();
 
-// Support /reports and /reports/* directly if requested without /api prefix
-app.use('/reports', (req, res, next) => {
-  req.url = '/reports' + req.url;
-  apiRouter(req, res, next);
-});
+const API_NAMESPACES = [
+  '/reports',
+  '/dashboard',
+  '/orders',
+  '/logs',
+  '/sync',
+  '/supabase',
+  '/historical',
+  '/alerts',
+  '/merchants',
+  '/comparison',
+  '/team',
+  '/risk',
+];
 
-// Mount API routes
+// Mount API routes at /api
 app.use('/api', apiRouter);
 
-// Prevent unmatched /api and /reports routes from falling through to Vite HTML
-app.use(['/api', '/reports'], (req, res) => {
+// Support direct calls to API namespaces without /api prefix
+API_NAMESPACES.forEach((prefix) => {
+  app.use(prefix, (req, res, next) => {
+    req.url = prefix + req.url;
+    apiRouter(req, res, next);
+  });
+});
+
+// Guard: Prevent unmatched /api or API namespace routes from falling through to Vite HTML
+app.use(['/api', ...API_NAMESPACES], (req, res) => {
   const requestId = crypto.randomUUID();
   res.status(404).json({
     success: false,
     error: {
-      code: 'REPORT_ROUTE_NOT_FOUND',
-      message: `مسار التقرير المطلوب '${req.originalUrl}' غير موجود (404)`,
+      code: 'ROUTE_NOT_FOUND',
+      message: `المسار المطلوب '${req.originalUrl}' غير موجود (404)`,
       retryable: false,
       requestId,
     },

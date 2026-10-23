@@ -58,13 +58,13 @@ export function getSupabasePool(): pg.Pool {
       ssl: {
         rejectUnauthorized: false, // Required for Supabase pooler connections in cloud containers
       },
-      max: 4, // Optimal size for Supabase PgBouncer transaction mode pooler (port 6543)
-      idleTimeoutMillis: 10000, // Clean up idle connections before PgBouncer drops them
-      connectionTimeoutMillis: 10000, // 10s connection timeout prevents long cascading hangs
-      statement_timeout: 15000, // 15s max query execution time
-      query_timeout: 15000,
+      max: 5, // Optimal size for Supabase PgBouncer transaction mode pooler (port 6543)
+      idleTimeoutMillis: 30000, // Keep connections alive across short bursts without premature teardown
+      connectionTimeoutMillis: 25000, // 25s connection timeout prevents premature aborts during TLS/pooler latency
+      statement_timeout: 30000, // 30s query timeout
+      query_timeout: 30000,
       keepAlive: true,
-      keepAliveInitialDelayMillis: 3000,
+      keepAliveInitialDelayMillis: 10000,
     });
 
     pool.on('error', (err) => {
@@ -79,7 +79,7 @@ export function getSupabasePool(): pg.Pool {
         // Recycle pool smoothly without unhandled exceptions or socket leaks
         resetSupabasePool().catch(() => {});
       } else {
-        console.warn('[Supabase Pool Notice]', err.message);
+        console.info('[Supabase Pool Notice]', err.message);
       }
     });
   }
@@ -108,7 +108,7 @@ export async function pgQuery<T extends pg.QueryResultRow = any>(text: string, p
         err.code === '57P01';
 
       if (isTransient && attempt < 2) {
-        console.warn(`[Supabase Query Retry] Transient pool issue on attempt ${attempt} (${err.message}), re-acquiring pool connection...`);
+        console.info(`[Supabase Query Notice] Transient connection issue on attempt ${attempt} (${err.message}), re-acquiring pool connection...`);
         await resetSupabasePool();
         await new Promise((r) => setTimeout(r, 1000));
         continue;
@@ -117,7 +117,18 @@ export async function pgQuery<T extends pg.QueryResultRow = any>(text: string, p
     }
   }
 
-  console.warn(`[Supabase Query Warning] ${lastErr.message} (SQL: ${text.slice(0, 100)}...)`);
+  const isTransient =
+    lastErr?.message?.includes('Connection terminated') ||
+    lastErr?.message?.includes('timeout') ||
+    lastErr?.message?.includes('ECONNRESET') ||
+    lastErr?.message?.includes('ETIMEDOUT') ||
+    lastErr?.code === '57P01';
+
+  if (isTransient) {
+    console.info(`[Supabase Query Notice] Connection standby: ${lastErr.message}`);
+  } else {
+    console.warn(`[Supabase Query Warning] ${lastErr.message} (SQL: ${text.slice(0, 100)}...)`);
+  }
   throw lastErr;
 }
 

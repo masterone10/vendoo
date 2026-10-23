@@ -1503,7 +1503,7 @@ apiRouter.post('/reports/day-action', async (req: Request, res: Response) => {
       result = await resolveHistoricalDay(cleanDate, { autoFetchMissing: false, forceRefetch: false });
     } else if (action === 'complete_missing') {
       result = await resolveHistoricalDay(cleanDate, { autoFetchMissing: true, forceRefetch: false });
-    } else if (action === 'force_refetch') {
+    } else if (action === 'force_refetch' || action === 're_export_excel') {
       result = await resolveHistoricalDay(cleanDate, { forceRefetch: true });
     } else if (action === 'sync_supabase') {
       if (cleanDate < '2026-10-23') {
@@ -1546,6 +1546,40 @@ apiRouter.post('/reports/day-action', async (req: Request, res: Response) => {
       error: {
         code: 'DAY_ACTION_FAILED',
         message: err.message || 'حدث خطأ أثناء تنفيذ إجراء اليوم',
+        retryable: true,
+        requestId,
+      },
+    });
+  }
+});
+
+// Dedicated single-day Re-Export from Vendoor endpoint
+apiRouter.post('/reports/re-export-day', async (req: Request, res: Response) => {
+  try {
+    const { date } = req.body;
+    if (!date) {
+      return res.status(400).json({
+        success: false,
+        error: {
+          code: 'MISSING_DATE',
+          message: 'حقل التاريخ (date) مطلوب لإعادة تصدير اليوم من Vendoor',
+          retryable: false,
+          requestId: crypto.randomUUID(),
+        },
+      });
+    }
+    const cleanDate = String(date).slice(0, 10);
+    const dayStatus = await resolveHistoricalDay(cleanDate, { forceRefetch: true });
+    const report = generateLogsIntelligenceReport(cleanDate, cleanDate);
+    res.json({ success: true, dayStatus, report });
+  } catch (err: any) {
+    const requestId = crypto.randomUUID();
+    console.error(`[ReExportDay API Error] [${requestId}]:`, err);
+    res.status(500).json({
+      success: false,
+      error: {
+        code: 'RE_EXPORT_FAILED',
+        message: err.message || 'تعذر إعادة تصدير شيت اليوم من فيندور',
         retryable: true,
         requestId,
       },

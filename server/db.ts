@@ -149,6 +149,8 @@ export function initDatabase() {
       last_updated_source TEXT,
       distinct_merchant_count INTEGER DEFAULT 1,
       multi_merchant_flag INTEGER DEFAULT 0,
+      distinct_warehouse_count INTEGER DEFAULT 1,
+      multi_warehouse_flag INTEGER DEFAULT 0,
       delivery_rate REAL,
       delivery_rate_num INTEGER,
       delivery_rate_denom INTEGER,
@@ -433,6 +435,8 @@ export function initDatabase() {
   tryRunMigration("ALTER TABLE orders ADD COLUMN address_quality_status TEXT DEFAULT 'NOT_RETRIEVED'");
   tryRunMigration("ALTER TABLE orders ADD COLUMN last_enrichment_at TEXT");
   tryRunMigration("ALTER TABLE orders ADD COLUMN last_enrichment_status TEXT");
+  tryRunMigration("ALTER TABLE orders ADD COLUMN distinct_warehouse_count INTEGER DEFAULT 1");
+  tryRunMigration("ALTER TABLE orders ADD COLUMN multi_warehouse_flag INTEGER DEFAULT 0");
   tryRunMigration("ALTER TABLE order_items ADD COLUMN merchant_name TEXT");
   tryRunMigration("ALTER TABLE order_items ADD COLUMN warehouse_name TEXT");
   tryRunMigration("ALTER TABLE order_items ADD COLUMN warehouse_code TEXT");
@@ -802,14 +806,16 @@ export function repairMerchantAndWarehouseData(onlyIfUnrepaired = false) {
     const updateOrderWhCount = db.prepare(`
       UPDATE orders
       SET distinct_merchant_count = ?,
-          multi_merchant_flag = ?
+          multi_merchant_flag = ?,
+          distinct_warehouse_count = ?,
+          multi_warehouse_flag = ?
       WHERE id = ?
     `);
 
     db.exec('BEGIN TRANSACTION;');
     for (const row of distinctWarehousesPerOrder) {
       const cnt = Math.max(1, row.wh_count || 1);
-      updateOrderWhCount.run(cnt, cnt > 1 ? 1 : 0, row.order_id);
+      updateOrderWhCount.run(cnt, cnt > 1 ? 1 : 0, cnt, cnt > 1 ? 1 : 0, row.order_id);
     }
     db.exec('COMMIT;');
   } catch (err: any) {

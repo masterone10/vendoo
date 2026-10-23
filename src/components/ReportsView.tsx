@@ -137,10 +137,6 @@ export const ReportsView: React.FC<ReportsViewProps> = ({ onSelectOrder }) => {
 
   async function handleDayAction(action: 'recheck' | 'complete_missing' | 'force_refetch' | 'sync_supabase' | 'reconcile') {
     if (!effectiveStart) return;
-    if (action === 'force_refetch') {
-      const ok = window.confirm('هل تريد بالتأكيد إعادة جلب هذا اليوم بالكامل من Vendoor وتحديث الحركات؟');
-      if (!ok) return;
-    }
     setDayActionLoading(true);
     try {
       const res = await fetch('/api/reports/day-action', {
@@ -764,24 +760,37 @@ export const ReportsView: React.FC<ReportsViewProps> = ({ onSelectOrder }) => {
               />
             )}
 
-            {/* Force Refresh / Sync Button */}
+            {/* Re-export from Vendoor (Single Day Excel Export) */}
+            {calendarMode === 'single' && (
+              <button
+                onClick={() => handleDayAction('force_refetch')}
+                disabled={dayActionLoading || isFetchingLogs}
+                className="flex items-center gap-1.5 px-3 py-2 rounded-xl bg-amber-500/15 hover:bg-amber-500/25 text-amber-300 border border-amber-500/40 text-xs font-semibold transition disabled:opacity-50"
+                title="إعادة تنزيل شيت إكسيل اليوم مباشرة من فيندور (تاريخ البداية = تاريخ النهاية) وتحديث الحركات"
+              >
+                <FileSpreadsheet className={`w-4 h-4 text-amber-400 ${dayActionLoading ? 'animate-spin' : ''}`} />
+                <span>إعادة تصدير من فيندور</span>
+              </button>
+            )}
+
+            {/* Refresh / Check Storage Button */}
             <button
-              onClick={() => fetchReport(effectiveStart, effectiveEnd, true)}
-              disabled={isFetchingLogs}
+              onClick={() => fetchReport(effectiveStart, effectiveEnd, false)}
+              disabled={isFetchingLogs || dayActionLoading}
               className="p-2.5 rounded-xl bg-slate-800 hover:bg-slate-700 text-slate-300 border border-slate-700/60 transition disabled:opacity-50"
-              title="إعادة فحص وجلب اللوجز الناقصة من Vendoor"
+              title="تحديث البيانات من الذاكرة المحلية والأرشيف"
             >
               <RefreshCw className={`w-4 h-4 text-amber-400 ${isFetchingLogs ? 'animate-spin' : ''}`} />
             </button>
 
-            {/* Batch Logs Import Button */}
+            {/* Manual Logs Import (Excel / CSV Fallback) */}
             <button
               onClick={() => setShowImportModal(true)}
-              className="flex items-center gap-1.5 px-3 py-2 rounded-xl bg-amber-500/10 hover:bg-amber-500/20 text-amber-300 border border-amber-500/30 text-xs font-semibold transition"
-              title="استيراد لوجز Excel أو CSV متعددة الأيام"
+              className="flex items-center gap-1.5 px-3 py-2 rounded-xl bg-slate-800 hover:bg-slate-700 text-slate-300 border border-slate-700/60 text-xs font-semibold transition"
+              title="رفع شيت إكسيل يدوي احتياطي في حال عدم توفر اتصال مباشر بفيندور"
             >
-              <FileSpreadsheet className="w-4 h-4 text-amber-400" />
-              <span>استيراد لوجز (Excel / CSV)</span>
+              <Download className="w-4 h-4 text-sky-400 rotate-180" />
+              <span>رفع شيت يدوي</span>
             </button>
 
             {/* Copy Executive Summary */}
@@ -994,10 +1003,11 @@ export const ReportsView: React.FC<ReportsViewProps> = ({ onSelectOrder }) => {
                 <button
                   onClick={() => handleDayAction('force_refetch')}
                   disabled={dayActionLoading}
-                  className="flex items-center gap-1 px-2.5 py-1.5 rounded-lg bg-rose-500/10 hover:bg-rose-500/20 text-rose-300 border border-rose-500/30 text-xs font-medium transition disabled:opacity-50"
-                  title="إعادة سحب اليوم كاملاً من Vendoor"
+                  className="flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg bg-amber-500/15 hover:bg-amber-500/25 text-amber-300 border border-amber-500/40 text-xs font-semibold transition disabled:opacity-50"
+                  title="إعادة تنزيل شيت إكسيل اليوم مباشرة من فيندور (تاريخ البداية = النهاية) وتحديث الحركات"
                 >
-                  <span>إعادة سحب كامل</span>
+                  <FileSpreadsheet className={`w-3.5 h-3.5 text-amber-400 ${dayActionLoading ? 'animate-spin' : ''}`} />
+                  <span>إعادة تصدير من فيندور (Excel)</span>
                 </button>
               </div>
             </div>

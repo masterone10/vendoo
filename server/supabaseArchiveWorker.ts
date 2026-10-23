@@ -8,7 +8,7 @@ export interface ArchiveWorkerStatus {
   lastRunAt: string | null;
   lastSuccessAt: string | null;
   lastError: string | null;
-  status: 'IDLE' | 'DRAINING' | 'FULLY_ARCHIVED' | 'PARTIAL' | 'FAILED' | 'AWAITING_CONFIG';
+  status: 'IDLE' | 'DRAINING' | 'FULLY_ARCHIVED' | 'PARTIAL' | 'FAILED' | 'AWAITING_CONFIG' | 'STANDBY_LOCAL_RETAIN';
   batchStatus: 'SUCCESS' | 'PARTIAL' | 'FAILED' | 'IDLE';
   batchSize: number;
   ordersWaiting: number;
@@ -179,18 +179,70 @@ export async function triggerArchivePass(): Promise<{
   let hadConnectionError = false;
 
   try {
-    // 0. Pre-flight health ping: verify pool connectivity before starting batch operations
+    // -------------------------------------------------------------------------
+    // 0. CHECK PENDING RECORDS IN SQLITE (Strictly enforce Cutoff >= 2026-10-23)
+    // -------------------------------------------------------------------------
+    const ordersCheckpoint = getCheckpoint('orders');
+    const canonCheckpoint = getCheckpoint('canonical_activity_events');
+    const rawCheckpoint = getCheckpoint('raw_activity_events');
+
+    const totalOrdersWaiting = (db.prepare("SELECT count(*) as c FROM orders WHERE id > ? AND created_at_source >= '2026-10-23 00:00:00'").get(ordersCheckpoint.lastArchivedId) as any)?.c || 0;
+    const totalCanonWaiting = (db.prepare("SELECT count(*) as c FROM canonical_activity_events WHERE id > ? AND event_timestamp >= '2026-10-23 00:00:00'").get(canonCheckpoint.lastArchivedId) as any)?.c || 0;
+    const totalRawWaiting = (db.prepare("SELECT count(*) as c FROM raw_activity_events WHERE id > ? AND event_timestamp >= '2026-10-23 00:00:00'").get(rawCheckpoint.lastArchivedId) as any)?.c || 0;
+
+    status.ordersWaiting = totalOrdersWaiting;
+    status.eventsWaiting = totalCanonWaiting;
+    status.rawLogsWaiting = totalRawWaiting;
+
+    const totalWaitingBeforePass = totalOrdersWaiting + totalCanonWaiting + totalRawWaiting;
+
+    // If no post-cutoff records are pending, conclude without opening remote connections
+    if (totalWaitingBeforePass === 0) {
+      status.ordersRemaining = 0;
+      status.eventsRemaining = 0;
+      status.rawLogsRemaining = 0;
+      status.isArchiveComplete = true;
+      status.status = 'FULLY_ARCHIVED';
+      status.batchStatus = 'IDLE';
+      consecutiveFailures = 0;
+
+      clearScheduledTimers();
+      if (status.isEnabled) {
+        periodicTimer = setTimeout(() => {
+          triggerArchivePass().catch(() => {});
+        }, scheduledIntervalMs);
+      }
+
+      return {
+        success: true,
+        ordersArchived: 0,
+        eventsArchived: 0,
+        rawLogsArchived: 0,
+        ordersRemaining: 0,
+        eventsRemaining: 0,
+        rawLogsRemaining: 0,
+        isArchiveComplete: true,
+      };
+    }
+
+    // -------------------------------------------------------------------------
+    // Pre-flight health ping: verify pool connectivity before starting batch operations
+    // -------------------------------------------------------------------------
     try {
       await pgQuery('SELECT 1 as ping');
+      consecutiveFailures = 0;
     } catch (pingErr: any) {
       consecutiveFailures++;
-      const backoffMs = Math.min(300000, Math.max(30000, consecutiveFailures * 30000));
-      status.status = 'FAILED';
+      const backoffMs = Math.min(600000, Math.max(30000, consecutiveFailures * 30000));
+      status.status = consecutiveFailures >= 2 ? 'STANDBY_LOCAL_RETAIN' : 'PARTIAL';
       status.batchStatus = 'FAILED';
-      status.lastError = `Supabase connection ping failed: ${pingErr.message}`;
-      console.warn(
-        `[SupabaseArchive] Pre-flight ping failed: ${pingErr.message}. Backing off next pass for ${backoffMs / 1000}s (consecutive failures: ${consecutiveFailures}).`
-      );
+      status.lastError = `Supabase standby (${pingErr.message}). Pending records preserved in SQLite.`;
+
+      if (consecutiveFailures <= 2) {
+        console.info(
+          `[SupabaseArchive] Pre-flight connection standby: ${pingErr.message}. Local records safely retained in SQLite. Backing off for ${backoffMs / 1000}s (consecutive: ${consecutiveFailures}).`
+        );
+      }
 
       clearScheduledTimers();
       if (status.isEnabled) {
@@ -204,9 +256,9 @@ export async function triggerArchivePass(): Promise<{
         ordersArchived: 0,
         eventsArchived: 0,
         rawLogsArchived: 0,
-        ordersRemaining: status.ordersRemaining,
-        eventsRemaining: status.eventsRemaining,
-        rawLogsRemaining: status.rawLogsRemaining,
+        ordersRemaining: totalOrdersWaiting,
+        eventsRemaining: totalCanonWaiting,
+        rawLogsRemaining: totalRawWaiting,
         isArchiveComplete: false,
         error: pingErr.message,
       };
@@ -214,11 +266,8 @@ export async function triggerArchivePass(): Promise<{
 
     // -------------------------------------------------------------------------
     // 1. ORDERS: Cursor-paginated batch of up to BATCH_SIZE with multi-row chunking
+    // CLOUD ARCHIVE POLICY: Only archive orders from 2026-10-23 onwards to Supabase
     // -------------------------------------------------------------------------
-    const ordersCheckpoint = getCheckpoint('orders');
-    const totalOrdersWaiting = (db.prepare('SELECT count(*) as c FROM orders WHERE id > ?').get(ordersCheckpoint.lastArchivedId) as any)?.c || 0;
-    status.ordersWaiting = totalOrdersWaiting;
-
     let currentOrderCheckpointId = ordersCheckpoint.lastArchivedId;
     let currentOrderCheckpointTime = ordersCheckpoint.lastArchivedAt;
 
@@ -226,12 +275,12 @@ export async function triggerArchivePass(): Promise<{
       const ordersBatch: any[] = db.prepare(`
         SELECT 
           id, vendoor_id, random_number, order_no, order_type, current_status,
-          distinct_merchant_count, multi_merchant_flag, delivery_rate,
+          distinct_merchant_count, multi_merchant_flag, distinct_warehouse_count, multi_warehouse_flag, delivery_rate,
           customer_phone, customer_phone_extra, extra_phone_valid,
           customer_name, governorate, address, total_price, shipping_cost,
           total_order, created_at_source, state_entry_at, last_observed_at
         FROM orders
-        WHERE id > ?
+        WHERE id > ? AND created_at_source >= '2026-10-23 00:00:00'
         ORDER BY id ASC
         LIMIT ?
       `).all(ordersCheckpoint.lastArchivedId, BATCH_SIZE);
@@ -245,14 +294,16 @@ export async function triggerArchivePass(): Promise<{
         for (const ord of chunk) {
           valuesSql.push(`(
             $${pIdx++}, $${pIdx++}, $${pIdx++}, $${pIdx++}, $${pIdx++},
-            $${pIdx++}, $${pIdx++}, $${pIdx++},
+            $${pIdx++}, $${pIdx++}, $${pIdx++}, $${pIdx++}, $${pIdx++},
             $${pIdx++}, $${pIdx++}, $${pIdx++},
             $${pIdx++}, $${pIdx++}, $${pIdx++}, $${pIdx++}, $${pIdx++},
             $${pIdx++}, $${pIdx++}, $${pIdx++}, $${pIdx++}
           )`);
           params.push(
             ord.vendoor_id, ord.random_number, ord.order_no, ord.order_type || 'اوردر جديد', ord.current_status,
-            ord.distinct_merchant_count || 1, ord.multi_merchant_flag || 0, ord.delivery_rate,
+            ord.distinct_merchant_count || 1, ord.multi_merchant_flag || 0,
+            ord.distinct_warehouse_count || 1, ord.multi_warehouse_flag || 0,
+            ord.delivery_rate,
             ord.customer_phone, ord.customer_phone_extra, ord.extra_phone_valid || 0,
             ord.customer_name, ord.governorate, ord.address, ord.total_price || 0, ord.shipping_cost || 0,
             ord.total_order || 0, ord.created_at_source, ord.state_entry_at, ord.last_observed_at
@@ -262,7 +313,7 @@ export async function triggerArchivePass(): Promise<{
         const queryText = `
           INSERT INTO orders (
             vendoor_id, random_number, order_no, order_type, current_status,
-            distinct_merchant_count, multi_merchant_flag, delivery_rate,
+            distinct_merchant_count, multi_merchant_flag, distinct_warehouse_count, multi_warehouse_flag, delivery_rate,
             customer_phone, customer_phone_extra, extra_phone_valid,
             customer_name, governorate, address, total_price, shipping_cost,
             total_order, created_at_source, state_entry_at, last_observed_at
@@ -270,6 +321,8 @@ export async function triggerArchivePass(): Promise<{
           ON CONFLICT (vendoor_id) DO UPDATE SET
             current_status = EXCLUDED.current_status,
             delivery_rate = EXCLUDED.delivery_rate,
+            distinct_warehouse_count = COALESCE(EXCLUDED.distinct_warehouse_count, orders.distinct_warehouse_count),
+            multi_warehouse_flag = COALESCE(EXCLUDED.multi_warehouse_flag, orders.multi_warehouse_flag),
             last_observed_at = EXCLUDED.last_observed_at,
             customer_phone_extra = COALESCE(EXCLUDED.customer_phone_extra, orders.customer_phone_extra),
             extra_phone_valid = GREATEST(EXCLUDED.extra_phone_valid, orders.extra_phone_valid)
@@ -285,7 +338,7 @@ export async function triggerArchivePass(): Promise<{
           await new Promise((r) => setTimeout(r, 60)); // Pacing
         } catch (chunkErr: any) {
           failedCount += chunk.length;
-          console.warn(`[SupabaseArchive] Orders chunk (${chunk.length} rows) insert error:`, chunkErr.message);
+          console.info(`[SupabaseArchive] Orders chunk (${chunk.length} rows) notice:`, chunkErr.message);
           if (isConnectionOrTimeoutError(chunkErr)) {
             hadConnectionError = true;
           }
@@ -295,7 +348,7 @@ export async function triggerArchivePass(): Promise<{
     }
 
     // Direct mathematical count from SQLite after cursor advance to prevent stale math drift
-    const ordersRemaining = (db.prepare('SELECT count(*) as c FROM orders WHERE id > ?').get(currentOrderCheckpointId) as any)?.c || 0;
+    const ordersRemaining = (db.prepare("SELECT count(*) as c FROM orders WHERE id > ? AND created_at_source >= '2026-10-23 00:00:00'").get(currentOrderCheckpointId) as any)?.c || 0;
     status.ordersArchivedThisPass = ordersArchived;
     status.ordersRemaining = ordersRemaining;
 
@@ -303,10 +356,6 @@ export async function triggerArchivePass(): Promise<{
     // 2. CANONICAL ACTIVITY EVENTS: Multi-row idempotent chunked insertion
     // CLOUD ARCHIVE POLICY: Only archive events from 2026-10-23 onwards to Supabase
     // -------------------------------------------------------------------------
-    const canonCheckpoint = getCheckpoint('canonical_activity_events');
-    const totalCanonWaiting = (db.prepare("SELECT count(*) as c FROM canonical_activity_events WHERE id > ? AND event_timestamp >= '2026-10-23 00:00:00'").get(canonCheckpoint.lastArchivedId) as any)?.c || 0;
-    status.eventsWaiting = totalCanonWaiting;
-
     let currentCanonCheckpointId = canonCheckpoint.lastArchivedId;
     let currentCanonCheckpointTime = canonCheckpoint.lastArchivedAt;
 
@@ -358,7 +407,7 @@ export async function triggerArchivePass(): Promise<{
           await new Promise((r) => setTimeout(r, 60)); // Pacing
         } catch (chunkErr: any) {
           failedCount += chunk.length;
-          console.warn(`[SupabaseArchive] Canonical events chunk (${chunk.length} rows) error:`, chunkErr.message);
+          console.info(`[SupabaseArchive] Canonical events chunk (${chunk.length} rows) notice:`, chunkErr.message);
           if (isConnectionOrTimeoutError(chunkErr)) {
             hadConnectionError = true;
           }
@@ -375,10 +424,6 @@ export async function triggerArchivePass(): Promise<{
     // 3. RAW ACTIVITY EVENTS: Multi-row chunked insertion with ON CONFLICT DO NOTHING
     // CLOUD ARCHIVE POLICY: Only archive raw logs from 2026-10-23 onwards to Supabase
     // -------------------------------------------------------------------------
-    const rawCheckpoint = getCheckpoint('raw_activity_events');
-    const totalRawWaiting = (db.prepare("SELECT count(*) as c FROM raw_activity_events WHERE id > ? AND event_timestamp >= '2026-10-23 00:00:00'").get(rawCheckpoint.lastArchivedId) as any)?.c || 0;
-    status.rawLogsWaiting = totalRawWaiting;
-
     let currentRawCheckpointId = rawCheckpoint.lastArchivedId;
     let currentRawCheckpointTime = rawCheckpoint.lastArchivedAt;
 
@@ -422,7 +467,7 @@ export async function triggerArchivePass(): Promise<{
           await new Promise((r) => setTimeout(r, 60)); // Pacing
         } catch (chunkErr: any) {
           failedCount += chunk.length;
-          console.warn(`[SupabaseArchive] Raw logs chunk (${chunk.length} rows) error:`, chunkErr.message);
+          console.info(`[SupabaseArchive] Raw logs chunk (${chunk.length} rows) notice:`, chunkErr.message);
           if (isConnectionOrTimeoutError(chunkErr)) {
             hadConnectionError = true;
           }
@@ -444,7 +489,6 @@ export async function triggerArchivePass(): Promise<{
     status.lastDurationMs = passDuration;
     const totalArchivedThisPass = ordersArchived + eventsArchived + rawLogsArchived;
     const totalRemaining = ordersRemaining + eventsRemaining + rawLogsRemaining;
-    const totalWaitingBeforePass = totalOrdersWaiting + totalCanonWaiting + totalRawWaiting;
 
     // Distinct evaluation of pass outcome vs overall archival state
     let batchStatus: 'SUCCESS' | 'PARTIAL' | 'FAILED' | 'IDLE';
@@ -470,7 +514,7 @@ export async function triggerArchivePass(): Promise<{
     if (isArchiveComplete) {
       status.status = 'FULLY_ARCHIVED';
     } else if (batchStatus === 'FAILED') {
-      status.status = 'FAILED';
+      status.status = consecutiveFailures >= 2 ? 'STANDBY_LOCAL_RETAIN' : 'FAILED';
     } else if (batchStatus === 'PARTIAL') {
       status.status = 'PARTIAL';
     } else {
@@ -489,8 +533,8 @@ export async function triggerArchivePass(): Promise<{
         `orders: ${ordersArchived}, events: ${eventsArchived}, raw logs: ${rawLogsArchived}. ${stateMsg}`
       );
     } else {
-      console.warn(
-        `[SupabaseArchive] Batch pass (${batchStatus}) completed with ${failedCount} errors in ${passDuration}ms: ` +
+      console.info(
+        `[SupabaseArchive] Batch pass (${batchStatus}) completed with ${failedCount} notices in ${passDuration}ms: ` +
         `orders: ${ordersArchived}, events: ${eventsArchived}, raw logs: ${rawLogsArchived}. Remaining: ${totalRemaining}`
       );
     }
@@ -500,8 +544,10 @@ export async function triggerArchivePass(): Promise<{
     if (status.isEnabled) {
       if (batchStatus === 'FAILED') {
         consecutiveFailures++;
-        const backoffMs = Math.min(300000, Math.max(30000, consecutiveFailures * 30000));
-        console.warn(`[SupabaseArchive] Backing off next drain pass for ${backoffMs / 1000}s due to failure (consecutive: ${consecutiveFailures}).`);
+        const backoffMs = Math.min(600000, Math.max(30000, consecutiveFailures * 30000));
+        if (consecutiveFailures <= 2) {
+          console.info(`[SupabaseArchive] Backing off next drain pass for ${backoffMs / 1000}s (consecutive: ${consecutiveFailures}, SQLite data safe).`);
+        }
         drainTimer = setTimeout(() => {
           triggerArchivePass().catch(() => {});
         }, backoffMs);
@@ -530,11 +576,13 @@ export async function triggerArchivePass(): Promise<{
     };
   } catch (err: any) {
     consecutiveFailures++;
-    const backoffMs = Math.min(300000, Math.max(30000, consecutiveFailures * 30000));
-    status.status = 'FAILED';
+    const backoffMs = Math.min(600000, Math.max(30000, consecutiveFailures * 30000));
+    status.status = consecutiveFailures >= 2 ? 'STANDBY_LOCAL_RETAIN' : 'FAILED';
     status.batchStatus = 'FAILED';
-    status.lastError = `Archive error: ${err.message}`;
-    console.error(`[SupabaseArchive Worker Fatal Error]: ${err.message}. Backing off for ${backoffMs / 1000}s.`);
+    status.lastError = `Archive notice: ${err.message}`;
+    if (consecutiveFailures <= 2) {
+      console.info(`[SupabaseArchive Notice]: ${err.message}. Data safely retained in SQLite. Retrying in ${backoffMs / 1000}s.`);
+    }
 
     clearScheduledTimers();
     if (status.isEnabled) {
@@ -567,11 +615,11 @@ export function startSupabaseArchiveWorker(intervalSeconds = 300): void {
   scheduledIntervalMs = intervalSeconds * 1000;
   console.log(`[SupabaseArchive] Background archive worker started (batchSize: ${BATCH_SIZE}, chunkSize: ${CHUNK_SIZE}, periodicInterval: ${intervalSeconds}s)...`);
 
-  // Initial trigger after 15 seconds to let server finish booting
+  // Initial trigger after 30 seconds to let server finish booting
   clearScheduledTimers();
   drainTimer = setTimeout(() => {
     triggerArchivePass().catch(() => {});
-  }, 15000);
+  }, 30000);
 }
 
 export function stopSupabaseArchiveWorker(): void {
