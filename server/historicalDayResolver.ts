@@ -247,26 +247,30 @@ export async function resolveHistoricalDay(
 
     // -------------------------------------------------------------------------
     // Case F: Partial data exists locally
-    // Rule: Without explicit forceRefetch, use existing partial data; do NOT auto-pull.
+    // Rule: If autoFetchMissing is enabled (default), automatically complete missing pages from Vendoor!
+    // Only if autoFetchMissing is explicitly false do we return USE_PARTIAL_LOCAL.
     // -------------------------------------------------------------------------
     if (!forceRefetch && hasLocalData && (cov?.completion_status === 'PARTIAL' || !cov)) {
-      return {
-        date: cleanDate,
-        decision: 'USE_PARTIAL_LOCAL',
-        dataSource: (cov?.data_source as any) || 'VENDOOR_FETCH',
-        completionStatus: 'PARTIAL',
-        localStorageStatus: 'LOCAL_PARTIAL',
-        remoteArchiveStatus: (cov?.remote_archive_status as any) || 'PENDING_REMOTE',
-        rawRecordsCount: rawCount,
-        canonicalEventsCount: canonCount,
-        loadedFromCache: true,
-        messageAr: 'البيانات جزئية مسجلة محلياً — يمكن استخدام زر "استكمال اليوم من Vendoor" عند الحاجة',
-      };
+      if (!autoFetchMissing) {
+        return {
+          date: cleanDate,
+          decision: 'USE_PARTIAL_LOCAL',
+          dataSource: (cov?.data_source as any) || 'VENDOOR_FETCH',
+          completionStatus: 'PARTIAL',
+          localStorageStatus: 'LOCAL_PARTIAL',
+          remoteArchiveStatus: (cov?.remote_archive_status as any) || 'PENDING_REMOTE',
+          rawRecordsCount: rawCount,
+          canonicalEventsCount: canonCount,
+          loadedFromCache: true,
+          messageAr: 'البيانات جزئية مسجلة محلياً (السحب التلقائي غير مفعّل)',
+        };
+      }
+      // If autoFetchMissing is true, proceed to fetch/complete from Vendoor below!
     }
 
     // -------------------------------------------------------------------------
-    // Case E: Day is completely absent OR explicit forceRefetch was requested
-    // Action: Auto-fetch from Vendoor, read all pages, save, sync to Supabase, verify.
+    // Case E: Day is completely absent OR has partial data needing completion OR explicit forceRefetch
+    // Action: Auto-fetch from Vendoor, complete missing pages or re-pull, save, sync to Supabase, verify.
     // -------------------------------------------------------------------------
     if (!autoFetchMissing && !forceRefetch) {
       return {
@@ -309,132 +313,202 @@ export async function resolveHistoricalDay(
     let fetchError: string | null = null;
 
     try {
-      // 1. Fetch Page 1
-      const p1 = await vendoorClient.fetchSystemLogs(1, cleanDate, cleanDate);
-      pagesDiscovered = Math.max(1, p1.totalPages);
-      pagesRead = 1;
-      options.onProgress?.('SAVING_RECORDS', `جاري حفظ السجلات (صفحة 1/${pagesDiscovered})...`, 1, pagesDiscovered, p1.entries.length);
+      const canResumePagination = Boolean(
+        !forceRefetch &&
+        hasLocalData &&
+        cov &&
+        cov.data_source === 'VENDOOR_FETCH' &&
+        cov.pages_read > 0 &&
+        cov.pages_discovered > cov.pages_read
+      );
 
-      // Check for Case H: Empty Day Verified
-      if (p1.entries.length === 0 && pagesDiscovered <= 1) {
-        const nowIso = new Date().toISOString();
-        saveCoverageRecord({
-          accountId: 'primary',
-          sourceDomain: 'logs',
-          periodDate: cleanDate,
-          storageTier: 'HOT',
-          pagesDiscovered: 1,
-          pagesRead: 1,
-          recordsExtracted: 0,
-          recordsSaved: 0,
-          completionStatus: 'EMPTY_VERIFIED',
-          dataSource: 'VENDOOR_FETCH',
-          canonicalEventsCount: 0,
-          localStorageStatus: 'LOCAL_SAVED',
-          remoteArchiveStatus: isSupabaseConfigured() ? 'REMOTE_VERIFIED' : 'NONE',
-          lastAttemptedAt: nowIso,
-          completedAt: nowIso,
-          verifiedAt: nowIso,
-          notes: 'Verified from Vendoor: zero movements on this date',
-        });
+      let resumedSuccessfully = false;
 
-        return {
-          date: cleanDate,
-          decision: 'EMPTY_VERIFIED',
-          dataSource: 'VENDOOR_FETCH',
-          completionStatus: 'EMPTY_VERIFIED',
-          localStorageStatus: 'LOCAL_SAVED',
-          remoteArchiveStatus: isSupabaseConfigured() ? 'REMOTE_VERIFIED' : 'NONE',
-          rawRecordsCount: 0,
-          canonicalEventsCount: 0,
-          loadedFromCache: false,
-          messageAr: 'تم التحقق من المصدر: لا توجد أي حركات مسجلة لهذا اليوم',
-        };
-      }
-
-      // Persist page 1
-      const p1Res = persistLogEntries(p1.entries, interval, {
-        dataSource: 'VENDOOR_FETCH',
-        strictInterval: true,
-      });
-      // 2. Fast-path: If day has multiple pages, attempt bulk Excel export to ingest full day in 1 call
-      if (pagesDiscovered > 3) {
+      if (canResumePagination) {
         try {
-          options.onProgress?.('FETCHING_VENDOOR', `جاري محاولة التنزيل المباشر ليوم ${cleanDate}...`, 1, pagesDiscovered, recordsSavedThisPass);
-          const excelBuf = await vendoorClient.exportSystemLogsExcel(cleanDate, cleanDate);
-          if (excelBuf && excelBuf.length > 500) {
-            const batchRes = await importBatchLogFiles([
-              { fileName: `vendoor_logs_${cleanDate}.xlsx`, buffer: excelBuf }
-            ]);
-            if (batchRes && batchRes.discoveredDates.some(d => d.date === cleanDate && d.savedCount > 0)) {
-              const totalRaw = (db.prepare(`
-                SELECT COUNT(*) as c FROM raw_activity_events
-                WHERE event_timestamp >= ? AND event_timestamp < ?
-              `).get(interval.startCairo, interval.endCairo) as any)?.c || batchRes.totalSaved;
-              const totalEvents = (db.prepare(`
-                SELECT COUNT(*) as c FROM canonical_activity_events
-                WHERE event_timestamp >= ? AND event_timestamp < ?
-              `).get(interval.startCairo, interval.endCairo) as any)?.c || 0;
-              return {
-                date: cleanDate,
-                decision: 'FETCH_FROM_VENDOOR',
-                dataSource: 'VENDOOR_FETCH',
-                completionStatus: 'COMPLETE',
-                localStorageStatus: 'LOCAL_SAVED',
-                remoteArchiveStatus: isSupabaseConfigured() ? 'REMOTE_SYNCED' : 'NONE',
-                rawRecordsCount: totalRaw,
-                canonicalEventsCount: totalEvents,
-                loadedFromCache: false,
-                messageAr: `تم جلب وتحديث اليوم بالكامل (${totalRaw} حركة مسجلة)`,
-              };
+          const fromPage = cov.pages_read + 1;
+          let toPage = cov.pages_discovered;
+          pagesDiscovered = toPage;
+          pagesRead = cov.pages_read;
+
+          options.onProgress?.(
+            'FETCHING_VENDOOR',
+            `جاري استكمال الصفحات الناقصة (${fromPage} إلى ${toPage}) ليوم ${cleanDate}...`,
+            pagesRead,
+            pagesDiscovered,
+            recordsSavedThisPass
+          );
+
+          let allPagesSucceeded = true;
+          for (let p = fromPage; p <= toPage; p++) {
+            let pageFetched = false;
+            let lastPageErr: any = null;
+
+            for (let attempt = 1; attempt <= 3; attempt++) {
+              try {
+                if (attempt === 1) await new Promise(r => setTimeout(r, 50));
+                options.onProgress?.(
+                  'FETCHING_VENDOOR',
+                  `جاري استكمال صفحة ${p} من ${toPage}${attempt > 1 ? ` (محاولة ${attempt}/3)` : ''}...`,
+                  p,
+                  toPage,
+                  recordsSavedThisPass
+                );
+
+                const nextP = await vendoorClient.fetchSystemLogs(p, cleanDate, cleanDate);
+                pagesRead = p;
+                if (nextP.totalPages > toPage) {
+                  toPage = nextP.totalPages;
+                  pagesDiscovered = toPage;
+                }
+
+                options.onProgress?.('SAVING_RECORDS', `جاري حفظ السجلات المستكملة (صفحة ${p}/${toPage})...`, p, toPage, recordsSavedThisPass);
+                const nextRes = persistLogEntries(nextP.entries, interval, {
+                  dataSource: 'VENDOOR_FETCH',
+                  strictInterval: true,
+                });
+                recordsSavedThisPass += nextRes.saved;
+                pageFetched = true;
+                break;
+              } catch (pageErr: any) {
+                lastPageErr = pageErr;
+                if (attempt < 3) {
+                  await new Promise(r => setTimeout(r, 600 * attempt));
+                }
+              }
+            }
+
+            if (!pageFetched) {
+              allPagesSucceeded = false;
+              break;
             }
           }
-        } catch (excelErr: any) {
-          console.warn(`[HistoricalResolver] Bulk export skipped for ${cleanDate}, falling back to pagination:`, excelErr.message);
+
+          if (allPagesSucceeded) {
+            resumedSuccessfully = true;
+          } else {
+            console.warn(`[HistoricalDayResolver] Smart resume incomplete for ${cleanDate}, falling back to full verified re-pull`);
+          }
+        } catch (resumeErr: any) {
+          console.warn(`[HistoricalDayResolver] Smart resume failed for ${cleanDate}: ${resumeErr.message}, falling back to full verified re-pull`);
         }
       }
 
-      // 3. Fetch remaining pages with retry and pacing
-      for (let p = 2; p <= pagesDiscovered; p++) {
-        let pageFetched = false;
-        let lastPageErr: any = null;
+      if (!resumedSuccessfully) {
+        // 1. Fetch Page 1
+        const p1 = await vendoorClient.fetchSystemLogs(1, cleanDate, cleanDate);
+        pagesDiscovered = Math.max(1, p1.totalPages);
+        pagesRead = 1;
+        options.onProgress?.('SAVING_RECORDS', `جاري حفظ السجلات (صفحة 1/${pagesDiscovered})...`, 1, pagesDiscovered, p1.entries.length);
 
-        for (let attempt = 1; attempt <= 3; attempt++) {
+        // Check for Case H: Empty Day Verified
+        if (p1.entries.length === 0 && pagesDiscovered <= 1) {
+          const nowIso = new Date().toISOString();
+          saveCoverageRecord({
+            accountId: 'primary',
+            sourceDomain: 'logs',
+            periodDate: cleanDate,
+            storageTier: 'HOT',
+            pagesDiscovered: 1,
+            pagesRead: 1,
+            recordsExtracted: 0,
+            recordsSaved: 0,
+            completionStatus: 'EMPTY_VERIFIED',
+            dataSource: 'VENDOOR_FETCH',
+            canonicalEventsCount: 0,
+            localStorageStatus: 'LOCAL_SAVED',
+            remoteArchiveStatus: isSupabaseConfigured() ? 'REMOTE_VERIFIED' : 'NONE',
+            lastAttemptedAt: nowIso,
+            completedAt: nowIso,
+            verifiedAt: nowIso,
+            notes: 'Verified from Vendoor: zero movements on this date',
+          });
+
+          return {
+            date: cleanDate,
+            decision: 'EMPTY_VERIFIED',
+            dataSource: 'VENDOOR_FETCH',
+            completionStatus: 'EMPTY_VERIFIED',
+            localStorageStatus: 'LOCAL_SAVED',
+            remoteArchiveStatus: isSupabaseConfigured() ? 'REMOTE_VERIFIED' : 'NONE',
+            rawRecordsCount: 0,
+            canonicalEventsCount: 0,
+            loadedFromCache: false,
+            messageAr: 'تم التحقق من المصدر: لا توجد أي حركات مسجلة لهذا اليوم',
+          };
+        }
+
+        // Persist page 1
+        const p1Res = persistLogEntries(p1.entries, interval, {
+          dataSource: 'VENDOOR_FETCH',
+          strictInterval: true,
+        });
+        recordsSavedThisPass += p1Res.saved;
+
+        // 2. Fast-path: If day has multiple pages, attempt bulk Excel export to ingest full day in 1 call
+        let bulkLoaded = false;
+        if (pagesDiscovered > 3) {
           try {
-            if (p > 2 && attempt === 1) {
-              await new Promise(r => setTimeout(r, 50));
+            options.onProgress?.('FETCHING_VENDOOR', `جاري محاولة التنزيل المباشر ليوم ${cleanDate}...`, 1, pagesDiscovered, recordsSavedThisPass);
+            const excelBuf = await vendoorClient.exportSystemLogsExcel(cleanDate, cleanDate);
+            if (excelBuf && excelBuf.length > 500) {
+              const batchRes = await importBatchLogFiles([
+                { fileName: `vendoor_logs_${cleanDate}.xlsx`, buffer: excelBuf }
+              ]);
+              if (batchRes && batchRes.discoveredDates.some(d => d.date === cleanDate && d.savedCount > 0)) {
+                bulkLoaded = true;
+                pagesRead = pagesDiscovered;
+              }
             }
-            options.onProgress?.(
-              'FETCHING_VENDOOR',
-              `جاري جلب صفحة ${p} من ${pagesDiscovered}${attempt > 1 ? ` (محاولة ${attempt}/3)` : ''}...`,
-              p,
-              pagesDiscovered,
-              recordsSavedThisPass
-            );
-            const nextP = await vendoorClient.fetchSystemLogs(p, cleanDate, cleanDate);
-            pagesRead = p;
-
-            options.onProgress?.('SAVING_RECORDS', `جاري حفظ السجلات (صفحة ${p}/${pagesDiscovered})...`, p, pagesDiscovered, recordsSavedThisPass);
-            const nextRes = persistLogEntries(nextP.entries, interval, {
-              dataSource: 'VENDOOR_FETCH',
-              strictInterval: true,
-            });
-            recordsSavedThisPass += nextRes.saved;
-            pageFetched = true;
-            break;
-          } catch (pageErr: any) {
-            lastPageErr = pageErr;
-            if (attempt < 3) {
-              console.warn(`[HistoricalDayResolver] Retrying page ${p} (${attempt}/3) for ${cleanDate}: ${pageErr.message}`);
-              await new Promise(r => setTimeout(r, 600 * attempt));
-            }
+          } catch (excelErr: any) {
+            console.warn(`[HistoricalResolver] Bulk export skipped for ${cleanDate}, falling back to pagination:`, excelErr.message);
           }
         }
 
-        if (!pageFetched) {
-          isPartial = true;
-          fetchError = `تعذر قراءة الصفحة ${p}: ${lastPageErr?.message}`;
-          break;
+        // 3. Fetch remaining pages with retry and pacing if not bulk loaded
+        if (!bulkLoaded) {
+          for (let p = 2; p <= pagesDiscovered; p++) {
+            let pageFetched = false;
+            let lastPageErr: any = null;
+
+            for (let attempt = 1; attempt <= 3; attempt++) {
+              try {
+                if (p > 2 && attempt === 1) {
+                  await new Promise(r => setTimeout(r, 50));
+                }
+                options.onProgress?.(
+                  'FETCHING_VENDOOR',
+                  `جاري جلب صفحة ${p} من ${pagesDiscovered}${attempt > 1 ? ` (محاولة ${attempt}/3)` : ''}...`,
+                  p,
+                  pagesDiscovered,
+                  recordsSavedThisPass
+                );
+                const nextP = await vendoorClient.fetchSystemLogs(p, cleanDate, cleanDate);
+                pagesRead = p;
+
+                options.onProgress?.('SAVING_RECORDS', `جاري حفظ السجلات (صفحة ${p}/${pagesDiscovered})...`, p, pagesDiscovered, recordsSavedThisPass);
+                const nextRes = persistLogEntries(nextP.entries, interval, {
+                  dataSource: 'VENDOOR_FETCH',
+                  strictInterval: true,
+                });
+                recordsSavedThisPass += nextRes.saved;
+                pageFetched = true;
+                break;
+              } catch (pageErr: any) {
+                lastPageErr = pageErr;
+                if (attempt < 3) {
+                  console.warn(`[HistoricalDayResolver] Retrying page ${p} (${attempt}/3) for ${cleanDate}: ${pageErr.message}`);
+                  await new Promise(r => setTimeout(r, 600 * attempt));
+                }
+              }
+            }
+
+            if (!pageFetched) {
+              isPartial = true;
+              fetchError = `تعذر قراءة الصفحة ${p}: ${lastPageErr?.message}`;
+              break;
+            }
+          }
         }
       }
     } catch (err: any) {

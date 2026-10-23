@@ -4,7 +4,7 @@ import { vendoorClient } from './vendoorClient.ts';
 import { parseLogActionDetails } from './logDetailsParser.ts';
 import { persistLogEntries, repairRawWithoutCanonical } from './historicalLogsService.ts';
 import { importBatchLogFiles } from './batchLogsImporter.ts';
-import { isSupabaseConfigured, fetchDayLogsFromSupabase } from './supabaseClient.ts';
+import { isSupabaseConfigured, fetchDayLogsFromSupabase, syncDayLogsToSupabase } from './supabaseClient.ts';
 import { processAndDeduplicateTeamEvents } from './teamDeduplication.ts';
 
 export type FetchStage =
@@ -144,21 +144,16 @@ export async function ensureCoverageForRange(
       `).get(interval.startCairo, interval.endCairo) as any)
     );
 
-    const hasRecordedHistory = Boolean(
-      (cov && (
+    const isDayVerifiedComplete = Boolean(
+      cov && (
         cov.completion_status === 'COMPLETE' ||
-        cov.completion_status === 'UNVERIFIED_SOURCE' ||
         cov.completion_status === 'EMPTY_VERIFIED' ||
-        cov.completion_status === 'PARTIAL' ||
-        cov.data_source === 'EXCEL_IMPORT' ||
-        cov.data_source === 'CSV_IMPORT' ||
-        cov.data_source === 'SUPABASE_ARCHIVE'
-      )) ||
-      hasLocalRaw ||
-      hasLocalCanon
+        ((cov.data_source === 'EXCEL_IMPORT' || cov.data_source === 'CSV_IMPORT') && cov.completion_status === 'UNVERIFIED_SOURCE')
+      )
     );
 
-    if (!hasRecordedHistory) {
+    // If day is missing entirely, has PARTIAL coverage, or has unverified raw records without completion:
+    if (!isDayVerifiedComplete) {
       missingDates.push(date);
     }
   }
@@ -228,33 +223,110 @@ export async function ensureCoverageForRange(
       }
 
       let bulkLoaded = false;
-      try {
-        job.stage = 'FETCHING_VENDOOR';
-        job.stageLabelAr = `جاري استخراج لوجز ${date} عبر تصدير Vendoor السريع`;
-        onProgress?.(job);
 
-        const excelBuf = await vendoorClient.exportSystemLogsExcel(date, date);
-        if (excelBuf && excelBuf.length > 500) {
-          const importRes = await importBatchLogFiles([
-            { fileName: `vendoor_logs_${date}.xlsx`, buffer: excelBuf },
-          ]);
-          if (importRes.success && importRes.totalSaved >= 0) {
-            dayEventsSaved = importRes.totalSaved;
-            totalSaved += importRes.totalSaved;
-            job.eventsSaved = totalSaved;
-            dayPagesTotal = 1;
-            dayPagesFetched = 1;
-            totalPagesDiscovered += 1;
-            totalPagesRead += 1;
+      // Smart resumption check for partial days with verified page tracking
+      const existingCov: any = db.prepare(`
+        SELECT completion_status, data_source, pages_read, pages_discovered
+        FROM historical_coverage
+        WHERE period_date = ? AND source_domain = 'logs'
+      `).get(date);
+
+      const hasLocalRaw = Boolean(
+        (db.prepare(`
+          SELECT 1 FROM raw_activity_events
+          WHERE event_timestamp >= ? AND event_timestamp < ?
+          LIMIT 1
+        `).get(interval.startCairo, interval.endCairo) as any)
+      );
+
+      const canResume = Boolean(
+        !forceRefetch &&
+        hasLocalRaw &&
+        existingCov &&
+        existingCov.data_source === 'VENDOOR_FETCH' &&
+        existingCov.pages_read > 0 &&
+        existingCov.pages_discovered > existingCov.pages_read
+      );
+
+      if (canResume) {
+        try {
+          const fromPage = existingCov.pages_read + 1;
+          let toPage = existingCov.pages_discovered;
+          let allResumeSucceeded = true;
+
+          for (let p = fromPage; p <= toPage; p++) {
+            let pageFetched = false;
+            for (let attempt = 1; attempt <= 3; attempt++) {
+              try {
+                if (attempt === 1) await new Promise(r => setTimeout(r, 50));
+                job.stage = 'FETCHING_VENDOOR';
+                job.stageLabelAr = `جاري استكمال صفحة ${p} من ${toPage} لليوم (${date})${attempt > 1 ? ` (محاولة ${attempt}/3)` : ''}`;
+                onProgress?.(job);
+
+                const nextP = await vendoorClient.fetchSystemLogs(p, date, date);
+                if (nextP.totalPages > toPage) {
+                  toPage = nextP.totalPages;
+                }
+                const nextRes = persistLogEntries(nextP.entries, interval);
+                dayEventsSaved += nextRes.saved;
+                totalSaved += nextRes.saved;
+                job.eventsSaved = totalSaved;
+                pageFetched = true;
+                break;
+              } catch {
+                if (attempt < 3) await new Promise(r => setTimeout(r, 600 * attempt));
+              }
+            }
+            if (!pageFetched) {
+              allResumeSucceeded = false;
+              break;
+            }
+          }
+
+          if (allResumeSucceeded) {
+            dayPagesTotal = toPage;
+            dayPagesFetched = toPage;
+            totalPagesDiscovered += (toPage - existingCov.pages_read);
+            totalPagesRead += (toPage - existingCov.pages_read);
             job.pagesTotal = Math.max(job.pagesTotal, totalPagesDiscovered);
             job.pagesFetched = totalPagesRead;
             bulkLoaded = true;
             dayStatus = 'COMPLETE';
           }
+        } catch {
+          bulkLoaded = false;
         }
-      } catch {
-        // Fall back gracefully to paginated fetch
-        bulkLoaded = false;
+      }
+
+      if (!bulkLoaded) {
+        try {
+          job.stage = 'FETCHING_VENDOOR';
+          job.stageLabelAr = `جاري استخراج لوجز ${date} عبر تصدير Vendoor السريع`;
+          onProgress?.(job);
+
+          const excelBuf = await vendoorClient.exportSystemLogsExcel(date, date);
+          if (excelBuf && excelBuf.length > 500) {
+            const importRes = await importBatchLogFiles([
+              { fileName: `vendoor_logs_${date}.xlsx`, buffer: excelBuf },
+            ]);
+            if (importRes.success && importRes.totalSaved >= 0) {
+              dayEventsSaved = importRes.totalSaved;
+              totalSaved += importRes.totalSaved;
+              job.eventsSaved = totalSaved;
+              dayPagesTotal = 1;
+              dayPagesFetched = 1;
+              totalPagesDiscovered += 1;
+              totalPagesRead += 1;
+              job.pagesTotal = Math.max(job.pagesTotal, totalPagesDiscovered);
+              job.pagesFetched = totalPagesRead;
+              bulkLoaded = true;
+              dayStatus = 'COMPLETE';
+            }
+          }
+        } catch {
+          // Fall back gracefully to paginated fetch
+          bulkLoaded = false;
+        }
       }
 
       if (!bulkLoaded) {
@@ -358,6 +430,10 @@ export async function ensureCoverageForRange(
         dayStatus === 'COMPLETE' ? new Date().toISOString() : null,
         dayStatus === 'COMPLETE' ? new Date().toISOString() : null
       );
+
+      if (date >= '2026-10-23' && isSupabaseConfigured() && dayStatus === 'COMPLETE') {
+        syncDayLogsToSupabase(date).catch(() => {});
+      }
     } catch (dayErr: any) {
       console.error(`[LogsIntelligence] Error fetching date ${date}:`, dayErr.message);
       dayStatus = 'FAILED';

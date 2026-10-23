@@ -41,7 +41,7 @@ import { ReportKpiDrilldownModal, DrilldownPillar } from './ReportKpiDrilldownMo
 import { BatchLogsImportModal } from './BatchLogsImportModal';
 import { LogsIntelligenceReport, RangeJobState, HistoricalDayStatus } from '../types';
 
-export type ReportViewState = 'idle' | 'loading' | 'success' | 'empty' | 'partial' | 'error';
+export type ReportViewState = 'idle' | 'loading' | 'fetching_source' | 'saving' | 'success' | 'empty' | 'partial' | 'error';
 
 export interface ReportErrorDetails {
   code: string;
@@ -325,7 +325,13 @@ export const ReportsView: React.FC<ReportsViewProps> = ({ onSelectOrder }) => {
             json.jobStatus.stage === 'PREPARING_REPORT');
 
         if (isRunning) {
-          setViewState('loading');
+          if (json.jobStatus.stage === 'FETCHING_VENDOOR') {
+            setViewState('fetching_source');
+          } else if (json.jobStatus.stage === 'SAVING_RECORDS' || json.jobStatus.stage === 'ANALYZING_ACTIONS') {
+            setViewState('saving');
+          } else {
+            setViewState('loading');
+          }
           startPolling(s, e, currentRequestId);
         } else {
           setLoading(false);
@@ -423,6 +429,14 @@ export const ReportsView: React.FC<ReportsViewProps> = ({ onSelectOrder }) => {
 
         if (data.success && data.job) {
           setJobStatus(data.job);
+          if (data.job.stage === 'FETCHING_VENDOOR') {
+            setViewState('fetching_source');
+          } else if (data.job.stage === 'SAVING_RECORDS' || data.job.stage === 'ANALYZING_ACTIONS') {
+            setViewState('saving');
+          } else if (data.job.stage === 'CHECKING_STORAGE' || data.job.stage === 'COMPUTING_METRICS' || data.job.stage === 'PREPARING_REPORT') {
+            setViewState('loading');
+          }
+
           if (data.job.stage === 'FAILED') {
             clearInterval(pollIntervalRef.current);
             setLoading(false);
@@ -586,6 +600,9 @@ export const ReportsView: React.FC<ReportsViewProps> = ({ onSelectOrder }) => {
   // Is infinity loading active?
   const isFetchingLogs = Boolean(
     loading ||
+    viewState === 'loading' ||
+    viewState === 'fetching_source' ||
+    viewState === 'saving' ||
     (jobStatus &&
       (jobStatus.stage === 'CHECKING_STORAGE' ||
         jobStatus.stage === 'FETCHING_VENDOOR' ||
@@ -990,12 +1007,35 @@ export const ReportsView: React.FC<ReportsViewProps> = ({ onSelectOrder }) => {
             </svg>
           </div>
 
-          <div className="space-y-1.5">
-            <h3 className="text-base font-bold text-amber-300 font-sans">
-              {jobStatus?.stageLabelAr || 'جاري فحص وتجهيز تقرير اللوجز...'}
-            </h3>
-            <p className="text-xs text-slate-400 font-sans max-w-md">
-              يفحص النظام اللوجز المحفوظة محلياً ويجلب الصفحات الناقصة من Vendoor مباشرةً لضمان دقة المؤشرات التاريخية
+          <div className="space-y-2">
+            <div className="flex items-center justify-center gap-2">
+              <h3 className="text-base font-bold text-amber-300 font-sans">
+                {viewState === 'fetching_source'
+                  ? 'جاري تنزيل اللوجز من Vendoor مباشرة...'
+                  : viewState === 'saving'
+                  ? 'جاري حفظ السجلات والتحقق من التغطية...'
+                  : jobStatus?.stageLabelAr || 'جاري فحص وتجهيز تقرير اللوجز...'}
+              </h3>
+              <span className={`px-2.5 py-0.5 rounded-full text-[11px] font-sans font-semibold border ${
+                viewState === 'fetching_source'
+                  ? 'bg-sky-500/20 text-sky-300 border-sky-500/30'
+                  : viewState === 'saving'
+                  ? 'bg-emerald-500/20 text-emerald-300 border-emerald-500/30'
+                  : 'bg-amber-500/20 text-amber-300 border-amber-500/30'
+              }`}>
+                {viewState === 'fetching_source'
+                  ? 'سحب مباشر (fetching_source)'
+                  : viewState === 'saving'
+                  ? 'حفظ السجلات (saving)'
+                  : 'جاري التحميل (loading)'}
+              </span>
+            </div>
+            <p className="text-xs text-slate-400 font-sans max-w-md mx-auto">
+              {viewState === 'fetching_source'
+                ? 'يتصل النظام الآن بـ Vendoor لسحب كافة الصفحات المفقودة تلقائيًا لضمان تغطية اليوم 100%'
+                : viewState === 'saving'
+                ? 'يتم تخزين السجلات في قاعدة البيانات المحلية والتحقق من مطابقتها وعدم تكرارها'
+                : 'يفحص النظام اللوجز المحفوظة محلياً ويجلب الصفحات الناقصة من Vendoor مباشرةً لضمان دقة المؤشرات التاريخية'}
             </p>
             {jobStatus && jobStatus.pagesTotal > 0 && jobStatus.pagesFetched > 0 && (
               <div className="pt-2 flex items-center justify-center gap-3 text-xs font-mono text-slate-300">
