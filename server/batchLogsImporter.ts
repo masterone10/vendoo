@@ -1070,9 +1070,9 @@ export async function importBatchLogFiles(
       notes: `Batch import: ${entries.length} rows processed from [${filesString}]`,
     });
 
-    // Remote Supabase verification if configured
+    // Remote Supabase verification if configured (enforce cloud archive boundary 2026-10-23)
     let remoteStatus = 'NONE';
-    if (isSupabaseConfigured()) {
+    if (dateStr >= '2026-10-23' && isSupabaseConfigured()) {
       try {
         const syncRes = await syncDayLogsToSupabase(dateStr);
         if (syncRes.verified) {

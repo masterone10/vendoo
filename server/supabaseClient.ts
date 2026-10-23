@@ -254,6 +254,19 @@ export async function syncDayLogsToSupabase(dateStr: string): Promise<{
     };
   }
 
+  // CLOUD ARCHIVE POLICY: In accordance with free-tier storage boundaries,
+  // logs prior to 2026-10-23 are stored strictly in local SQLite and must NOT be synced to Supabase.
+  if (dateStr < '2026-10-23') {
+    return {
+      success: true,
+      verified: true,
+      rawSaved: 0,
+      canonicalSaved: 0,
+      verifiedRemoteCount: 0,
+      error: 'CLOUD_ARCHIVE_POLICY: Logs prior to 2026-10-23 remain in local SQLite only',
+    };
+  }
+
   const { db, getCairoDateInterval } = await import('./db.ts');
   const interval = getCairoDateInterval(dateStr);
 

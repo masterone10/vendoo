@@ -1,8 +1,11 @@
 import crypto from 'node:crypto';
-import { db, getCairoDateInterval, isDateInHot } from './db.ts';
-import { vendoorClient } from './vendoorClient.ts';
+import * as XLSX from 'xlsx';
+import { db, getCairoDateInterval, isDateInHot, saveCoverageRecord } from './db.ts';
+import { vendoorClient, type LogEntry } from './vendoorClient.ts';
 import { syncEngine } from './syncEngine.ts';
 import { parseLogActionDetails } from './logDetailsParser.ts';
+import { normalizeDateStringToCairo, findMatchingField, HEADER_ALIASES } from './batchLogsImporter.ts';
+import { isSupabaseConfigured, syncDayLogsToSupabase } from './supabaseClient.ts';
 
 export interface LogBackfillState {
   date: string;
@@ -113,6 +116,8 @@ export function persistLogEntries(
 
   const TX_BATCH_SIZE = 1000;
   let inTx = false;
+  const tupleSeqMap = new Map<string, number>();
+
   try {
     db.exec('BEGIN TRANSACTION;');
     inTx = true;
@@ -132,9 +137,15 @@ export function persistLogEntries(
         continue;
       }
 
+      const naturalKey = `${actorName}|${orderCode || ''}|${rawActionText}|${eventTime}`;
+      const occurrenceSeq = (tupleSeqMap.get(naturalKey) || 0) + 1;
+      tupleSeqMap.set(naturalKey, occurrenceSeq);
+
+      // Occurrence 1 maintains exact compatibility with existing single-instance hashes;
+      // occurrence >= 2 gets a sequence suffix so multiple distinct events in the same second are not merged!
       const sourceHash = crypto
         .createHash('sha256')
-        .update(`${actorName}|${orderCode || ''}|${rawActionText}|${eventTime}`)
+        .update(occurrenceSeq === 1 ? naturalKey : `${naturalKey}|#${occurrenceSeq}`)
         .digest('hex');
 
       const logTier = isDateInHot(eventTime) ? 'HOT' : 'COLD';
@@ -362,7 +373,128 @@ export async function getOrFetchHistoricalLogs(targetDate: string): Promise<{
 }
 
 /**
- * Worker that paginates through Vendoor system logs for a specific Cairo business date.
+ * Attempts to download and parse the native Vendoor System Logs Excel export (/dashboard/log/xls/all).
+ * Verifies that the file contains genuine rows for the specified Cairo business date.
+ */
+export async function tryVendoorNativeExcelExport(
+  targetDate: string,
+  interval: { startCairo: string; endCairo: string }
+): Promise<{ success: boolean; entries: LogEntry[]; reason?: string; rawBufferLength?: number }> {
+  try {
+    if (!vendoorClient.isConfigured()) {
+      return { success: false, entries: [], reason: 'بيانات دخول Vendoor غير مهيأة في بيئة التشغيل' };
+    }
+
+    const buffer = await vendoorClient.exportSystemLogsExcel(targetDate, targetDate);
+    if (!buffer || buffer.length === 0) {
+      return { success: false, entries: [], reason: 'الملف المستلم من خادم Vendoor فارغ' };
+    }
+
+    // Check if response is an HTML error/login page instead of binary spreadsheet
+    const peek = buffer.slice(0, 300).toString('utf-8');
+    if (peek.includes('<html') || peek.includes('<!DOCTYPE html') || peek.includes('/login')) {
+      return { success: false, entries: [], reason: 'أعاد الخادم صفحة تسجيل دخول أو خطأ HTML بدل ملف Excel' };
+    }
+
+    let workbook: XLSX.WorkBook;
+    try {
+      workbook = XLSX.read(buffer, { type: 'buffer', raw: true });
+    } catch (parseErr: any) {
+      return { success: false, entries: [], reason: `فشل فك تشفير جدول البيانات: ${parseErr.message}` };
+    }
+
+    if (!workbook.SheetNames || workbook.SheetNames.length === 0) {
+      return { success: false, entries: [], reason: 'ملف Excel لا يحتوي على أي صفحات عمل' };
+    }
+
+    const sheetName = workbook.SheetNames[0];
+    const worksheet = workbook.Sheets[sheetName];
+    if (!worksheet) {
+      return { success: false, entries: [], reason: 'صفحة العمل الأساسية فارغة' };
+    }
+
+    const sheetAoa: any[][] = XLSX.utils.sheet_to_json(worksheet, { header: 1, defval: '', raw: true });
+    if (!sheetAoa || sheetAoa.length < 2) {
+      return { success: false, entries: [], reason: 'ملف Excel يحتوي على أقل من صفين (لا توجد بيانات حركات)' };
+    }
+
+    // Header detection across first 15 rows
+    let headerRowIdx = -1;
+    let colOrderCode = -1;
+    let colActor = -1;
+    let colAction = -1;
+    let colTimestamp = -1;
+    let colOrderId = -1;
+
+    for (let r = 0; r < Math.min(15, sheetAoa.length); r++) {
+      const row = (sheetAoa[r] || []).map(c => String(c || '').trim());
+      const fOrder = findMatchingField(row, HEADER_ALIASES.orderCode);
+      const fActor = findMatchingField(row, HEADER_ALIASES.actorName);
+      const fAction = findMatchingField(row, HEADER_ALIASES.rawActionText);
+      const fTime = findMatchingField(row, HEADER_ALIASES.eventTimestamp);
+      const fOid = findMatchingField(row, HEADER_ALIASES.vendoorOrderId);
+
+      if (fAction || fTime) {
+        headerRowIdx = r;
+        colOrderCode = fOrder ? row.indexOf(fOrder) : -1;
+        colActor = fActor ? row.indexOf(fActor) : -1;
+        colAction = fAction ? row.indexOf(fAction) : -1;
+        colTimestamp = fTime ? row.indexOf(fTime) : -1;
+        colOrderId = fOid ? row.indexOf(fOid) : -1;
+        break;
+      }
+    }
+
+    if (headerRowIdx === -1 || colAction === -1 || colTimestamp === -1) {
+      return { success: false, entries: [], reason: 'تعذر العثور على أعمدة الإجراء ووقت الحدث في ملف Excel' };
+    }
+
+    const entries: LogEntry[] = [];
+    for (let rIdx = headerRowIdx + 1; rIdx < sheetAoa.length; rIdx++) {
+      const row = sheetAoa[rIdx];
+      if (!row || row.length === 0) continue;
+
+      const actionText = String(row[colAction] || '').trim();
+      const rawTimestamp = row[colTimestamp];
+      if (!actionText && !rawTimestamp) continue;
+
+      const normalized = normalizeDateStringToCairo(rawTimestamp);
+      if (!normalized.timestampStr) continue;
+
+      // Ensure Cairo date interval bounds [startCairo, endCairo)
+      if (normalized.timestampStr < interval.startCairo || normalized.timestampStr >= interval.endCairo) {
+        continue;
+      }
+
+      const orderCode = colOrderCode >= 0 ? String(row[colOrderCode] || '').trim() || null : null;
+      const actorName = colActor >= 0 ? String(row[colActor] || '').trim() || 'النظام' : 'النظام';
+      const rawOrderId = colOrderId >= 0 ? parseInt(String(row[colOrderId]), 10) : null;
+      const vendoorOrderId = isNaN(rawOrderId as any) ? null : rawOrderId;
+
+      entries.push({
+        index: rIdx,
+        orderCode: orderCode || '',
+        actorName,
+        rawActionText: actionText,
+        eventTimestamp: normalized.timestampStr,
+        vendoorOrderId,
+      });
+    }
+
+    return {
+      success: true,
+      entries,
+      rawBufferLength: buffer.length,
+    };
+  } catch (err: any) {
+    return { success: false, entries: [], reason: err.message };
+  }
+}
+
+/**
+ * Worker that retrieves Vendoor system logs for a specific Cairo business date.
+ * Primary Path: Native Vendoor Excel export (/dashboard/log/xls/all) with date boundaries.
+ * Fallback Path: Robust paginated extraction (/dashboard/log/system) page-by-page.
  */
 export async function runHistoricalLogJob(targetDate: string): Promise<void> {
   const job = activeJobs.get(targetDate) || {
@@ -383,18 +515,97 @@ export async function runHistoricalLogJob(targetDate: string): Promise<void> {
   let pagesDiscovered = 1;
 
   try {
-    console.log(`[HistoricalLogs] Starting log retrieval for date ${targetDate}...`);
+    console.log(`[HistoricalLogs] Starting unified log retrieval for date ${targetDate}...`);
 
     if (!vendoorClient.isConfigured()) {
-      throw new Error('Vendoor credentials are not configured in environment or secrets.');
+      throw new Error('بيانات دخول Vendoor غير مهيأة في بيئة التشغيل');
     }
+
+    // -------------------------------------------------------------------------
+    // Phase 1: Attempt Native Vendoor Excel Export
+    // -------------------------------------------------------------------------
+    console.log(`[HistoricalLogs] Attempting native Excel export for ${targetDate}...`);
+    const excelRes = await tryVendoorNativeExcelExport(targetDate, interval);
+
+    if (excelRes.success && excelRes.entries.length > 0) {
+      console.log(`[HistoricalLogs] Native Excel export succeeded for ${targetDate}: ${excelRes.entries.length} entries verified`);
+      const pRes = persistLogEntries(excelRes.entries, interval, {
+        dataSource: 'VENDOOR_FETCH',
+        strictInterval: true,
+      });
+
+      totalSaved = pRes.saved;
+      job.pagesFetched = 1;
+      job.pagesTotal = 1;
+      job.eventsSaved = totalSaved;
+      job.status = 'COMPLETE';
+      job.completedAt = new Date().toISOString();
+
+      saveCoverageRecord({
+        periodDate: targetDate,
+        sourceDomain: 'logs',
+        storageTier: 'HOT',
+        pagesDiscovered: 1,
+        pagesRead: 1,
+        recordsExtracted: excelRes.entries.length,
+        recordsSaved: totalSaved,
+        completionStatus: 'COMPLETE',
+        lastAttemptedAt: new Date().toISOString(),
+        completedAt: new Date().toISOString(),
+        verifiedAt: new Date().toISOString(),
+        dataSource: 'VENDOOR_FETCH',
+        canonicalEventsCount: totalSaved,
+        duplicatesCount: pRes.duplicates,
+        notes: `تصدير Excel أصلي مباشر من Vendoor: تم التحقق من ${excelRes.entries.length} حركة بنجاح`,
+      });
+
+      if (targetDate >= '2026-10-23' && isSupabaseConfigured()) {
+        syncDayLogsToSupabase(targetDate).catch(e => console.warn('[HistoricalLogs] Supabase background sync error:', e.message));
+      }
+
+      return;
+    }
+
+    // -------------------------------------------------------------------------
+    // Phase 2: Fallback to Paginated Extraction
+    // -------------------------------------------------------------------------
+    console.warn(`[HistoricalLogs] Native Excel export not available for ${targetDate} (${excelRes.reason || 'لا توجد حركات'}); انتقال إلى السحب المرقّم بالصفحات...`);
 
     // Fetch page 1 with date filter
     const page1 = await vendoorClient.fetchSystemLogs(1, targetDate, targetDate);
     pagesDiscovered = Math.max(1, page1.totalPages);
     job.pagesTotal = pagesDiscovered;
 
-    const p1Result = persistLogEntries(page1.entries, interval);
+    // Check if this is an empty verified day
+    if (page1.entries.length === 0 && pagesDiscovered <= 1) {
+      console.log(`[HistoricalLogs] Date ${targetDate} confirmed EMPTY_VERIFIED (0 logs in Vendoor System Logs)`);
+      job.status = 'COMPLETE';
+      job.completedAt = new Date().toISOString();
+
+      saveCoverageRecord({
+        periodDate: targetDate,
+        sourceDomain: 'logs',
+        storageTier: 'HOT',
+        pagesDiscovered: 1,
+        pagesRead: 1,
+        recordsExtracted: 0,
+        recordsSaved: 0,
+        completionStatus: 'EMPTY_VERIFIED',
+        lastAttemptedAt: new Date().toISOString(),
+        completedAt: new Date().toISOString(),
+        verifiedAt: new Date().toISOString(),
+        dataSource: 'VENDOOR_FETCH',
+        canonicalEventsCount: 0,
+        duplicatesCount: 0,
+        notes: 'يوم تم التحقق من خلوه من أي حركات في Vendoor',
+      });
+      return;
+    }
+
+    const p1Result = persistLogEntries(page1.entries, interval, {
+      dataSource: 'VENDOOR_FETCH',
+      strictInterval: true,
+    });
     totalSaved += p1Result.saved;
     job.pagesFetched = 1;
     job.eventsSaved = totalSaved;
@@ -403,14 +614,17 @@ export async function runHistoricalLogJob(targetDate: string): Promise<void> {
     for (let p = 2; p <= pagesDiscovered; p++) {
       try {
         const nextBatch = await vendoorClient.fetchSystemLogs(p, targetDate, targetDate);
-        const batchRes = persistLogEntries(nextBatch.entries, interval);
+        const batchRes = persistLogEntries(nextBatch.entries, interval, {
+          dataSource: 'VENDOOR_FETCH',
+          strictInterval: true,
+        });
         totalSaved += batchRes.saved;
         job.pagesFetched = p;
         job.eventsSaved = totalSaved;
       } catch (pageErr: any) {
         console.warn(`[HistoricalLogs] Page ${p} failed for ${targetDate}:`, pageErr.message);
         hasFailedPage = true;
-        job.errorMessage = `Failed on page ${p}: ${pageErr.message}`;
+        job.errorMessage = `فشل في الصفحة ${p}: ${pageErr.message}`;
         break;
       }
     }
@@ -419,30 +633,26 @@ export async function runHistoricalLogJob(targetDate: string): Promise<void> {
     job.status = finalStatus;
     job.completedAt = new Date().toISOString();
 
-    // Update historical coverage table
-    db.prepare(`
-      INSERT INTO historical_coverage (
-        period_date, source_domain, storage_tier, pages_discovered, pages_read,
-        records_saved, completion_status, last_attempted_at, completed_at, verified_at
-      ) VALUES (?, 'logs', 'HOT', ?, ?, ?, ?, ?, ?, ?)
-      ON CONFLICT(source_domain, period_date) DO UPDATE SET
-        pages_discovered = excluded.pages_discovered,
-        pages_read = excluded.pages_read,
-        records_saved = excluded.records_saved,
-        completion_status = excluded.completion_status,
-        last_attempted_at = excluded.last_attempted_at,
-        completed_at = excluded.completed_at,
-        verified_at = CASE WHEN excluded.completion_status = 'COMPLETE' THEN excluded.last_attempted_at ELSE historical_coverage.verified_at END
-    `).run(
-      targetDate,
-      pagesDiscovered,
-      job.pagesFetched,
-      totalSaved,
-      finalStatus,
-      new Date().toISOString(),
-      finalStatus === 'COMPLETE' ? new Date().toISOString() : null,
-      finalStatus === 'COMPLETE' ? new Date().toISOString() : null
-    );
+    saveCoverageRecord({
+      periodDate: targetDate,
+      sourceDomain: 'logs',
+      storageTier: 'HOT',
+      pagesDiscovered: pagesDiscovered,
+      pagesRead: job.pagesFetched,
+      recordsExtracted: totalSaved,
+      recordsSaved: totalSaved,
+      completionStatus: finalStatus,
+      lastAttemptedAt: new Date().toISOString(),
+      completedAt: finalStatus === 'COMPLETE' ? new Date().toISOString() : null,
+      verifiedAt: finalStatus === 'COMPLETE' ? new Date().toISOString() : null,
+      dataSource: 'VENDOOR_FETCH',
+      canonicalEventsCount: totalSaved,
+      notes: hasFailedPage ? `سحب جزئي: توقف عند الصفحة ${job.pagesFetched}/${pagesDiscovered}` : `سحب مرقّم مكتمل: ${job.pagesFetched} صفحة`,
+    });
+
+    if (targetDate >= '2026-10-23' && finalStatus === 'COMPLETE' && isSupabaseConfigured()) {
+      syncDayLogsToSupabase(targetDate).catch(e => console.warn('[HistoricalLogs] Supabase background sync error:', e.message));
+    }
 
     console.log(`[HistoricalLogs] Completed log retrieval for ${targetDate}: Status=${finalStatus}, Saved=${totalSaved}`);
   } catch (err: any) {
@@ -450,16 +660,19 @@ export async function runHistoricalLogJob(targetDate: string): Promise<void> {
     job.errorMessage = err.message;
     console.error(`[HistoricalLogs] Failure for ${targetDate}:`, err.message);
 
-    db.prepare(`
-      INSERT INTO historical_coverage (
-        period_date, source_domain, storage_tier, pages_discovered, pages_read,
-        records_saved, completion_status, last_attempted_at, error_message
-      ) VALUES (?, 'logs', 'HOT', ?, ?, ?, 'FAILED', ?, ?)
-      ON CONFLICT(source_domain, period_date) DO UPDATE SET
-        completion_status = 'FAILED',
-        error_message = excluded.error_message,
-        last_attempted_at = excluded.last_attempted_at
-    `).run(targetDate, pagesDiscovered, job.pagesFetched, totalSaved, new Date().toISOString(), err.message);
+    saveCoverageRecord({
+      periodDate: targetDate,
+      sourceDomain: 'logs',
+      storageTier: 'HOT',
+      pagesDiscovered: pagesDiscovered,
+      pagesRead: job.pagesFetched,
+      recordsExtracted: totalSaved,
+      recordsSaved: totalSaved,
+      completionStatus: 'FAILED',
+      errorMessage: err.message,
+      lastAttemptedAt: new Date().toISOString(),
+      dataSource: 'VENDOOR_FETCH',
+    });
   }
 }
 
@@ -508,30 +721,55 @@ export async function fetchAndPersistLogsForPeriod(
         throw new Error('بيانات دخول Vendoor غير مهيأة في بيئة التشغيل');
       }
 
-      // Fetch page 1
-      const p1 = await vendoorClient.fetchSystemLogs(1, date, date);
-      dayPagesTotal = Math.max(1, p1.totalPages);
-      dayPagesFetched = 1;
-      dayEventsFetched += p1.entries.length;
+      // 1. Try native Excel export first
+      const excelRes = await tryVendoorNativeExcelExport(date, interval);
+      if (excelRes.success && excelRes.entries.length > 0) {
+        dayPagesTotal = 1;
+        dayPagesFetched = 1;
+        dayEventsFetched = excelRes.entries.length;
+        const pRes = persistLogEntries(excelRes.entries, interval, {
+          dataSource: 'VENDOOR_FETCH',
+          strictInterval: true,
+        });
+        dayEventsSaved = pRes.saved;
+        totalDuplicates += pRes.duplicates;
+        dayStatus = 'COMPLETE';
+      } else {
+        // 2. Fallback to paginated logs
+        const p1 = await vendoorClient.fetchSystemLogs(1, date, date);
+        dayPagesTotal = Math.max(1, p1.totalPages);
+        dayPagesFetched = 1;
+        dayEventsFetched += p1.entries.length;
 
-      const p1Res = persistLogEntries(p1.entries, interval);
-      dayEventsSaved += p1Res.saved;
-      totalDuplicates += p1Res.duplicates;
+        if (p1.entries.length === 0 && dayPagesTotal <= 1) {
+          dayStatus = 'COMPLETE';
+        } else {
+          const p1Res = persistLogEntries(p1.entries, interval, {
+            dataSource: 'VENDOOR_FETCH',
+            strictInterval: true,
+          });
+          dayEventsSaved += p1Res.saved;
+          totalDuplicates += p1Res.duplicates;
 
-      // Remaining pages
-      for (let p = 2; p <= dayPagesTotal; p++) {
-        try {
-          const nextP = await vendoorClient.fetchSystemLogs(p, date, date);
-          dayPagesFetched = p;
-          dayEventsFetched += nextP.entries.length;
-          const nextRes = persistLogEntries(nextP.entries, interval);
-          dayEventsSaved += nextRes.saved;
-          totalDuplicates += nextRes.duplicates;
-        } catch (pageErr: any) {
-          failedPages++;
-          dayStatus = 'PARTIAL';
-          dayError = `فشل في الصفحة ${p}: ${pageErr.message}`;
-          break;
+          // Remaining pages
+          for (let p = 2; p <= dayPagesTotal; p++) {
+            try {
+              const nextP = await vendoorClient.fetchSystemLogs(p, date, date);
+              dayPagesFetched = p;
+              dayEventsFetched += nextP.entries.length;
+              const nextRes = persistLogEntries(nextP.entries, interval, {
+                dataSource: 'VENDOOR_FETCH',
+                strictInterval: true,
+              });
+              dayEventsSaved += nextRes.saved;
+              totalDuplicates += nextRes.duplicates;
+            } catch (pageErr: any) {
+              failedPages++;
+              dayStatus = 'PARTIAL';
+              dayError = `فشل في الصفحة ${p}: ${pageErr.message}`;
+              break;
+            }
+          }
         }
       }
 

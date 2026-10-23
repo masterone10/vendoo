@@ -1,5 +1,5 @@
 import { db, getCairoDateInterval, saveCoverageRecord, getCoverageRecord, type HistoricalCoverageRecord } from './db.ts';
-import { isSupabaseConfigured, pgQuery, fetchDayLogsFromSupabase, restoreMissingOrdersFromSupabase } from './supabaseClient.ts';
+import { isSupabaseConfigured, pgQuery, fetchDayLogsFromSupabase, restoreMissingOrdersFromSupabase, syncDayLogsToSupabase } from './supabaseClient.ts';
 import { repairRawWithoutCanonical, fetchAndPersistLogsForPeriod } from './historicalLogsService.ts';
 import { backfillOrderLinksForEvents } from './db.ts';
 import { vendoorClient } from './vendoorClient.ts';
@@ -36,10 +36,14 @@ export interface ReconciliationReport {
     duplicatesIgnored: number;
     failedWrites: number;
     unlinkedCount: number;
+    sqliteOnlyCount: number;
+    supabaseOnlyCount: number;
+    commonExactMatchCount: number;
+    discrepancyCount: number;
   };
   parityStatus: 'VERIFIED_PARITY' | 'LOCAL_AHEAD' | 'REMOTE_AHEAD' | 'RECONCILED' | 'EMPTY_VERIFIED' | 'PARTIAL' | 'ERROR';
   primarySource: 'SQLITE_LOCAL' | 'SUPABASE_ARCHIVE' | 'VENDOOR_FETCH' | 'MIXED' | 'NONE';
-  coverageStatus: 'COMPLETE' | 'PARTIAL' | 'EMPTY_VERIFIED' | 'NOT_SYNCED' | 'FAILED';
+  coverageStatus: 'COMPLETE' | 'PARTIAL' | 'EMPTY_VERIFIED' | 'UNVERIFIED_SOURCE' | 'NOT_SYNCED' | 'FAILED';
   summaryMessageAr: string;
   diagnosticNotes: string[];
 }
@@ -168,37 +172,100 @@ export async function reconcileHistoricalRange(
   let convertedFromRaw = 0;
   let duplicatesIgnored = 0;
   let failedWrites = 0;
+  let sqliteOnlyCount = 0;
+  let supabaseOnlyCount = 0;
+  let commonExactMatchCount = 0;
+  let discrepancyCount = 0;
 
-  // 3. Auto-Repair / Sync when gaps are detected
+  // 3. Deep Hash-level inspection between SQLite and Supabase
+  if (supaMetrics.isConnected) {
+    try {
+      const startTz = `${cleanStart} 00:00:00+03`;
+      const endTz = `${endInt.nextDateStr} 00:00:00+03`;
+
+      const localHashes = new Set(
+        (db.prepare(`
+          SELECT source_hash FROM raw_activity_events
+          WHERE event_timestamp >= ? AND event_timestamp < ?
+        `).all(startTime, endTime) as any[]).map(r => r.source_hash)
+      );
+
+      const remoteHashesRes = await pgQuery<{ source_hash: string }>(`
+        SELECT source_hash FROM raw_activity_events
+        WHERE event_timestamp >= $1::timestamptz AND event_timestamp < $2::timestamptz
+      `, [startTz, endTz]);
+      const remoteHashes = new Set(remoteHashesRes.rows.map(r => r.source_hash));
+
+      for (const h of localHashes) {
+        if (remoteHashes.has(h)) {
+          commonExactMatchCount++;
+        } else {
+          sqliteOnlyCount++;
+        }
+      }
+      for (const h of remoteHashes) {
+        if (!localHashes.has(h)) {
+          supabaseOnlyCount++;
+        }
+      }
+    } catch (hashErr: any) {
+      diagnosticNotes.push(`تعذر إجراء مطابقة الهاش التفصيلية: ${hashErr.message}`);
+    }
+  }
+
+  // 4. Two-Way Auto-Repair / Sync when gaps are detected
   if (autoRepair) {
-    // Case B & Case C: If Supabase has raw records that SQLite is missing, stream them into SQLite!
-    if (supaMetrics.isConnected && supaMetrics.rawCount > sqliteMetrics.rawCount) {
-      options.onProgress?.('RESTORING_FROM_SUPABASE', `جاري استرجاع السجلات الناقصة من Supabase (${supaMetrics.rawCount - sqliteMetrics.rawCount} سجل)...`, 0, 1);
+    // Step 4a: If Supabase has records that SQLite is missing, restore them into SQLite
+    if (supaMetrics.isConnected && (supaMetrics.rawCount > sqliteMetrics.rawCount || supabaseOnlyCount > 0)) {
+      options.onProgress?.('RESTORING_FROM_SUPABASE', `جاري استرجاع السجلات الناقصة من Supabase إلى SQLite...`, 0, 1);
 
-      // Iterate day by day between cleanStart and cleanEnd
       const curDate = new Date(`${cleanStart}T00:00:00Z`);
       const targetEndDate = new Date(`${cleanEnd}T00:00:00Z`);
 
       while (curDate <= targetEndDate) {
         const dStr = curDate.toISOString().slice(0, 10);
-        const restoreRes = await fetchDayLogsFromSupabase(dStr, {
-          onProgress: (restored, total) => {
-            options.onProgress?.('RESTORING_BATCH', `استرجاع لوجز ${dStr}: ${restored}/${total}`, restored, total);
-          },
-        });
-        if (restoreRes.success) {
-          restoredFromRemote += restoreRes.rawRestored;
-          convertedFromRaw += restoreRes.canonicalRestored;
-          duplicatesIgnored += restoreRes.duplicates;
-          failedWrites += restoreRes.failedWrites;
-        } else if (restoreRes.error) {
-          diagnosticNotes.push(`فشل استرجاع ${dStr} من Supabase: ${restoreRes.error}`);
+        // CLOUD ARCHIVE POLICY: Remote archive begins from 2026-10-23.
+        if (dStr >= '2026-10-23') {
+          const restoreRes = await fetchDayLogsFromSupabase(dStr, {
+            onProgress: (restored, total) => {
+              options.onProgress?.('RESTORING_BATCH', `استرجاع لوجز ${dStr}: ${restored}/${total}`, restored, total);
+            },
+          });
+          if (restoreRes.success) {
+            restoredFromRemote += restoreRes.rawRestored;
+            convertedFromRaw += restoreRes.canonicalRestored;
+            duplicatesIgnored += restoreRes.duplicates;
+            failedWrites += restoreRes.failedWrites;
+          } else if (restoreRes.error) {
+            diagnosticNotes.push(`فشل استرجاع ${dStr} من Supabase: ${restoreRes.error}`);
+          }
         }
         curDate.setUTCDate(curDate.getUTCDate() + 1);
       }
     }
 
-    // Convert any raw records that lack a canonical representation in SQLite
+    // Step 4b: If SQLite has records that Supabase is missing, archive them to Supabase
+    // CLOUD ARCHIVE POLICY: Supabase archive starts strictly on 2026-10-23.
+    // Days prior to 2026-10-23 are intentionally kept exclusively in local SQLite.
+    if (supaMetrics.isConnected && (sqliteMetrics.rawCount > supaMetrics.rawCount || sqliteOnlyCount > 0)) {
+      const curDate = new Date(`${cleanStart}T00:00:00Z`);
+      const targetEndDate = new Date(`${cleanEnd}T00:00:00Z`);
+
+      while (curDate <= targetEndDate) {
+        const dStr = curDate.toISOString().slice(0, 10);
+        if (dStr >= '2026-10-23') {
+          options.onProgress?.('SYNCING_TO_SUPABASE', `جاري رفع السجلات المحلية الناقصة إلى أرشيف Supabase لـ ${dStr}...`, 0, 1);
+          try {
+            await syncDayLogsToSupabase(dStr);
+          } catch (syncErr: any) {
+            diagnosticNotes.push(`فشل رفع لوجز ${dStr} إلى Supabase: ${syncErr.message}`);
+          }
+        }
+        curDate.setUTCDate(curDate.getUTCDate() + 1);
+      }
+    }
+
+    // Step 4c: Convert any raw records that lack a canonical representation in SQLite
     const rawToConvertCheck = (db.prepare(`
       SELECT COUNT(*) as c FROM raw_activity_events r
       WHERE r.event_timestamp >= ? AND r.event_timestamp < ?
@@ -212,7 +279,7 @@ export async function reconcileHistoricalRange(
       diagnosticNotes.push(`تم تحويل ${repairRes.repaired} سجل خام إلى معياري محلياً`);
     }
 
-    // Resolve unlinked orders against SQLite orders table & backfill missing orders from Supabase
+    // Step 4d: Resolve unlinked orders against SQLite orders table & backfill missing orders from Supabase
     if (sqliteMetrics.unlinkedOrdersCount > 0) {
       const unlinkedCodes = (db.prepare(`
         SELECT DISTINCT order_code FROM canonical_activity_events
@@ -231,7 +298,7 @@ export async function reconcileHistoricalRange(
       backfillOrderLinksForEvents();
     }
 
-    // Case D: Completely missing in both SQLite and Supabase -> fetch from Vendoor if requested
+    // Step 4e: Completely missing in both SQLite and Supabase -> fetch from Vendoor if requested
     const totalLocalNow = (db.prepare(`
       SELECT COUNT(*) as c FROM raw_activity_events
       WHERE event_timestamp >= ? AND event_timestamp < ?
@@ -252,7 +319,7 @@ export async function reconcileHistoricalRange(
     }
   }
 
-  // 4. Re-calculate metrics after repair pass
+  // 5. Re-calculate metrics after repair pass
   const finalSqliteRaw = (db.prepare(`
     SELECT COUNT(*) as c FROM raw_activity_events
     WHERE event_timestamp >= ? AND event_timestamp < ?
@@ -302,16 +369,15 @@ export async function reconcileHistoricalRange(
     parityStatus = 'EMPTY_VERIFIED';
     coverageStatus = 'EMPTY_VERIFIED';
     primarySource = 'NONE';
-  } else if (finalSqliteRaw === supaMetrics.rawCount) {
+  } else if (finalSqliteRaw === supaMetrics.rawCount && sqliteOnlyCount === 0 && supabaseOnlyCount === 0) {
     parityStatus = 'VERIFIED_PARITY';
     primarySource = restoredFromRemote > 0 ? 'SUPABASE_ARCHIVE' : 'SQLITE_LOCAL';
     coverageStatus = 'COMPLETE';
-  } else if (finalSqliteRaw > supaMetrics.rawCount) {
+  } else if (finalSqliteRaw > supaMetrics.rawCount || sqliteOnlyCount > 0) {
     parityStatus = 'LOCAL_AHEAD';
     primarySource = 'SQLITE_LOCAL';
     coverageStatus = 'COMPLETE';
   } else {
-    // Supabase still has more records than SQLite
     parityStatus = 'REMOTE_AHEAD';
     primarySource = 'SUPABASE_ARCHIVE';
     coverageStatus = 'PARTIAL';
@@ -351,6 +417,10 @@ export async function reconcileHistoricalRange(
       duplicatesIgnored,
       failedWrites,
       unlinkedCount: finalUnlinked,
+      sqliteOnlyCount,
+      supabaseOnlyCount,
+      commonExactMatchCount,
+      discrepancyCount,
     },
     parityStatus,
     primarySource,

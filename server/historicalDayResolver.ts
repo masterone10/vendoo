@@ -115,9 +115,10 @@ export async function resolveHistoricalDay(
 
     // -------------------------------------------------------------------------
     // Case A & B: Check Supabase PostgreSQL Archive
-    // If local has 0 records, OR if Supabase is known/checked to have more records
+    // CLOUD ARCHIVE POLICY: Remote archive begins from 2026-10-23.
+    // Days prior to 2026-10-23 are stored locally in SQLite and not queried from remote.
     // -------------------------------------------------------------------------
-    if (!forceRefetch && isSupabaseConfigured() && (!hasLocalData || cov?.completion_status === 'PARTIAL' || !cov)) {
+    if (!forceRefetch && cleanDate >= '2026-10-23' && isSupabaseConfigured() && (!hasLocalData || cov?.completion_status === 'PARTIAL' || !cov)) {
       options.onProgress?.('CHECKING_STORAGE', 'جاري فحص أرشيف Supabase البعيد...', 0, 1, 0);
       try {
         const restoreRes = await fetchDayLogsFromSupabase(cleanDate);
@@ -200,8 +201,8 @@ export async function resolveHistoricalDay(
       (cov?.completion_status === 'UNVERIFIED_SOURCE');
 
     if (!forceRefetch && (isImported || (hasLocalData && cov?.data_source?.includes('IMPORT')))) {
-      // If not yet verified on Supabase, trigger background sync
-      if (isSupabaseConfigured() && cov?.remote_archive_status !== 'REMOTE_VERIFIED') {
+      // If not yet verified on Supabase, trigger background sync (only for dates >= 2026-10-23)
+      if (cleanDate >= '2026-10-23' && isSupabaseConfigured() && cov?.remote_archive_status !== 'REMOTE_VERIFIED') {
         syncDayLogsToSupabase(cleanDate).catch(() => {});
       }
 
@@ -223,8 +224,8 @@ export async function resolveHistoricalDay(
     // Case C: Day already exists locally in SQLite and is complete
     // -------------------------------------------------------------------------
     if (!forceRefetch && hasLocalData && cov?.completion_status === 'COMPLETE') {
-      // Sync to Supabase in background if missing remote verification
-      if (isSupabaseConfigured() && cov?.remote_archive_status !== 'REMOTE_VERIFIED') {
+      // Sync to Supabase in background if missing remote verification (only for dates >= 2026-10-23)
+      if (cleanDate >= '2026-10-23' && isSupabaseConfigured() && cov?.remote_archive_status !== 'REMOTE_VERIFIED') {
         syncDayLogsToSupabase(cleanDate).catch(() => {});
       }
 
@@ -459,9 +460,9 @@ export async function resolveHistoricalDay(
 
     const nowIso = new Date().toISOString();
 
-    // Sync to Supabase & verify
+    // Sync to Supabase & verify (enforce cloud archive start date 2026-10-23)
     let remoteStatus: 'REMOTE_VERIFIED' | 'REMOTE_SYNCED' | 'PENDING_REMOTE' | 'REMOTE_FAILED' | 'NONE' = 'NONE';
-    if (isSupabaseConfigured() && finalStatus !== 'FAILED') {
+    if (cleanDate >= '2026-10-23' && isSupabaseConfigured() && finalStatus !== 'FAILED') {
       options.onProgress?.('SAVING_RECORDS', 'جاري المزامنة والتحقق من Supabase...', pagesRead, pagesDiscovered, finalRawCount);
       try {
         const supaSync = await syncDayLogsToSupabase(cleanDate);

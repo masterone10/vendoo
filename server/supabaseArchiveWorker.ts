@@ -244,15 +244,16 @@ export async function triggerArchivePass(): Promise<{
 
     // -------------------------------------------------------------------------
     // 2. CANONICAL ACTIVITY EVENTS: Multi-row idempotent chunked insertion
+    // CLOUD ARCHIVE POLICY: Only archive events from 2026-10-23 onwards to Supabase
     // -------------------------------------------------------------------------
     const canonCheckpoint = getCheckpoint('canonical_activity_events');
-    const totalCanonWaiting = (db.prepare('SELECT count(*) as c FROM canonical_activity_events WHERE id > ?').get(canonCheckpoint.lastArchivedId) as any)?.c || 0;
+    const totalCanonWaiting = (db.prepare("SELECT count(*) as c FROM canonical_activity_events WHERE id > ? AND event_timestamp >= '2026-10-23 00:00:00'").get(canonCheckpoint.lastArchivedId) as any)?.c || 0;
     status.eventsWaiting = totalCanonWaiting;
 
     const canonBatch: any[] = db.prepare(`
       SELECT id, order_code, actor_name, action_type, from_status, to_status, event_timestamp, is_system_actor
       FROM canonical_activity_events
-      WHERE id > ?
+      WHERE id > ? AND event_timestamp >= '2026-10-23 00:00:00'
       ORDER BY id ASC
       LIMIT ?
     `).all(canonCheckpoint.lastArchivedId, BATCH_SIZE);
@@ -303,21 +304,22 @@ export async function triggerArchivePass(): Promise<{
       }
     }
 
-    const eventsRemaining = (db.prepare('SELECT count(*) as c FROM canonical_activity_events WHERE id > ?').get(currentCanonCheckpointId) as any)?.c || 0;
+    const eventsRemaining = (db.prepare("SELECT count(*) as c FROM canonical_activity_events WHERE id > ? AND event_timestamp >= '2026-10-23 00:00:00'").get(currentCanonCheckpointId) as any)?.c || 0;
     status.eventsArchivedThisPass = eventsArchived;
     status.eventsRemaining = eventsRemaining;
 
     // -------------------------------------------------------------------------
     // 3. RAW ACTIVITY EVENTS: Multi-row chunked insertion with ON CONFLICT DO NOTHING
+    // CLOUD ARCHIVE POLICY: Only archive raw logs from 2026-10-23 onwards to Supabase
     // -------------------------------------------------------------------------
     const rawCheckpoint = getCheckpoint('raw_activity_events');
-    const totalRawWaiting = (db.prepare('SELECT count(*) as c FROM raw_activity_events WHERE id > ?').get(rawCheckpoint.lastArchivedId) as any)?.c || 0;
+    const totalRawWaiting = (db.prepare("SELECT count(*) as c FROM raw_activity_events WHERE id > ? AND event_timestamp >= '2026-10-23 00:00:00'").get(rawCheckpoint.lastArchivedId) as any)?.c || 0;
     status.rawLogsWaiting = totalRawWaiting;
 
     const rawBatch: any[] = db.prepare(`
       SELECT id, source_hash, order_code, actor_name, raw_action_text, event_timestamp, page_source, is_duplicate
       FROM raw_activity_events
-      WHERE id > ?
+      WHERE id > ? AND event_timestamp >= '2026-10-23 00:00:00'
       ORDER BY id ASC
       LIMIT ?
     `).all(rawCheckpoint.lastArchivedId, BATCH_SIZE);
