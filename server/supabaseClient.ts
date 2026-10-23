@@ -34,6 +34,18 @@ export function isSupabaseConfigured(): boolean {
   return getDatabaseUrl() !== null;
 }
 
+export async function resetSupabasePool(): Promise<void> {
+  if (pool) {
+    const old = pool;
+    pool = null;
+    try {
+      await old.end();
+    } catch {
+      // Ignore errors when ending broken pool
+    }
+  }
+}
+
 export function getSupabasePool(): pg.Pool {
   const connStr = getDatabaseUrl();
   if (!connStr) {
@@ -46,17 +58,28 @@ export function getSupabasePool(): pg.Pool {
       ssl: {
         rejectUnauthorized: false, // Required for Supabase pooler connections in cloud containers
       },
-      max: 10,
-      idleTimeoutMillis: 15000,
-      connectionTimeoutMillis: 25000,
+      max: 4, // Optimal size for Supabase PgBouncer transaction mode pooler (port 6543)
+      idleTimeoutMillis: 10000, // Clean up idle connections before PgBouncer drops them
+      connectionTimeoutMillis: 10000, // 10s connection timeout prevents long cascading hangs
+      statement_timeout: 15000, // 15s max query execution time
+      query_timeout: 15000,
       keepAlive: true,
-      keepAliveInitialDelayMillis: 10000,
+      keepAliveInitialDelayMillis: 3000,
     });
 
     pool.on('error', (err) => {
-      console.warn('[Supabase Pool Notice]', err.message);
-      if (err.message.includes('Connection terminated') || err.message.includes('timeout')) {
-        pool = null;
+      const isConnectionDrop =
+        err.message?.includes('Connection terminated') ||
+        err.message?.includes('timeout') ||
+        err.message?.includes('ECONNRESET') ||
+        err.message?.includes('closed') ||
+        (err as any)?.code === '57P01';
+
+      if (isConnectionDrop) {
+        // Recycle pool smoothly without unhandled exceptions or socket leaks
+        resetSupabasePool().catch(() => {});
+      } else {
+        console.warn('[Supabase Pool Notice]', err.message);
       }
     });
   }
@@ -81,12 +104,13 @@ export async function pgQuery<T extends pg.QueryResultRow = any>(text: string, p
         err.message?.includes('Connection terminated') ||
         err.message?.includes('timeout') ||
         err.message?.includes('ECONNRESET') ||
+        err.message?.includes('ETIMEDOUT') ||
         err.code === '57P01';
 
       if (isTransient && attempt < 2) {
-        console.warn(`[Supabase Query Retry] Transient pool issue on attempt ${attempt}, re-acquiring connection...`);
-        pool = null;
-        await new Promise((r) => setTimeout(r, 400));
+        console.warn(`[Supabase Query Retry] Transient pool issue on attempt ${attempt} (${err.message}), re-acquiring pool connection...`);
+        await resetSupabasePool();
+        await new Promise((r) => setTimeout(r, 1000));
         continue;
       }
       break;

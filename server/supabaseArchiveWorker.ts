@@ -56,11 +56,28 @@ const status: ArchiveWorkerStatus = {
 let drainTimer: NodeJS.Timeout | null = null;
 let periodicTimer: NodeJS.Timeout | null = null;
 let scheduledIntervalMs = 300000;
+let consecutiveFailures = 0;
 const BATCH_SIZE = 200;
 const CHUNK_SIZE = 50;
 
 export function getArchiveWorkerStatus(): ArchiveWorkerStatus {
   return { ...status };
+}
+
+function isConnectionOrTimeoutError(err: any): boolean {
+  if (!err) return false;
+  const msg = String(err.message || '');
+  return (
+    msg.includes('Connection terminated') ||
+    msg.includes('timeout') ||
+    msg.includes('ECONNRESET') ||
+    msg.includes('ETIMEDOUT') ||
+    msg.includes('ECONNREFUSED') ||
+    msg.includes('closed') ||
+    err.code === '57P01' ||
+    err.code === '08006' ||
+    err.code === '08001'
+  );
 }
 
 function clearScheduledTimers() {
@@ -159,8 +176,42 @@ export async function triggerArchivePass(): Promise<{
   let eventsArchived = 0;
   let rawLogsArchived = 0;
   let failedCount = 0;
+  let hadConnectionError = false;
 
   try {
+    // 0. Pre-flight health ping: verify pool connectivity before starting batch operations
+    try {
+      await pgQuery('SELECT 1 as ping');
+    } catch (pingErr: any) {
+      consecutiveFailures++;
+      const backoffMs = Math.min(300000, Math.max(30000, consecutiveFailures * 30000));
+      status.status = 'FAILED';
+      status.batchStatus = 'FAILED';
+      status.lastError = `Supabase connection ping failed: ${pingErr.message}`;
+      console.warn(
+        `[SupabaseArchive] Pre-flight ping failed: ${pingErr.message}. Backing off next pass for ${backoffMs / 1000}s (consecutive failures: ${consecutiveFailures}).`
+      );
+
+      clearScheduledTimers();
+      if (status.isEnabled) {
+        drainTimer = setTimeout(() => {
+          triggerArchivePass().catch(() => {});
+        }, backoffMs);
+      }
+
+      return {
+        success: false,
+        ordersArchived: 0,
+        eventsArchived: 0,
+        rawLogsArchived: 0,
+        ordersRemaining: status.ordersRemaining,
+        eventsRemaining: status.eventsRemaining,
+        rawLogsRemaining: status.rawLogsRemaining,
+        isArchiveComplete: false,
+        error: pingErr.message,
+      };
+    }
+
     // -------------------------------------------------------------------------
     // 1. ORDERS: Cursor-paginated batch of up to BATCH_SIZE with multi-row chunking
     // -------------------------------------------------------------------------
@@ -168,72 +219,78 @@ export async function triggerArchivePass(): Promise<{
     const totalOrdersWaiting = (db.prepare('SELECT count(*) as c FROM orders WHERE id > ?').get(ordersCheckpoint.lastArchivedId) as any)?.c || 0;
     status.ordersWaiting = totalOrdersWaiting;
 
-    const ordersBatch: any[] = db.prepare(`
-      SELECT 
-        id, vendoor_id, random_number, order_no, order_type, current_status,
-        distinct_merchant_count, multi_merchant_flag, delivery_rate,
-        customer_phone, customer_phone_extra, extra_phone_valid,
-        customer_name, governorate, address, total_price, shipping_cost,
-        total_order, created_at_source, state_entry_at, last_observed_at
-      FROM orders
-      WHERE id > ?
-      ORDER BY id ASC
-      LIMIT ?
-    `).all(ordersCheckpoint.lastArchivedId, BATCH_SIZE);
-
     let currentOrderCheckpointId = ordersCheckpoint.lastArchivedId;
     let currentOrderCheckpointTime = ordersCheckpoint.lastArchivedAt;
 
-    for (let i = 0; i < ordersBatch.length; i += CHUNK_SIZE) {
-      const chunk = ordersBatch.slice(i, i + CHUNK_SIZE);
-      const valuesSql: string[] = [];
-      const params: any[] = [];
-      let pIdx = 1;
-
-      for (const ord of chunk) {
-        valuesSql.push(`(
-          $${pIdx++}, $${pIdx++}, $${pIdx++}, $${pIdx++}, $${pIdx++},
-          $${pIdx++}, $${pIdx++}, $${pIdx++},
-          $${pIdx++}, $${pIdx++}, $${pIdx++},
-          $${pIdx++}, $${pIdx++}, $${pIdx++}, $${pIdx++}, $${pIdx++},
-          $${pIdx++}, $${pIdx++}, $${pIdx++}, $${pIdx++}
-        )`);
-        params.push(
-          ord.vendoor_id, ord.random_number, ord.order_no, ord.order_type || 'اوردر جديد', ord.current_status,
-          ord.distinct_merchant_count || 1, ord.multi_merchant_flag || 0, ord.delivery_rate,
-          ord.customer_phone, ord.customer_phone_extra, ord.extra_phone_valid || 0,
-          ord.customer_name, ord.governorate, ord.address, ord.total_price || 0, ord.shipping_cost || 0,
-          ord.total_order || 0, ord.created_at_source, ord.state_entry_at, ord.last_observed_at
-        );
-      }
-
-      const queryText = `
-        INSERT INTO orders (
-          vendoor_id, random_number, order_no, order_type, current_status,
+    if (totalOrdersWaiting > 0) {
+      const ordersBatch: any[] = db.prepare(`
+        SELECT 
+          id, vendoor_id, random_number, order_no, order_type, current_status,
           distinct_merchant_count, multi_merchant_flag, delivery_rate,
           customer_phone, customer_phone_extra, extra_phone_valid,
           customer_name, governorate, address, total_price, shipping_cost,
           total_order, created_at_source, state_entry_at, last_observed_at
-        ) VALUES ${valuesSql.join(', ')}
-        ON CONFLICT (vendoor_id) DO UPDATE SET
-          current_status = EXCLUDED.current_status,
-          delivery_rate = EXCLUDED.delivery_rate,
-          last_observed_at = EXCLUDED.last_observed_at,
-          customer_phone_extra = COALESCE(EXCLUDED.customer_phone_extra, orders.customer_phone_extra),
-          extra_phone_valid = GREATEST(EXCLUDED.extra_phone_valid, orders.extra_phone_valid)
-      `;
+        FROM orders
+        WHERE id > ?
+        ORDER BY id ASC
+        LIMIT ?
+      `).all(ordersCheckpoint.lastArchivedId, BATCH_SIZE);
 
-      try {
-        await pgQuery(queryText, params);
-        ordersArchived += chunk.length;
-        const lastChunkItem = chunk[chunk.length - 1];
-        currentOrderCheckpointId = lastChunkItem.id;
-        currentOrderCheckpointTime = lastChunkItem.last_observed_at || currentOrderCheckpointTime;
-        updateCheckpoint('orders', currentOrderCheckpointId, currentOrderCheckpointTime, chunk.length);
-      } catch (chunkErr: any) {
-        failedCount += chunk.length;
-        console.warn(`[SupabaseArchive] Orders chunk (${chunk.length} rows) insert error:`, chunkErr.message);
-        break; // Stop advancing checkpoint past failed chunk
+      for (let i = 0; i < ordersBatch.length; i += CHUNK_SIZE) {
+        const chunk = ordersBatch.slice(i, i + CHUNK_SIZE);
+        const valuesSql: string[] = [];
+        const params: any[] = [];
+        let pIdx = 1;
+
+        for (const ord of chunk) {
+          valuesSql.push(`(
+            $${pIdx++}, $${pIdx++}, $${pIdx++}, $${pIdx++}, $${pIdx++},
+            $${pIdx++}, $${pIdx++}, $${pIdx++},
+            $${pIdx++}, $${pIdx++}, $${pIdx++},
+            $${pIdx++}, $${pIdx++}, $${pIdx++}, $${pIdx++}, $${pIdx++},
+            $${pIdx++}, $${pIdx++}, $${pIdx++}, $${pIdx++}
+          )`);
+          params.push(
+            ord.vendoor_id, ord.random_number, ord.order_no, ord.order_type || 'اوردر جديد', ord.current_status,
+            ord.distinct_merchant_count || 1, ord.multi_merchant_flag || 0, ord.delivery_rate,
+            ord.customer_phone, ord.customer_phone_extra, ord.extra_phone_valid || 0,
+            ord.customer_name, ord.governorate, ord.address, ord.total_price || 0, ord.shipping_cost || 0,
+            ord.total_order || 0, ord.created_at_source, ord.state_entry_at, ord.last_observed_at
+          );
+        }
+
+        const queryText = `
+          INSERT INTO orders (
+            vendoor_id, random_number, order_no, order_type, current_status,
+            distinct_merchant_count, multi_merchant_flag, delivery_rate,
+            customer_phone, customer_phone_extra, extra_phone_valid,
+            customer_name, governorate, address, total_price, shipping_cost,
+            total_order, created_at_source, state_entry_at, last_observed_at
+          ) VALUES ${valuesSql.join(', ')}
+          ON CONFLICT (vendoor_id) DO UPDATE SET
+            current_status = EXCLUDED.current_status,
+            delivery_rate = EXCLUDED.delivery_rate,
+            last_observed_at = EXCLUDED.last_observed_at,
+            customer_phone_extra = COALESCE(EXCLUDED.customer_phone_extra, orders.customer_phone_extra),
+            extra_phone_valid = GREATEST(EXCLUDED.extra_phone_valid, orders.extra_phone_valid)
+        `;
+
+        try {
+          await pgQuery(queryText, params);
+          ordersArchived += chunk.length;
+          const lastChunkItem = chunk[chunk.length - 1];
+          currentOrderCheckpointId = lastChunkItem.id;
+          currentOrderCheckpointTime = lastChunkItem.last_observed_at || currentOrderCheckpointTime;
+          updateCheckpoint('orders', currentOrderCheckpointId, currentOrderCheckpointTime, chunk.length);
+          await new Promise((r) => setTimeout(r, 60)); // Pacing
+        } catch (chunkErr: any) {
+          failedCount += chunk.length;
+          console.warn(`[SupabaseArchive] Orders chunk (${chunk.length} rows) insert error:`, chunkErr.message);
+          if (isConnectionOrTimeoutError(chunkErr)) {
+            hadConnectionError = true;
+          }
+          break; // Stop advancing checkpoint past failed chunk
+        }
       }
     }
 
@@ -250,57 +307,63 @@ export async function triggerArchivePass(): Promise<{
     const totalCanonWaiting = (db.prepare("SELECT count(*) as c FROM canonical_activity_events WHERE id > ? AND event_timestamp >= '2026-10-23 00:00:00'").get(canonCheckpoint.lastArchivedId) as any)?.c || 0;
     status.eventsWaiting = totalCanonWaiting;
 
-    const canonBatch: any[] = db.prepare(`
-      SELECT id, order_code, actor_name, action_type, from_status, to_status, event_timestamp, is_system_actor
-      FROM canonical_activity_events
-      WHERE id > ? AND event_timestamp >= '2026-10-23 00:00:00'
-      ORDER BY id ASC
-      LIMIT ?
-    `).all(canonCheckpoint.lastArchivedId, BATCH_SIZE);
-
     let currentCanonCheckpointId = canonCheckpoint.lastArchivedId;
     let currentCanonCheckpointTime = canonCheckpoint.lastArchivedAt;
 
-    for (let i = 0; i < canonBatch.length; i += CHUNK_SIZE) {
-      const chunk = canonBatch.slice(i, i + CHUNK_SIZE);
-      const valuesSql: string[] = [];
-      const params: any[] = [];
-      let pIdx = 1;
+    if (!hadConnectionError && totalCanonWaiting > 0) {
+      const canonBatch: any[] = db.prepare(`
+        SELECT id, order_code, actor_name, action_type, from_status, to_status, event_timestamp, is_system_actor
+        FROM canonical_activity_events
+        WHERE id > ? AND event_timestamp >= '2026-10-23 00:00:00'
+        ORDER BY id ASC
+        LIMIT ?
+      `).all(canonCheckpoint.lastArchivedId, BATCH_SIZE);
 
-      for (const ev of chunk) {
-        valuesSql.push(`($${pIdx++}, $${pIdx++}, $${pIdx++}, $${pIdx++}, $${pIdx++}, $${pIdx++}::timestamptz, $${pIdx++}::boolean)`);
-        params.push(
-          ev.order_code, ev.actor_name, ev.action_type || 'action', ev.from_status, ev.to_status,
-          ev.event_timestamp, Boolean(ev.is_system_actor)
-        );
-      }
+      for (let i = 0; i < canonBatch.length; i += CHUNK_SIZE) {
+        const chunk = canonBatch.slice(i, i + CHUNK_SIZE);
+        const valuesSql: string[] = [];
+        const params: any[] = [];
+        let pIdx = 1;
 
-      const queryText = `
-        INSERT INTO canonical_activity_events (
-          order_code, actor_name, action_type, from_status, to_status, event_timestamp, is_system_actor
-        )
-        SELECT v.order_code, v.actor_name, v.action_type, v.from_status, v.to_status, v.event_timestamp, v.is_system_actor
-        FROM (VALUES ${valuesSql.join(', ')}) AS v(order_code, actor_name, action_type, from_status, to_status, event_timestamp, is_system_actor)
-        WHERE NOT EXISTS (
-          SELECT 1 FROM canonical_activity_events c
-          WHERE (c.order_code IS NOT DISTINCT FROM v.order_code)
-            AND c.event_timestamp = v.event_timestamp
-            AND c.action_type = v.action_type
-            AND c.actor_name = v.actor_name
-        )
-      `;
+        for (const ev of chunk) {
+          valuesSql.push(`($${pIdx++}, $${pIdx++}, $${pIdx++}, $${pIdx++}, $${pIdx++}, $${pIdx++}::timestamptz, $${pIdx++}::boolean)`);
+          params.push(
+            ev.order_code, ev.actor_name, ev.action_type || 'action', ev.from_status, ev.to_status,
+            ev.event_timestamp, Boolean(ev.is_system_actor)
+          );
+        }
 
-      try {
-        await pgQuery(queryText, params);
-        eventsArchived += chunk.length;
-        const lastChunkItem = chunk[chunk.length - 1];
-        currentCanonCheckpointId = lastChunkItem.id;
-        currentCanonCheckpointTime = lastChunkItem.event_timestamp || currentCanonCheckpointTime;
-        updateCheckpoint('canonical_activity_events', currentCanonCheckpointId, currentCanonCheckpointTime, chunk.length);
-      } catch (chunkErr: any) {
-        failedCount += chunk.length;
-        console.warn(`[SupabaseArchive] Canonical events chunk (${chunk.length} rows) error:`, chunkErr.message);
-        break; // Stop advancing checkpoint past failed chunk
+        const queryText = `
+          INSERT INTO canonical_activity_events (
+            order_code, actor_name, action_type, from_status, to_status, event_timestamp, is_system_actor
+          )
+          SELECT v.order_code, v.actor_name, v.action_type, v.from_status, v.to_status, v.event_timestamp, v.is_system_actor
+          FROM (VALUES ${valuesSql.join(', ')}) AS v(order_code, actor_name, action_type, from_status, to_status, event_timestamp, is_system_actor)
+          WHERE NOT EXISTS (
+            SELECT 1 FROM canonical_activity_events c
+            WHERE (c.order_code IS NOT DISTINCT FROM v.order_code)
+              AND c.event_timestamp = v.event_timestamp
+              AND c.action_type = v.action_type
+              AND c.actor_name = v.actor_name
+          )
+        `;
+
+        try {
+          await pgQuery(queryText, params);
+          eventsArchived += chunk.length;
+          const lastChunkItem = chunk[chunk.length - 1];
+          currentCanonCheckpointId = lastChunkItem.id;
+          currentCanonCheckpointTime = lastChunkItem.event_timestamp || currentCanonCheckpointTime;
+          updateCheckpoint('canonical_activity_events', currentCanonCheckpointId, currentCanonCheckpointTime, chunk.length);
+          await new Promise((r) => setTimeout(r, 60)); // Pacing
+        } catch (chunkErr: any) {
+          failedCount += chunk.length;
+          console.warn(`[SupabaseArchive] Canonical events chunk (${chunk.length} rows) error:`, chunkErr.message);
+          if (isConnectionOrTimeoutError(chunkErr)) {
+            hadConnectionError = true;
+          }
+          break; // Stop advancing checkpoint past failed chunk
+        }
       }
     }
 
@@ -316,49 +379,55 @@ export async function triggerArchivePass(): Promise<{
     const totalRawWaiting = (db.prepare("SELECT count(*) as c FROM raw_activity_events WHERE id > ? AND event_timestamp >= '2026-10-23 00:00:00'").get(rawCheckpoint.lastArchivedId) as any)?.c || 0;
     status.rawLogsWaiting = totalRawWaiting;
 
-    const rawBatch: any[] = db.prepare(`
-      SELECT id, source_hash, order_code, actor_name, raw_action_text, event_timestamp, page_source, is_duplicate
-      FROM raw_activity_events
-      WHERE id > ? AND event_timestamp >= '2026-10-23 00:00:00'
-      ORDER BY id ASC
-      LIMIT ?
-    `).all(rawCheckpoint.lastArchivedId, BATCH_SIZE);
-
     let currentRawCheckpointId = rawCheckpoint.lastArchivedId;
     let currentRawCheckpointTime = rawCheckpoint.lastArchivedAt;
 
-    for (let i = 0; i < rawBatch.length; i += CHUNK_SIZE) {
-      const chunk = rawBatch.slice(i, i + CHUNK_SIZE);
-      const valuesSql: string[] = [];
-      const params: any[] = [];
-      let pIdx = 1;
+    if (!hadConnectionError && totalRawWaiting > 0) {
+      const rawBatch: any[] = db.prepare(`
+        SELECT id, source_hash, order_code, actor_name, raw_action_text, event_timestamp, page_source, is_duplicate
+        FROM raw_activity_events
+        WHERE id > ? AND event_timestamp >= '2026-10-23 00:00:00'
+        ORDER BY id ASC
+        LIMIT ?
+      `).all(rawCheckpoint.lastArchivedId, BATCH_SIZE);
 
-      for (const rawEv of chunk) {
-        valuesSql.push(`($${pIdx++}, $${pIdx++}, $${pIdx++}, $${pIdx++}, $${pIdx++}::timestamptz, $${pIdx++}, $${pIdx++}::boolean)`);
-        params.push(
-          rawEv.source_hash, rawEv.order_code, rawEv.actor_name, rawEv.raw_action_text,
-          rawEv.event_timestamp, rawEv.page_source || 'log/system', Boolean(rawEv.is_duplicate)
-        );
-      }
+      for (let i = 0; i < rawBatch.length; i += CHUNK_SIZE) {
+        const chunk = rawBatch.slice(i, i + CHUNK_SIZE);
+        const valuesSql: string[] = [];
+        const params: any[] = [];
+        let pIdx = 1;
 
-      const queryText = `
-        INSERT INTO raw_activity_events (
-          source_hash, order_code, actor_name, raw_action_text, event_timestamp, page_source, is_duplicate
-        ) VALUES ${valuesSql.join(', ')}
-        ON CONFLICT (source_hash) DO NOTHING
-      `;
+        for (const rawEv of chunk) {
+          valuesSql.push(`($${pIdx++}, $${pIdx++}, $${pIdx++}, $${pIdx++}, $${pIdx++}::timestamptz, $${pIdx++}, $${pIdx++}::boolean)`);
+          params.push(
+            rawEv.source_hash, rawEv.order_code, rawEv.actor_name, rawEv.raw_action_text,
+            rawEv.event_timestamp, rawEv.page_source || 'log/system', Boolean(rawEv.is_duplicate)
+          );
+        }
 
-      try {
-        await pgQuery(queryText, params);
-        rawLogsArchived += chunk.length;
-        const lastChunkItem = chunk[chunk.length - 1];
-        currentRawCheckpointId = lastChunkItem.id;
-        currentRawCheckpointTime = lastChunkItem.event_timestamp || currentRawCheckpointTime;
-        updateCheckpoint('raw_activity_events', currentRawCheckpointId, currentRawCheckpointTime, chunk.length);
-      } catch (chunkErr: any) {
-        failedCount += chunk.length;
-        console.warn(`[SupabaseArchive] Raw logs chunk (${chunk.length} rows) error:`, chunkErr.message);
-        break; // Stop advancing checkpoint past failed chunk
+        const queryText = `
+          INSERT INTO raw_activity_events (
+            source_hash, order_code, actor_name, raw_action_text, event_timestamp, page_source, is_duplicate
+          ) VALUES ${valuesSql.join(', ')}
+          ON CONFLICT (source_hash) DO NOTHING
+        `;
+
+        try {
+          await pgQuery(queryText, params);
+          rawLogsArchived += chunk.length;
+          const lastChunkItem = chunk[chunk.length - 1];
+          currentRawCheckpointId = lastChunkItem.id;
+          currentRawCheckpointTime = lastChunkItem.event_timestamp || currentRawCheckpointTime;
+          updateCheckpoint('raw_activity_events', currentRawCheckpointId, currentRawCheckpointTime, chunk.length);
+          await new Promise((r) => setTimeout(r, 60)); // Pacing
+        } catch (chunkErr: any) {
+          failedCount += chunk.length;
+          console.warn(`[SupabaseArchive] Raw logs chunk (${chunk.length} rows) error:`, chunkErr.message);
+          if (isConnectionOrTimeoutError(chunkErr)) {
+            hadConnectionError = true;
+          }
+          break; // Stop advancing checkpoint past failed chunk
+        }
       }
     }
 
@@ -379,8 +448,10 @@ export async function triggerArchivePass(): Promise<{
 
     // Distinct evaluation of pass outcome vs overall archival state
     let batchStatus: 'SUCCESS' | 'PARTIAL' | 'FAILED' | 'IDLE';
-    if (failedCount > 0) {
-      batchStatus = totalArchivedThisPass > 0 ? 'PARTIAL' : 'FAILED';
+    if (hadConnectionError || (failedCount > 0 && totalArchivedThisPass === 0)) {
+      batchStatus = 'FAILED';
+    } else if (failedCount > 0) {
+      batchStatus = 'PARTIAL';
     } else if (totalArchivedThisPass > 0) {
       batchStatus = 'SUCCESS';
     } else {
@@ -398,16 +469,15 @@ export async function triggerArchivePass(): Promise<{
 
     if (isArchiveComplete) {
       status.status = 'FULLY_ARCHIVED';
-    } else if (failedCount > 0 && totalArchivedThisPass === 0) {
+    } else if (batchStatus === 'FAILED') {
       status.status = 'FAILED';
-    } else if (failedCount > 0) {
+    } else if (batchStatus === 'PARTIAL') {
       status.status = 'PARTIAL';
     } else {
       status.status = 'DRAINING';
     }
 
-    // Diagnostics & logging level:
-    // Success and normal backlog drains log as INFO. Real errors log as WARN/ERROR.
+    // Diagnostics & logging:
     if (totalWaitingBeforePass === 0 && totalArchivedThisPass === 0) {
       console.log(`[SupabaseArchive] Idle — local queue is fully synchronized with Supabase (0 records remaining).`);
     } else if (failedCount === 0) {
@@ -425,16 +495,23 @@ export async function triggerArchivePass(): Promise<{
       );
     }
 
-    // Controlled scheduling:
-    // When remaining backlog exists, schedule next drain pass with small delay (6 seconds)
-    // When queue is empty, enter periodic mode (300 seconds)
+    // Controlled scheduling with exponential backoff on failure:
     clearScheduledTimers();
     if (status.isEnabled) {
-      if (totalRemaining > 0) {
+      if (batchStatus === 'FAILED') {
+        consecutiveFailures++;
+        const backoffMs = Math.min(300000, Math.max(30000, consecutiveFailures * 30000));
+        console.warn(`[SupabaseArchive] Backing off next drain pass for ${backoffMs / 1000}s due to failure (consecutive: ${consecutiveFailures}).`);
+        drainTimer = setTimeout(() => {
+          triggerArchivePass().catch(() => {});
+        }, backoffMs);
+      } else if (totalRemaining > 0) {
+        consecutiveFailures = 0;
         drainTimer = setTimeout(() => {
           triggerArchivePass().catch(() => {});
         }, 6000);
       } else {
+        consecutiveFailures = 0;
         periodicTimer = setTimeout(() => {
           triggerArchivePass().catch(() => {});
         }, scheduledIntervalMs);
@@ -452,16 +529,18 @@ export async function triggerArchivePass(): Promise<{
       isArchiveComplete,
     };
   } catch (err: any) {
+    consecutiveFailures++;
+    const backoffMs = Math.min(300000, Math.max(30000, consecutiveFailures * 30000));
     status.status = 'FAILED';
     status.batchStatus = 'FAILED';
     status.lastError = `Archive error: ${err.message}`;
-    console.error('[SupabaseArchive Worker Fatal Error]:', err.message);
+    console.error(`[SupabaseArchive Worker Fatal Error]: ${err.message}. Backing off for ${backoffMs / 1000}s.`);
 
     clearScheduledTimers();
     if (status.isEnabled) {
-      periodicTimer = setTimeout(() => {
+      drainTimer = setTimeout(() => {
         triggerArchivePass().catch(() => {});
-      }, 30000); // Retry after 30s on fatal exception
+      }, backoffMs);
     }
 
     return {

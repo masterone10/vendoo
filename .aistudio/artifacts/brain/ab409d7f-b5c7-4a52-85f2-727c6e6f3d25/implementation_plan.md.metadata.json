@@ -1,6 +1,6 @@
 {
-  "summary":  "Implementation plan for presenting full data and dedicated drilldown modals for critical risk indicators (multi-merchant codes, missing extra phone, delivery rate < 70%) with status filtering, comprehensive columns, and search.",
-  "updatedAt":  "2026-10-22T12:44:43.488335815Z",
+  "summary":  "خطة تنفيذ شاملة لإصلاح آلية تحميل التقارير واستكمال البيانات الناقصة ومعالجة تاريخ قطع الأرشيف السحابي وتحديث واجهة المستخدم تلقائيًا بشارة 'البيانات غير مكتملة — جاري الاستكمال'.",
+  "updatedAt":  "2026-10-23T17:07:19.463442571Z",
   "requestFeedback":  true,
   "userFacing":  true
 }

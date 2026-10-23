@@ -607,16 +607,44 @@ class VendoorClient {
     return rows;
   }
 
+  public buildSystemLogsUrl(page = 1, startDate = '', endDate = ''): URL {
+    const url = new URL(`${this.baseUrl}/dashboard/log/system`);
+    url.searchParams.set('page', String(page));
+    const cleanStart = (startDate || '').trim().slice(0, 10);
+    const cleanEnd = (endDate || cleanStart).trim().slice(0, 10);
+    if (cleanStart) {
+      url.searchParams.set('start_date', cleanStart);
+      url.searchParams.set('from_date', cleanStart);
+    }
+    if (cleanEnd) {
+      url.searchParams.set('end_date', cleanEnd);
+      url.searchParams.set('to_date', cleanEnd);
+    }
+    return url;
+  }
+
+  public buildExcelExportUrl(startDate = '', endDate = ''): URL {
+    const url = new URL(`${this.baseUrl}/dashboard/log/xls/all`);
+    const cleanStart = (startDate || '').trim().slice(0, 10);
+    const cleanEnd = (endDate || cleanStart).trim().slice(0, 10);
+    if (cleanStart) {
+      url.searchParams.set('start_date', cleanStart);
+      url.searchParams.set('from_date', cleanStart);
+    }
+    if (cleanEnd) {
+      url.searchParams.set('end_date', cleanEnd);
+      url.searchParams.set('to_date', cleanEnd);
+    }
+    return url;
+  }
+
   public async fetchSystemLogs(page = 1, startDate = '', endDate = ''): Promise<{
     entries: LogEntry[];
     totalPages: number;
   }> {
     await this.ensureAuthenticated();
 
-    const url = new URL(`${this.baseUrl}/dashboard/log/system`);
-    url.searchParams.set('page', String(page));
-    if (startDate) url.searchParams.set('start_date', startDate);
-    if (endDate) url.searchParams.set('end_date', endDate);
+    const url = this.buildSystemLogsUrl(page, startDate, endDate);
 
     const res = await this.fetchWithRetry(url.toString(), {
       headers: {
@@ -678,12 +706,7 @@ class VendoorClient {
   public async exportSystemLogsExcel(startDate: string, endDate: string): Promise<Buffer> {
     await this.ensureAuthenticated();
 
-    const cleanStart = (startDate || '').trim().slice(0, 10);
-    const cleanEnd = (endDate || cleanStart).trim().slice(0, 10);
-
-    const url = new URL(`${this.baseUrl}/dashboard/log/xls/all`);
-    if (cleanStart) url.searchParams.set('start_date', cleanStart);
-    if (cleanEnd) url.searchParams.set('end_date', cleanEnd);
+    const url = this.buildExcelExportUrl(startDate, endDate);
 
     const res = await this.fetchWithRetry(
       url.toString(),

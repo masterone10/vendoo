@@ -496,6 +496,9 @@ export async function resolveHistoricalDay(
                 );
                 const nextP = await vendoorClient.fetchSystemLogs(p, cleanDate, cleanDate);
                 pagesRead = p;
+                if (nextP.totalPages > pagesDiscovered) {
+                  pagesDiscovered = nextP.totalPages;
+                }
 
                 options.onProgress?.('SAVING_RECORDS', `جاري حفظ السجلات (صفحة ${p}/${pagesDiscovered})...`, p, pagesDiscovered, recordsSavedThisPass);
                 const nextRes = persistLogEntries(nextP.entries, interval, {

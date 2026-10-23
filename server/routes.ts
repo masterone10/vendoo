@@ -56,6 +56,12 @@ export function isCSEmployee(actorName: string): boolean {
 
 export const apiRouter = Router();
 
+// Ensure all responses from apiRouter explicitly declare JSON content type
+apiRouter.use((_req, res, next) => {
+  res.setHeader('Content-Type', 'application/json; charset=utf-8');
+  next();
+});
+
 // 1. Health & Sync Status
 apiRouter.get('/health', (_req: Request, res: Response) => {
   const syncStatus = syncEngine.getStatus();
@@ -1500,6 +1506,17 @@ apiRouter.post('/reports/day-action', async (req: Request, res: Response) => {
     } else if (action === 'force_refetch') {
       result = await resolveHistoricalDay(cleanDate, { forceRefetch: true });
     } else if (action === 'sync_supabase') {
+      if (cleanDate < '2026-10-23') {
+        return res.status(400).json({
+          success: false,
+          error: {
+            code: 'PRE_CUTOFF_ARCHIVE_NOT_ALLOWED',
+            message: 'سياسة الأرشيف السحابي تبدأ من 23 أكتوبر 2026 فقط. الأيام السابقة تبقى محفوظة محلياً في SQLite.',
+            retryable: false,
+            requestId: crypto.randomUUID(),
+          },
+        });
+      }
       await syncDayLogsToSupabase(cleanDate);
       result = await resolveHistoricalDay(cleanDate, { autoFetchMissing: false });
     } else if (action === 'reconcile') {
@@ -1508,13 +1525,31 @@ apiRouter.post('/reports/day-action', async (req: Request, res: Response) => {
       res.json({ success: true, dayStatus: result, reconciliation: rec });
       return;
     } else {
-      res.status(400).json({ success: false, error: `Unknown action: ${action}` });
-      return;
+      const requestId = crypto.randomUUID();
+      return res.status(400).json({
+        success: false,
+        error: {
+          code: 'UNKNOWN_ACTION',
+          message: `الإجراء المطلوب '${action}' غير مدعوم`,
+          retryable: false,
+          requestId,
+        },
+      });
     }
 
     res.json({ success: true, dayStatus: result });
   } catch (err: any) {
-    res.status(500).json({ success: false, error: err.message });
+    const requestId = crypto.randomUUID();
+    console.error(`[DayAction API Error] [${requestId}]:`, err);
+    res.status(500).json({
+      success: false,
+      error: {
+        code: 'DAY_ACTION_FAILED',
+        message: err.message || 'حدث خطأ أثناء تنفيذ إجراء اليوم',
+        retryable: true,
+        requestId,
+      },
+    });
   }
 });
 

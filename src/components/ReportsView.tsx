@@ -324,21 +324,27 @@ export const ReportsView: React.FC<ReportsViewProps> = ({ onSelectOrder }) => {
             json.jobStatus.stage === 'COMPUTING_METRICS' ||
             json.jobStatus.stage === 'PREPARING_REPORT');
 
+        const totalLogs = rep.metrics?.totalLogs ?? 0;
+        const uniqueOrders = rep.metrics?.uniqueOrdersTouched ?? 0;
+        const hasData = totalLogs > 0 || uniqueOrders > 0;
+
         if (isRunning) {
-          if (json.jobStatus.stage === 'FETCHING_VENDOOR') {
-            setViewState('fetching_source');
-          } else if (json.jobStatus.stage === 'SAVING_RECORDS' || json.jobStatus.stage === 'ANALYZING_ACTIONS') {
-            setViewState('saving');
+          // If partial data exists, show it immediately with incomplete badge and poll in background
+          if (hasData) {
+            setLoading(false);
+            setViewState('partial');
           } else {
-            setViewState('loading');
+            if (json.jobStatus.stage === 'FETCHING_VENDOOR') {
+              setViewState('fetching_source');
+            } else if (json.jobStatus.stage === 'SAVING_RECORDS' || json.jobStatus.stage === 'ANALYZING_ACTIONS') {
+              setViewState('saving');
+            } else {
+              setViewState('loading');
+            }
           }
           startPolling(s, e, currentRequestId);
         } else {
           setLoading(false);
-          const totalLogs = rep.metrics?.totalLogs ?? 0;
-          const uniqueOrders = rep.metrics?.uniqueOrdersTouched ?? 0;
-          const hasData = totalLogs > 0 || uniqueOrders > 0;
-
           if (!hasData) {
             setViewState('empty');
           } else if (rep.status === 'PARTIAL' || (rep.coverage && !rep.coverage.isFullyComplete)) {
@@ -429,34 +435,42 @@ export const ReportsView: React.FC<ReportsViewProps> = ({ onSelectOrder }) => {
 
         if (data.success && data.job) {
           setJobStatus(data.job);
-          if (data.job.stage === 'FETCHING_VENDOOR') {
-            setViewState('fetching_source');
-          } else if (data.job.stage === 'SAVING_RECORDS' || data.job.stage === 'ANALYZING_ACTIONS') {
-            setViewState('saving');
-          } else if (data.job.stage === 'CHECKING_STORAGE' || data.job.stage === 'COMPUTING_METRICS' || data.job.stage === 'PREPARING_REPORT') {
-            setViewState('loading');
-          }
 
           if (data.job.stage === 'FAILED') {
             clearInterval(pollIntervalRef.current);
+            pollIntervalRef.current = null;
             setLoading(false);
-            setViewState('error');
-            setErrorDetails({
-              code: 'LOG_JOB_FAILED',
-              message: data.job.error || 'تعذر إكمال عملية جلب وتحليل اللوجز بنجاح',
-              category: 'SERVER_ERROR',
-              periodLabel: s === e ? s : `${s} إلى ${e}`,
-              startDate: s,
-              endDate: e,
-              retryable: true,
-            });
+            // If partial report is available, retain it in view instead of replacing with full-screen error!
+            if (report && ((report.metrics?.totalLogs ?? 0) > 0 || (report.metrics?.uniqueOrdersTouched ?? 0) > 0)) {
+              setViewState('partial');
+              setErrorDetails({
+                code: 'LOG_JOB_FAILED',
+                message: data.job.error || 'تعذر استكمال جلب كافة الصفحات من Vendoor، وتم الاحتفاظ بالبيانات الجزئية المتوفرة',
+                category: 'SERVER_ERROR',
+                periodLabel: s === e ? s : `${s} إلى ${e}`,
+                startDate: s,
+                endDate: e,
+                retryable: true,
+              });
+            } else {
+              setViewState('error');
+              setErrorDetails({
+                code: 'LOG_JOB_FAILED',
+                message: data.job.error || 'تعذر إكمال عملية جلب وتحليل اللوجز بنجاح',
+                category: 'SERVER_ERROR',
+                periodLabel: s === e ? s : `${s} إلى ${e}`,
+                startDate: s,
+                endDate: e,
+                retryable: true,
+              });
+            }
             return;
           }
 
           if (data.job.stage === 'COMPLETE' || data.job.stage === 'PARTIAL') {
             clearInterval(pollIntervalRef.current);
             pollIntervalRef.current = null;
-            // Refresh final report data
+            // Refresh final report data silently without full-page reloads
             try {
               const repRes = await fetch(`/api/reports/logs-intelligence?startDate=${encodeURIComponent(s)}&endDate=${encodeURIComponent(e)}&autoFetch=false`);
               if (parentRequestId !== requestIdRef.current) return;
@@ -470,6 +484,8 @@ export const ReportsView: React.FC<ReportsViewProps> = ({ onSelectOrder }) => {
                 if (repData.success && repData.report) {
                   const rep = repData.report;
                   setReport(rep);
+                  setJobStatus(null);
+                  setErrorDetails(null);
                   setLoading(false);
                   const totalLogs = rep.metrics?.totalLogs ?? 0;
                   const uniqueOrders = rep.metrics?.uniqueOrdersTouched ?? 0;
@@ -493,7 +509,7 @@ export const ReportsView: React.FC<ReportsViewProps> = ({ onSelectOrder }) => {
               console.warn('Error refreshing final report after job complete:', err);
             } finally {
               setLoading(false);
-              setViewState('success');
+              setJobStatus(null);
               if (calendarMode === 'single' || s === e) {
                 fetchDayStatus(s);
               }
@@ -607,20 +623,31 @@ export const ReportsView: React.FC<ReportsViewProps> = ({ onSelectOrder }) => {
     });
   }, [report?.employees, employeeSearch, employeeTypeFilter]);
 
-  // Is infinity loading active?
-  const isFetchingLogs = Boolean(
-    loading ||
-    viewState === 'loading' ||
-    viewState === 'fetching_source' ||
-    viewState === 'saving' ||
-    (jobStatus &&
+  // Report data presence check
+  const hasLoadedReportData = Boolean(
+    report && ((report.metrics?.totalLogs ?? 0) > 0 || (report.metrics?.uniqueOrdersTouched ?? 0) > 0)
+  );
+
+  const isJobRunningInBackground = Boolean(
+    jobStatus &&
       (jobStatus.stage === 'CHECKING_STORAGE' ||
         jobStatus.stage === 'FETCHING_VENDOOR' ||
         jobStatus.stage === 'SAVING_RECORDS' ||
         jobStatus.stage === 'ANALYZING_ACTIONS' ||
         jobStatus.stage === 'COMPUTING_METRICS' ||
-        jobStatus.stage === 'PREPARING_REPORT'))
+        jobStatus.stage === 'PREPARING_REPORT')
   );
+
+  // Blocking loading indicator only applies when we have NO data to show yet
+  const isBlockingLoading = Boolean(
+    !hasLoadedReportData &&
+      (loading ||
+        viewState === 'loading' ||
+        viewState === 'fetching_source' ||
+        viewState === 'saving')
+  );
+
+  const isFetchingLogs = Boolean(loading || isJobRunningInBackground);
 
   return (
     <div className="space-y-6 animate-in fade-in duration-300 pb-16">
@@ -978,8 +1005,8 @@ export const ReportsView: React.FC<ReportsViewProps> = ({ onSelectOrder }) => {
         </div>
       )}
 
-      {/* 2. THE ANIMATED INFINITY LOADING INDICATOR (∞) */}
-      {isFetchingLogs && (
+      {/* 2. THE ANIMATED INFINITY LOADING INDICATOR (∞) - only when blocking/initial */}
+      {isBlockingLoading && (
         <div className="bg-slate-900/90 border border-amber-500/30 rounded-2xl p-6 shadow-2xl backdrop-blur-md flex flex-col items-center justify-center text-center animate-in fade-in duration-300">
           {/* Animated Lemniscate SVG */}
           <div className="relative mb-3 flex items-center justify-center animate-infinity-glow">
@@ -1081,8 +1108,80 @@ export const ReportsView: React.FC<ReportsViewProps> = ({ onSelectOrder }) => {
         </div>
       )}
 
-      {/* 2.5 ERROR STATE: Clear, unambiguous failure and recovery path */}
-      {viewState === 'error' && !isFetchingLogs && (
+      {/* 2.4 LIVE IN-PROGRESS BACKGROUND COMPLETION BANNER (Non-blocking preview) */}
+      {isJobRunningInBackground && hasLoadedReportData && (
+        <div className="bg-amber-950/20 border-2 border-amber-500/40 rounded-2xl p-4 lg:p-5 shadow-lg flex flex-col md:flex-row items-start md:items-center justify-between gap-4 animate-in fade-in duration-300">
+          <div className="flex items-start gap-3">
+            <div className="p-2.5 rounded-xl bg-amber-500/20 text-amber-400 border border-amber-500/30 shrink-0">
+              <RefreshCw className="w-5 h-5 animate-spin" />
+            </div>
+            <div>
+              <div className="flex flex-wrap items-center gap-2">
+                <span className="px-3 py-1 rounded-full text-xs font-bold bg-amber-500 text-slate-950 shadow-sm animate-pulse">
+                  البيانات غير مكتملة — جاري الاستكمال
+                </span>
+                <span className="text-xs font-medium text-amber-300">
+                  {jobStatus?.stageLabelAr || 'جاري استكمال الصفحات الناقصة من Vendoor...'}
+                </span>
+              </div>
+              <p className="text-xs text-slate-400 mt-1 font-sans">
+                يتم عرض البيانات المتوفرة حالياً مؤقتاً، وستتحدث الأرقام والجداول تلقائياً فور اكتمال الجلب دون الحاجة لتحديث الصفحة.
+              </p>
+            </div>
+          </div>
+
+          {jobStatus && (
+            <div className="flex flex-wrap items-center gap-2.5 w-full md:w-auto">
+              {jobStatus.pagesTotal > 0 && (
+                <div className="flex items-center gap-2 px-3 py-1.5 rounded-xl bg-slate-950 border border-slate-800 text-xs font-mono text-slate-300">
+                  <span>الصفحة:</span>
+                  <strong className="text-amber-400">{jobStatus.pagesFetched || 0}</strong>
+                  <span className="text-slate-500">من</span>
+                  <strong className="text-slate-200">{jobStatus.pagesTotal || 1}</strong>
+                </div>
+              )}
+              <div className="flex items-center gap-2 px-3 py-1.5 rounded-xl bg-slate-950 border border-slate-800 text-xs font-mono text-slate-300">
+                <span>سجلات محفوظة:</span>
+                <strong className="text-emerald-400">{(jobStatus.eventsSaved || 0).toLocaleString()}</strong>
+              </div>
+            </div>
+          )}
+        </div>
+      )}
+
+      {/* Non-blocking error banner when background completion fails but partial data exists */}
+      {errorDetails && hasLoadedReportData && !isJobRunningInBackground && (
+        <div className="bg-rose-950/20 border-2 border-rose-500/40 rounded-2xl p-4 shadow-lg flex flex-col md:flex-row items-start md:items-center justify-between gap-4 animate-in fade-in duration-300">
+          <div className="flex items-start gap-3">
+            <div className="p-2.5 rounded-xl bg-rose-500/20 text-rose-400 border border-rose-500/30 shrink-0">
+              <AlertCircle className="w-5 h-5" />
+            </div>
+            <div>
+              <div className="flex items-center gap-2">
+                <span className="px-2.5 py-0.5 rounded-full text-xs font-bold bg-rose-500 text-slate-950">
+                  البيانات غير مكتملة (توقف الاستكمال)
+                </span>
+                <h3 className="text-xs font-bold text-rose-200">
+                  {errorDetails.message}
+                </h3>
+              </div>
+              <p className="text-xs text-rose-300/80 mt-1 font-sans">
+                تم الاحتفاظ بالبيانات الجزئية المتوفرة حتى لا تفقد نتائج العمل. يمكنك إعادة محاولة استكمال الصفحات من Vendoor.
+              </p>
+            </div>
+          </div>
+          <button
+            onClick={() => fetchReport(effectiveStart, effectiveEnd, true)}
+            className="flex items-center gap-1.5 px-3 py-1.5 rounded-xl bg-rose-500 hover:bg-rose-400 text-slate-950 font-bold text-xs shadow transition"
+          >
+            <RefreshCw className="w-3.5 h-3.5" />
+            <span>إعادة محاولة الاستكمال</span>
+          </button>
+        </div>
+      )}
+
+      {/* 2.5 ERROR STATE: Full screen error ONLY if no data is loaded */}
+      {viewState === 'error' && !hasLoadedReportData && !isFetchingLogs && (
         <div className="bg-rose-950/20 border-2 border-rose-500/40 rounded-3xl p-6 lg:p-8 shadow-2xl backdrop-blur-md animate-in fade-in zoom-in-95 duration-300">
           <div className="flex flex-col md:flex-row items-start md:items-center justify-between gap-6 pb-6 border-b border-rose-500/20">
             <div className="flex items-start gap-4">
