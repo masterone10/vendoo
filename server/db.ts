@@ -1,3 +1,4 @@
+import './env.ts';
 import { DatabaseSync } from 'node:sqlite';
 import fs from 'node:fs';
 import path from 'node:path';
@@ -482,6 +483,9 @@ export function initDatabase() {
   tryRunMigration("ALTER TABLE merchant_code_mappings ADD COLUMN warehouse_name TEXT");
   tryRunMigration("ALTER TABLE merchant_code_mappings ADD COLUMN updated_at TEXT");
 
+  // Verify and enforce required columns on orders table
+  ensureOrdersColumnsExist();
+
   // 3. Create all indexes safely
   db.exec(`
     CREATE INDEX IF NOT EXISTS idx_mcm_sku ON merchant_code_mappings(sku);
@@ -824,11 +828,74 @@ export function repairMerchantAndWarehouseData(onlyIfUnrepaired = false) {
   }
 }
 
-function tryRunMigration(sql: string) {
+export interface MigrationFailure {
+  sql: string;
+  error: string;
+  timestamp: string;
+}
+
+export const migrationFailures: MigrationFailure[] = [];
+
+export function tryRunMigration(sql: string): boolean {
   try {
     db.exec(sql);
+    return true;
   } catch (err: any) {
-    // Column already exists or duplicate column name is normal during migrations
+    const msg = String(err?.message || '');
+    if (msg.includes('duplicate column name') || msg.includes('already exists')) {
+      // Normal idempotent migration behavior: column already present
+      return false;
+    }
+    // Genuine migration failure: record and log
+    console.error(`[DB Migration Failure] SQL: "${sql}" Error: ${msg}`);
+    migrationFailures.push({
+      sql,
+      error: msg,
+      timestamp: new Date().toISOString(),
+    });
+    return false;
+  }
+}
+
+export function ensureOrdersColumnsExist() {
+  const columns = new Set<string>();
+  try {
+    const rows: any[] = db.prepare("PRAGMA table_info(orders)").all();
+    for (const r of rows) {
+      if (r.name) columns.add(r.name.toLowerCase());
+    }
+  } catch (err: any) {
+    console.warn('[DB] Could not check orders table info:', err.message);
+    return;
+  }
+
+  const requiredDefs: [string, string][] = [
+    ['distinct_warehouse_count', 'INTEGER DEFAULT 1'],
+    ['distinct_merchant_count', 'INTEGER DEFAULT 1'],
+    ['multi_warehouse_flag', 'INTEGER DEFAULT 0'],
+    ['multi_merchant_flag', 'INTEGER DEFAULT 0'],
+    ['delivery_rate', 'REAL'],
+    ['delivery_rate_num', 'INTEGER'],
+    ['delivery_rate_denom', 'INTEGER'],
+    ['cancel_rate', 'REAL'],
+    ['cancel_rate_num', 'INTEGER'],
+    ['cancel_rate_denom', 'INTEGER'],
+    ['canceling_date', 'TEXT'],
+    ['extra_phone_status', "TEXT DEFAULT 'NOT_RETRIEVED'"],
+    ['extra_phone_valid', 'INTEGER DEFAULT 0'],
+    ['address_word_count', 'INTEGER'],
+    ['address_is_latin', 'INTEGER DEFAULT 0'],
+    ['address_quality_status', "TEXT DEFAULT 'NOT_RETRIEVED'"],
+    ['last_enrichment_at', 'TEXT'],
+    ['last_enrichment_status', 'TEXT'],
+    ['validation_status', "TEXT DEFAULT 'PENDING_VALIDATION'"],
+    ['storage_tier', "TEXT DEFAULT 'HOT'"],
+  ];
+
+  for (const [colName, colType] of requiredDefs) {
+    if (!columns.has(colName.toLowerCase())) {
+      tryRunMigration(`ALTER TABLE orders ADD COLUMN ${colName} ${colType}`);
+    }
   }
 }
 

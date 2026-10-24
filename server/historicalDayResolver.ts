@@ -117,8 +117,9 @@ export async function resolveHistoricalDay(
     // Case A & B: Check Supabase PostgreSQL Archive
     // CLOUD ARCHIVE POLICY: Remote archive begins from 2026-10-23.
     // Days prior to 2026-10-23 are stored locally in SQLite and not queried from remote.
+    // Query/restore from Supabase ONLY when local data is absent and autoFetchMissing is enabled.
     // -------------------------------------------------------------------------
-    if (!forceRefetch && cleanDate >= '2026-10-23' && isSupabaseConfigured() && (!hasLocalData || cov?.completion_status === 'PARTIAL' || !cov)) {
+    if (!forceRefetch && cleanDate >= '2026-10-23' && isSupabaseConfigured() && !hasLocalData && autoFetchMissing) {
       options.onProgress?.('CHECKING_STORAGE', 'جاري فحص أرشيف Supabase البعيد...', 0, 1, 0);
       try {
         const restoreRes = await fetchDayLogsFromSupabase(cleanDate);
@@ -193,14 +194,16 @@ export async function resolveHistoricalDay(
 
     // -------------------------------------------------------------------------
     // Case B: Day exists from Excel / CSV Import
-    // Rule: Existence in external import STRICTLY blocks automatic full Vendoor download.
+    // Rule: Verified complete imports (COMPLETE) are used immediately.
+    // If completion_status is UNVERIFIED_SOURCE or PARTIAL, automatic completion
+    // is allowed and encouraged to ensure full historical coverage.
     // -------------------------------------------------------------------------
     const isImported =
       cov?.data_source === 'EXCEL_IMPORT' ||
       cov?.data_source === 'CSV_IMPORT' ||
       (cov?.completion_status === 'UNVERIFIED_SOURCE');
 
-    if (!forceRefetch && (isImported || (hasLocalData && cov?.data_source?.includes('IMPORT')))) {
+    if (!forceRefetch && isImported && hasLocalData) {
       // If not yet verified on Supabase, trigger background sync (only for dates >= 2026-10-23)
       if (cleanDate >= '2026-10-23' && isSupabaseConfigured() && cov?.remote_archive_status !== 'REMOTE_VERIFIED') {
         syncDayLogsToSupabase(cleanDate).catch(() => {});
@@ -216,7 +219,9 @@ export async function resolveHistoricalDay(
         rawRecordsCount: rawCount,
         canonicalEventsCount: canonCount,
         loadedFromCache: true,
-        messageAr: 'البيانات مستوردة من ملف خارجي (يمنع السحب التلقائي، متاح للاستعراض والتقرير)',
+        messageAr: cov?.completion_status === 'COMPLETE'
+          ? 'البيانات مستوردة ومكتملة من ملف خارجي موثوق'
+          : 'البيانات مستوردة محلياً من ملف خارجي (مصدر غير موثق بالكامل)',
       };
     }
 

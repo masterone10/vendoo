@@ -34,8 +34,8 @@ export function isSupabaseConfigured(): boolean {
   return getDatabaseUrl() !== null;
 }
 
-export async function resetSupabasePool(): Promise<void> {
-  if (pool) {
+export async function resetSupabasePool(targetPool?: pg.Pool): Promise<void> {
+  if (pool && (!targetPool || pool === targetPool)) {
     const old = pool;
     pool = null;
     try {
@@ -67,7 +67,8 @@ export function getSupabasePool(): pg.Pool {
       keepAliveInitialDelayMillis: 10000,
     });
 
-    pool.on('error', (err) => {
+    const currentPoolInstance = pool;
+    currentPoolInstance.on('error', (err) => {
       const isConnectionDrop =
         err.message?.includes('Connection terminated') ||
         err.message?.includes('timeout') ||
@@ -76,8 +77,8 @@ export function getSupabasePool(): pg.Pool {
         (err as any)?.code === '57P01';
 
       if (isConnectionDrop) {
-        // Recycle pool smoothly without unhandled exceptions or socket leaks
-        resetSupabasePool().catch(() => {});
+        // Recycle ONLY this specific pool instance without destroying any newer pool
+        resetSupabasePool(currentPoolInstance).catch(() => {});
       } else {
         console.info('[Supabase Pool Notice]', err.message);
       }
@@ -109,7 +110,7 @@ export async function pgQuery<T extends pg.QueryResultRow = any>(text: string, p
 
       if (isTransient && attempt < 2) {
         console.info(`[Supabase Query Notice] Transient connection issue on attempt ${attempt} (${err.message}), re-acquiring pool connection...`);
-        await resetSupabasePool();
+        await resetSupabasePool(p);
         await new Promise((r) => setTimeout(r, 1000));
         continue;
       }
@@ -299,6 +300,12 @@ export async function syncDayLogsToSupabase(dateStr: string): Promise<{
   rawSaved: number;
   canonicalSaved: number;
   verifiedRemoteCount: number;
+  rawInserted?: number;
+  rawIgnored?: number;
+  rawFailed?: number;
+  canonicalInserted?: number;
+  canonicalIgnored?: number;
+  canonicalFailed?: number;
   error?: string;
 }> {
   if (!isSupabaseConfigured()) {
@@ -337,10 +344,12 @@ export async function syncDayLogsToSupabase(dateStr: string): Promise<{
       WHERE event_timestamp >= ? AND event_timestamp < ?
     `).all(interval.startCairo, interval.endCairo);
 
-    let rawSaved = 0;
+    let rawInserted = 0;
+    let rawIgnored = 0;
+    let rawFailed = 0;
     for (const r of rawRows) {
       try {
-        await pgQuery(`
+        const res = await pgQuery(`
           INSERT INTO raw_activity_events (
             source_hash, order_code, actor_name, raw_action_text, event_timestamp,
             storage_tier, page_source, is_duplicate
@@ -350,8 +359,15 @@ export async function syncDayLogsToSupabase(dateStr: string): Promise<{
           r.source_hash, r.order_code, r.actor_name, r.raw_action_text,
           r.event_timestamp, r.storage_tier || 'HOT', r.page_source || 'log/system'
         ]);
-        rawSaved++;
-      } catch {}
+        if (res.rowCount && res.rowCount > 0) {
+          rawInserted++;
+        } else {
+          rawIgnored++;
+        }
+      } catch (insertErr: any) {
+        rawFailed++;
+        console.error(`[Supabase Sync] Failed to insert raw event (${r.source_hash}):`, insertErr.message);
+      }
     }
 
     const canonRows: any[] = db.prepare(`
@@ -361,10 +377,12 @@ export async function syncDayLogsToSupabase(dateStr: string): Promise<{
       WHERE event_timestamp >= ? AND event_timestamp < ?
     `).all(interval.startCairo, interval.endCairo);
 
-    let canonicalSaved = 0;
+    let canonicalInserted = 0;
+    let canonicalIgnored = 0;
+    let canonicalFailed = 0;
     for (const c of canonRows) {
       try {
-        await pgQuery(`
+        const res = await pgQuery(`
           INSERT INTO canonical_activity_events (
             order_code, actor_name, action_type, from_status, to_status,
             event_timestamp, is_system_actor
@@ -378,18 +396,37 @@ export async function syncDayLogsToSupabase(dateStr: string): Promise<{
           c.order_code, c.actor_name, c.action_type || 'action', c.from_status, c.to_status,
           c.event_timestamp, Boolean(c.is_system_actor)
         ]);
-        canonicalSaved++;
-      } catch {}
+        if (res.rowCount && res.rowCount > 0) {
+          canonicalInserted++;
+        } else {
+          canonicalIgnored++;
+        }
+      } catch (insertErr: any) {
+        canonicalFailed++;
+        console.error(`[Supabase Sync] Failed to insert canonical event (${c.order_code || 'general'}):`, insertErr.message);
+      }
     }
 
-    // Verification check: Query Supabase directly
-    const verifyRes = await pgQuery(`
-      SELECT COUNT(*)::int as c FROM canonical_activity_events
-      WHERE event_timestamp >= $1 AND event_timestamp < $2
-    `, [interval.startCairo, interval.endCairo]);
+    // Comprehensive Verification: Query both canonical and raw counts directly from Supabase
+    const [canonVerifyRes, rawVerifyRes] = await Promise.all([
+      pgQuery(`SELECT COUNT(*)::int as c FROM canonical_activity_events WHERE event_timestamp >= $1 AND event_timestamp < $2`, [interval.startCairo, interval.endCairo]),
+      pgQuery(`SELECT COUNT(*)::int as c FROM raw_activity_events WHERE event_timestamp >= $1 AND event_timestamp < $2`, [interval.startCairo, interval.endCairo]),
+    ]);
 
-    const verifiedRemoteCount = Number(verifyRes.rows[0]?.c || 0);
-    const verified = verifiedRemoteCount > 0 || (rawRows.length === 0 && canonRows.length === 0);
+    const verifiedRemoteCanonCount = Number(canonVerifyRes.rows[0]?.c || 0);
+    const verifiedRemoteRawCount = Number(rawVerifyRes.rows[0]?.c || 0);
+
+    const localCov: any = db.prepare(`
+      SELECT completion_status, records_saved FROM historical_coverage
+      WHERE period_date = ? AND source_domain = 'logs'
+    `).get(dateStr);
+
+    const localHasData = rawRows.length > 0 || canonRows.length > 0;
+    // Strict verification: Remote must have all expected local rows, with zero failed writes.
+    // If local has 0 rows, only verify as empty if local coverage is authentically complete or verified empty.
+    const verified = localHasData
+      ? (verifiedRemoteRawCount >= rawRows.length && verifiedRemoteCanonCount >= canonRows.length && rawFailed === 0 && canonicalFailed === 0)
+      : Boolean(localCov && (localCov.completion_status === 'EMPTY_VERIFIED' || localCov.completion_status === 'COMPLETE'));
 
     const nowIso = new Date().toISOString();
     try {
@@ -410,9 +447,15 @@ export async function syncDayLogsToSupabase(dateStr: string): Promise<{
     return {
       success: true,
       verified,
-      rawSaved,
-      canonicalSaved,
-      verifiedRemoteCount,
+      rawSaved: rawInserted + rawIgnored,
+      canonicalSaved: canonicalInserted + canonicalIgnored,
+      verifiedRemoteCount: verifiedRemoteCanonCount,
+      rawInserted,
+      rawIgnored,
+      rawFailed,
+      canonicalInserted,
+      canonicalIgnored,
+      canonicalFailed,
     };
   } catch (err: any) {
     return {

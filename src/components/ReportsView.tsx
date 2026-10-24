@@ -122,7 +122,9 @@ export const ReportsView: React.FC<ReportsViewProps> = ({ onSelectOrder }) => {
 
   async function fetchDayStatus(date: string) {
     try {
-      const res = await fetch(`/api/reports/day-status?date=${date}`);
+      const res = await fetch(`/api/reports/day-status?date=${encodeURIComponent(date)}`, {
+        signal: AbortSignal.timeout(12000),
+      });
       if (!res.ok) return;
       const ct = res.headers.get('content-type') || '';
       if (!ct.includes('application/json')) return;
@@ -130,8 +132,9 @@ export const ReportsView: React.FC<ReportsViewProps> = ({ onSelectOrder }) => {
       if (data.success && data.dayStatus) {
         setDayStatus(data.dayStatus);
       }
-    } catch (err) {
-      console.error('Error fetching day status:', err);
+    } catch (err: any) {
+      if (err?.name === 'AbortError' || err?.name === 'TimeoutError') return;
+      console.warn('Notice fetching day status:', err?.message || err);
     }
   }
 
@@ -143,6 +146,7 @@ export const ReportsView: React.FC<ReportsViewProps> = ({ onSelectOrder }) => {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ date: effectiveStart, action }),
+        signal: AbortSignal.timeout(30000),
       });
       const ct = res.headers.get('content-type') || '';
       if (!ct.includes('application/json')) {
@@ -161,8 +165,9 @@ export const ReportsView: React.FC<ReportsViewProps> = ({ onSelectOrder }) => {
         setDayStatus(data.dayStatus);
       }
       await fetchReport(effectiveStart, effectiveEnd, action === 'force_refetch');
-    } catch (err) {
-      console.error('Error executing day action:', err);
+    } catch (err: any) {
+      if (err?.name === 'AbortError' || err?.name === 'TimeoutError') return;
+      console.warn('Notice executing day action:', err?.message || err);
     } finally {
       setDayActionLoading(false);
     }

@@ -638,6 +638,79 @@ class VendoorClient {
     return url;
   }
 
+  public async fetchBufferWithRetry(
+    url: string | URL,
+    options: RequestInit = {},
+    timeoutMs = 45000,
+    maxRetries = 3
+  ): Promise<{ status: number; buffer: Buffer; ok: boolean; url: string }> {
+    let lastError: any = null;
+    for (let attempt = 1; attempt <= maxRetries; attempt++) {
+      const controller = new AbortController();
+      const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
+      try {
+        const res = await fetch(url.toString(), {
+          ...options,
+          signal: controller.signal,
+        });
+        this.updateCookies(res);
+
+        const ab = await res.arrayBuffer();
+        const buffer = Buffer.from(ab);
+        clearTimeout(timeoutId);
+
+        const urlStr = url.toString();
+        const isLoginRequest = urlStr.includes('/login');
+        if (
+          !isLoginRequest &&
+          (res.status === 401 ||
+           res.status === 419 ||
+           (res.url && res.url.includes('/login')))
+        ) {
+          if (attempt < maxRetries) {
+            this.isAuthenticated = false;
+            await this.login();
+            const headers = new Headers(options.headers || {});
+            headers.set('Cookie', this.getCookieHeader());
+            options = { ...options, headers };
+            await new Promise(r => setTimeout(r, 500 * attempt));
+            continue;
+          }
+        }
+
+        if ((res.status === 502 || res.status === 503 || res.status === 504) && attempt < maxRetries) {
+          await new Promise(r => setTimeout(r, 800 * attempt));
+          continue;
+        }
+
+        return {
+          status: res.status,
+          buffer,
+          ok: res.ok,
+          url: res.url,
+        };
+      } catch (err: any) {
+        clearTimeout(timeoutId);
+        lastError = err;
+        const errMsg = String(err?.message || '');
+        const isNetworkOrTimeout =
+          err.name === 'AbortError' ||
+          errMsg.includes('Request timed out') ||
+          errMsg.includes('fetch failed') ||
+          errMsg.includes('ECONNRESET') ||
+          errMsg.includes('ETIMEDOUT');
+
+        if (isNetworkOrTimeout && attempt < maxRetries) {
+          const delay = 600 * Math.pow(2, attempt - 1);
+          await new Promise(r => setTimeout(r, delay));
+          continue;
+        }
+        throw err;
+      }
+    }
+    throw lastError || new Error(`Request failed after ${maxRetries} attempts: ${url}`);
+  }
+
   public async fetchSystemLogs(page = 1, startDate = '', endDate = ''): Promise<{
     entries: LogEntry[];
     totalPages: number;
@@ -646,18 +719,36 @@ class VendoorClient {
 
     const url = this.buildSystemLogsUrl(page, startDate, endDate);
 
-    const res = await this.fetchWithRetry(url.toString(), {
-      headers: {
-        'User-Agent': this.userAgent,
-        'Cookie': this.getCookieHeader(),
+    const result = await this.fetchTextWithRetry(
+      url.toString(),
+      {
+        headers: {
+          'User-Agent': this.userAgent,
+          'Cookie': this.getCookieHeader(),
+        },
       },
-    }, 25000, 3);
+      25000,
+      3
+    );
 
-    if (!res.ok) {
-      throw new Error(`Failed to fetch system logs page ${page}: HTTP ${res.status}`);
+    if (!result.ok) {
+      throw new Error(`Failed to fetch system logs page ${page}: HTTP ${result.status}`);
     }
 
-    const html = await res.text();
+    const html = result.text;
+    const trimmedHtml = html.trim().toLowerCase();
+
+    // Verify response is authentic logs HTML and NOT a login redirect
+    if (
+      trimmedHtml.includes('action="/login"') ||
+      trimmedHtml.includes('<title>تسجيل الدخول') ||
+      trimmedHtml.includes('<title>login') ||
+      (trimmedHtml.includes('name="password"') && trimmedHtml.includes('name="email"'))
+    ) {
+      this.isAuthenticated = false;
+      throw new Error(`انتهت جلسة تسجيل دخول Vendoor أثناء جلب الصفحة ${page}`);
+    }
+
     const entries: LogEntry[] = [];
 
     // Parse log table rows
@@ -701,14 +792,14 @@ class VendoorClient {
   /**
    * Native Vendoor System Logs Excel Export:
    * Downloads the complete Excel file for a specified date range via /dashboard/log/xls/all
-   * This is the exact action performed by clicking the green Export button in Vendoor System Logs.
+   * Validates file signature to reject HTML error pages and login screens.
    */
   public async exportSystemLogsExcel(startDate: string, endDate: string): Promise<Buffer> {
     await this.ensureAuthenticated();
 
     const url = this.buildExcelExportUrl(startDate, endDate);
 
-    const res = await this.fetchWithRetry(
+    const result = await this.fetchBufferWithRetry(
       url.toString(),
       {
         headers: {
@@ -721,15 +812,31 @@ class VendoorClient {
       3
     );
 
-    if (!res.ok) {
-      throw new Error(`Failed to export system logs Excel from Vendoor: HTTP ${res.status}`);
+    if (!result.ok) {
+      throw new Error(`Failed to export system logs Excel from Vendoor: HTTP ${result.status}`);
     }
 
-    const arrayBuffer = await res.arrayBuffer();
-    const buffer = Buffer.from(arrayBuffer);
+    const buffer = result.buffer;
 
     if (!buffer || buffer.length === 0) {
-      throw new Error('Exported system logs Excel file is empty');
+      throw new Error('ملف Excel المستخرج من Vendoor فارغ تماماً');
+    }
+
+    // Validate that response is NOT an HTML error or login page
+    const sample = buffer.slice(0, 512).toString('utf8').trim().toLowerCase();
+    const isHtml =
+      sample.startsWith('<!doctype') ||
+      sample.startsWith('<html') ||
+      sample.includes('<head>') ||
+      sample.includes('<body') ||
+      sample.includes('action="/login"');
+
+    if (isHtml) {
+      if (sample.includes('/login') || sample.includes('password')) {
+        this.isAuthenticated = false;
+        throw new Error('فشل تنزيل ملف Excel: الجلسة منتهية أو تم التحويل لصفحة تسجيل الدخول');
+      }
+      throw new Error('الخادم أرجع صفحة HTML بدلاً من ملف Excel صالح');
     }
 
     return buffer;

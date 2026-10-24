@@ -1,3 +1,6 @@
+// 1. Load environment variables before any other module evaluation
+import './server/env.ts';
+
 import express from 'express';
 import fs from 'node:fs';
 import path from 'node:path';
@@ -6,19 +9,6 @@ import { initDatabase } from './server/db.ts';
 import { apiRouter } from './server/routes.ts';
 import { syncEngine } from './server/syncEngine.ts';
 import { startSupabaseArchiveWorker } from './server/supabaseArchiveWorker.ts';
-
-// Safe environment loading: try dotenv first, fallback to Node 22 native loadEnvFile
-try {
-  const dotenv = await import('dotenv');
-  dotenv.default?.config?.({ override: true });
-} catch {
-  try {
-    // @ts-ignore Node 22 built-in env file loader
-    process.loadEnvFile?.();
-  } catch {
-    // In production container environments, environment variables are directly injected
-  }
-}
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -64,10 +54,11 @@ API_NAMESPACES.forEach((prefix) => {
 // Guard: Prevent unmatched /api or API namespace routes from falling through to Vite HTML
 app.use(['/api', ...API_NAMESPACES], (req, res) => {
   const requestId = crypto.randomUUID();
+  const isReport = req.originalUrl.includes('/reports');
   res.status(404).json({
     success: false,
     error: {
-      code: 'ROUTE_NOT_FOUND',
+      code: isReport ? 'REPORT_ROUTE_NOT_FOUND' : 'ROUTE_NOT_FOUND',
       message: `المسار المطلوب '${req.originalUrl}' غير موجود (404)`,
       retryable: false,
       requestId,

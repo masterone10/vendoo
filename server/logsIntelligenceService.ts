@@ -144,11 +144,12 @@ export async function ensureCoverageForRange(
       `).get(interval.startCairo, interval.endCairo) as any)
     );
 
+    // Rule: UNVERIFIED_SOURCE does NOT mean verified complete.
+    // Only strictly verified COMPLETE days (with all pages read) or verified EMPTY days are complete.
     const isDayVerifiedComplete = Boolean(
       cov && (
         (cov.completion_status === 'COMPLETE' && !(cov.pages_discovered > 1 && cov.pages_read < cov.pages_discovered)) ||
-        cov.completion_status === 'EMPTY_VERIFIED' ||
-        ((cov.data_source === 'EXCEL_IMPORT' || cov.data_source === 'CSV_IMPORT') && cov.completion_status === 'UNVERIFIED_SOURCE')
+        cov.completion_status === 'EMPTY_VERIFIED'
       )
     );
 
