@@ -684,7 +684,9 @@ export async function importBatchLogFiles(
       let workbook: XLSX.WorkBook | null = null;
       if (f.filePath && fs.existsSync(f.filePath)) {
         try {
-          workbook = XLSX.readFile(f.filePath, {
+          const fileBuf = fs.readFileSync(f.filePath);
+          workbook = XLSX.read(fileBuf, {
+            type: 'buffer',
             cellDates: false,
             raw: true,
             codepage: 65001,

@@ -9,6 +9,7 @@ import { initDatabase } from './server/db.ts';
 import { apiRouter } from './server/routes.ts';
 import { syncEngine } from './server/syncEngine.ts';
 import { startSupabaseArchiveWorker } from './server/supabaseArchiveWorker.ts';
+import { shutdownSupabasePool } from './server/supabaseClient.ts';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -123,4 +124,17 @@ async function startServer() {
 startServer().catch(err => {
   console.error('[Server Error]', err);
   process.exit(1);
+});
+
+// Graceful cleanup of shared Supabase PostgreSQL pool on container shutdown
+process.on('SIGTERM', async () => {
+  console.log('[Server] SIGTERM received: shutting down cleanly...');
+  await shutdownSupabasePool();
+  process.exit(0);
+});
+
+process.on('SIGINT', async () => {
+  console.log('[Server] SIGINT received: shutting down cleanly...');
+  await shutdownSupabasePool();
+  process.exit(0);
 });

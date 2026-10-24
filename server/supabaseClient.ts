@@ -19,29 +19,81 @@ export interface SupabaseConnectionStatus {
 }
 
 let pool: pg.Pool | null = null;
+let poolResetPromise: Promise<void> | null = null;
 let lastConnectionCheck: SupabaseConnectionStatus | null = null;
 let lastCheckTime = 0;
 
+let poolMetrics = {
+  totalAcquires: 0,
+  totalReleases: 0,
+  totalCreated: 0,
+  totalRemoved: 0,
+};
+
+export interface QueryContext {
+  correlationId?: string;
+  operationName?: string;
+}
+
 export function getDatabaseUrl(): string | null {
-  const url = process.env.DATABASE_URL;
-  if (url && typeof url === 'string' && url.trim().length > 0 && !url.includes('placeholder')) {
-    return url.trim();
+  let url = process.env.DATABASE_URL;
+  if (!url || typeof url !== 'string' || url.trim().length === 0 || url.includes('placeholder')) {
+    return null;
   }
-  return null;
+  url = url.trim();
+
+  // Normalize Supabase pooler from Transaction Mode (port 6543) to Session Mode (port 5432)
+  // for persistent backend stability, full session persistence, and elimination of SCRAM auth storms.
+  if (url.includes('.pooler.supabase.com:6543')) {
+    url = url.replace(/(\.pooler\.supabase\.com):6543/, '$1:5432');
+  }
+
+  return url;
 }
 
 export function isSupabaseConfigured(): boolean {
   return getDatabaseUrl() !== null;
 }
 
+export function getPoolTelemetry() {
+  return {
+    ...poolMetrics,
+    totalCount: pool?.totalCount || 0,
+    idleCount: pool?.idleCount || 0,
+    waitingCount: pool?.waitingCount || 0,
+  };
+}
+
 export async function resetSupabasePool(targetPool?: pg.Pool): Promise<void> {
+  if (poolResetPromise) {
+    return poolResetPromise;
+  }
+
   if (pool && (!targetPool || pool === targetPool)) {
+    const old = pool;
+    pool = null;
+    poolResetPromise = (async () => {
+      try {
+        await old.end();
+      } catch {
+        // Ignore errors during broken pool teardown
+      } finally {
+        poolResetPromise = null;
+      }
+    })();
+    return poolResetPromise;
+  }
+}
+
+export async function shutdownSupabasePool(): Promise<void> {
+  if (pool) {
     const old = pool;
     pool = null;
     try {
       await old.end();
-    } catch {
-      // Ignore errors when ending broken pool
+      console.log('[Supabase Client] Shared pool cleanly disconnected.');
+    } catch (err: any) {
+      console.warn('[Supabase Client] Notice while closing shared pool:', err.message);
     }
   }
 }
@@ -49,38 +101,56 @@ export async function resetSupabasePool(targetPool?: pg.Pool): Promise<void> {
 export function getSupabasePool(): pg.Pool {
   const connStr = getDatabaseUrl();
   if (!connStr) {
-    throw new Error('DATABASE_URL is not configured. Please set DATABASE_URL in Google AI Studio Secrets per SUPABASE_SETUP.md');
+    throw new Error('DATABASE_URL is not configured. Please set DATABASE_URL in Google AI Studio Secrets.');
   }
 
   if (!pool) {
+    // 3 connections max as confirmed for single backend process: optimal for Supabase Session Pooler
     pool = new Pool({
       connectionString: connStr,
       ssl: {
-        rejectUnauthorized: false, // Required for Supabase pooler connections in cloud containers
+        rejectUnauthorized: false,
       },
-      max: 5, // Optimal size for Supabase PgBouncer transaction mode pooler (port 6543)
-      idleTimeoutMillis: 30000, // Keep connections alive across short bursts without premature teardown
-      connectionTimeoutMillis: 25000, // 25s connection timeout prevents premature aborts during TLS/pooler latency
-      statement_timeout: 30000, // 30s query timeout
+      max: 3,
+      idleTimeoutMillis: 60000, // 60s idle timeout prevents churning sockets
+      connectionTimeoutMillis: 20000, // 20s connection timeout for TLS/SCRAM negotiation
+      statement_timeout: 30000, // 30s query execution ceiling
       query_timeout: 30000,
       keepAlive: true,
       keepAliveInitialDelayMillis: 10000,
     });
 
     const currentPoolInstance = pool;
-    currentPoolInstance.on('error', (err) => {
-      const isConnectionDrop =
-        err.message?.includes('Connection terminated') ||
-        err.message?.includes('timeout') ||
-        err.message?.includes('ECONNRESET') ||
-        err.message?.includes('closed') ||
+
+    currentPoolInstance.on('connect', () => {
+      poolMetrics.totalCreated++;
+    });
+
+    currentPoolInstance.on('acquire', () => {
+      poolMetrics.totalAcquires++;
+    });
+
+    currentPoolInstance.on('release', () => {
+      poolMetrics.totalReleases++;
+    });
+
+    currentPoolInstance.on('remove', () => {
+      poolMetrics.totalRemoved++;
+    });
+
+    // CRITICAL FIX: When an idle connection is closed by remote pooler/server,
+    // pg.Pool automatically removes that specific client. DO NOT destroy the entire pool!
+    currentPoolInstance.on('error', (err: any) => {
+      const msg = String(err?.message || '');
+      const isNormalIdleReap =
+        msg.includes('Connection terminated') ||
+        msg.includes('closed') ||
+        msg.includes('timeout') ||
+        msg.includes('ECLIENTSOCKETCLOSED') ||
         (err as any)?.code === '57P01';
 
-      if (isConnectionDrop) {
-        // Recycle ONLY this specific pool instance without destroying any newer pool
-        resetSupabasePool(currentPoolInstance).catch(() => {});
-      } else {
-        console.info('[Supabase Pool Notice]', err.message);
+      if (!isNormalIdleReap) {
+        console.info('[Supabase Pool Notice]', msg);
       }
     });
   }
@@ -89,15 +159,38 @@ export function getSupabasePool(): pg.Pool {
 }
 
 /**
- * Execute a SQL query on Supabase PostgreSQL with parameters and automatic transient retry
+ * Execute a SQL query on Supabase PostgreSQL with timing separation,
+ * request correlation ID, and transient connection resilience without pool teardown.
  */
-export async function pgQuery<T extends pg.QueryResultRow = any>(text: string, params: any[] = []): Promise<pg.QueryResult<T>> {
+export async function pgQuery<T extends pg.QueryResultRow = any>(
+  text: string,
+  params: any[] = [],
+  context: QueryContext = {}
+): Promise<pg.QueryResult<T>> {
+  const cid = context.correlationId || `req_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
+  const opName = context.operationName || 'query';
   let lastErr: any = null;
 
   for (let attempt = 1; attempt <= 2; attempt++) {
     const p = getSupabasePool();
+    let client: pg.PoolClient | null = null;
+    const tStartAcquire = Date.now();
+
     try {
-      const res = await p.query<T>(text, params);
+      client = await p.connect();
+      const tWaitMs = Date.now() - tStartAcquire;
+
+      const tStartExec = Date.now();
+      const res = await client.query<T>(text, params);
+      const tExecMs = Date.now() - tStartExec;
+
+      // Log timing telemetry if duration was notable (> 2500ms)
+      if (tWaitMs + tExecMs > 2500) {
+        console.info(`[Supabase Query ${cid}] Slow ${opName}: waitPool=${tWaitMs}ms execSql=${tExecMs}ms total=${tWaitMs + tExecMs}ms`);
+      }
+
+      client.release();
+      client = null;
       return res;
     } catch (err: any) {
       lastErr = err;
@@ -106,12 +199,21 @@ export async function pgQuery<T extends pg.QueryResultRow = any>(text: string, p
         err.message?.includes('timeout') ||
         err.message?.includes('ECONNRESET') ||
         err.message?.includes('ETIMEDOUT') ||
+        err.message?.includes('ECLIENTSOCKETCLOSED') ||
         err.code === '57P01';
 
+      if (client) {
+        try {
+          // Instruct pg.Pool to discard only this faulty socket client, preserving the pool
+          client.release(err);
+        } catch {}
+        client = null;
+      }
+
       if (isTransient && attempt < 2) {
-        console.info(`[Supabase Query Notice] Transient connection issue on attempt ${attempt} (${err.message}), re-acquiring pool connection...`);
-        await resetSupabasePool(p);
-        await new Promise((r) => setTimeout(r, 1000));
+        // Exponential backoff with small random jitter to avoid thundering herd
+        const jitterMs = 300 + Math.floor(Math.random() * 400);
+        await new Promise((r) => setTimeout(r, jitterMs));
         continue;
       }
       break;
@@ -123,12 +225,13 @@ export async function pgQuery<T extends pg.QueryResultRow = any>(text: string, p
     lastErr?.message?.includes('timeout') ||
     lastErr?.message?.includes('ECONNRESET') ||
     lastErr?.message?.includes('ETIMEDOUT') ||
+    lastErr?.message?.includes('ECLIENTSOCKETCLOSED') ||
     lastErr?.code === '57P01';
 
   if (isTransient) {
-    console.info(`[Supabase Query Notice] Connection standby: ${lastErr.message}`);
+    console.info(`[Supabase Query Notice ${cid}] Standby (${opName}): ${lastErr.message}`);
   } else {
-    console.warn(`[Supabase Query Warning] ${lastErr.message} (SQL: ${text.slice(0, 100)}...)`);
+    console.warn(`[Supabase Query Warning ${cid}] ${lastErr.message} (${opName})`);
   }
   throw lastErr;
 }
@@ -180,20 +283,23 @@ export async function checkSupabaseConnection(forceFresh = false): Promise<Supab
   }
 
   const start = Date.now();
+  const checkCid = `check_${Date.now()}`;
   try {
-    const p = getSupabasePool();
     // 1. Ping
-    const pingRes = await p.query('SELECT current_database() as db, inet_server_addr() as ip, now() as ts');
+    const pingRes = await pgQuery('SELECT current_database() as db, inet_server_addr() as ip, now() as ts', [], {
+      correlationId: checkCid,
+      operationName: 'health_check_ping',
+    });
     const latencyMs = Date.now() - start;
     const dbName = pingRes.rows[0]?.db || 'postgres';
     const serverIp = pingRes.rows[0]?.ip ? String(pingRes.rows[0]?.ip) : undefined;
 
     // 2. Query tables in public schema
-    const tablesRes = await p.query(`
+    const tablesRes = await pgQuery(`
       SELECT table_name
       FROM information_schema.tables
       WHERE table_schema = 'public'
-    `);
+    `, [], { correlationId: checkCid, operationName: 'list_tables' });
     const existingTableNames = new Set(tablesRes.rows.map((r: any) => r.table_name));
 
     const presentTables: string[] = [];
@@ -211,7 +317,10 @@ export async function checkSupabaseConnection(forceFresh = false): Promise<Supab
     const tableCounts: Record<string, number> = {};
     for (const t of presentTables) {
       try {
-        const countRes = await p.query(`SELECT count(*)::int as c FROM "${t}"`);
+        const countRes = await pgQuery(`SELECT count(*)::int as c FROM "${t}"`, [], {
+          correlationId: checkCid,
+          operationName: `count_${t}`,
+        });
         tableCounts[t] = countRes.rows[0]?.c ?? 0;
       } catch {
         tableCounts[t] = 0;
@@ -221,11 +330,11 @@ export async function checkSupabaseConnection(forceFresh = false): Promise<Supab
     // 4. Check for canonical unique constraint on vendoor_id in orders
     let canonicalConstraintPresent = false;
     if (existingTableNames.has('orders')) {
-      const constraintRes = await p.query(`
+      const constraintRes = await pgQuery(`
         SELECT conname
         FROM pg_constraint
         WHERE conrelid = 'orders'::regclass AND contype = 'u'
-      `);
+      `, [], { correlationId: checkCid, operationName: 'check_constraint' });
       canonicalConstraintPresent = constraintRes.rows.some((r: any) =>
         r.conname.includes('vendoor_id') || r.conname.includes('orders_vendoor_id')
       );
@@ -269,7 +378,6 @@ export async function checkSupabaseConnection(forceFresh = false): Promise<Supab
  * Applies the migration SQL directly to the connected Supabase instance
  */
 export async function applySupabaseMigration(): Promise<{ success: boolean; message: string; appliedTables: string[] }> {
-  const p = getSupabasePool();
   const migrationPath = path.resolve(process.cwd(), 'supabase/migrations/20261017000001_create_vendoor_intelligence_schema.sql');
 
   if (!fs.existsSync(migrationPath)) {
@@ -277,7 +385,7 @@ export async function applySupabaseMigration(): Promise<{ success: boolean; mess
   }
 
   const sql = fs.readFileSync(migrationPath, 'utf-8');
-  await p.query(sql);
+  await pgQuery(sql, [], { operationName: 'apply_migration' });
 
   // Re-check schema
   const status = await checkSupabaseConnection(true);

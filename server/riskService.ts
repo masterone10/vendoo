@@ -183,16 +183,6 @@ export function getRiskConditionSql(riskType: RiskType, tableAlias = 'o'): strin
     case 'no_extra_phone':
       return `(
         (${tableAlias}.extra_phone_status = 'CONFIRMED_ABSENT' OR (${tableAlias}.customer_phone_extra IS NULL OR TRIM(${tableAlias}.customer_phone_extra) = '' OR ${tableAlias}.customer_phone_extra = 'N/A' OR ${tableAlias}.customer_phone_extra = ${tableAlias}.customer_phone OR ${tableAlias}.extra_phone_valid = 0) AND ${tableAlias}.extra_phone_status != 'PRESENT')
-        AND NOT EXISTS (
-          SELECT 1 FROM canonical_activity_events cae_phone
-          WHERE (cae_phone.order_id = ${tableAlias}.id OR cae_phone.order_code = ${tableAlias}.random_number OR cae_phone.order_code = ${tableAlias}.order_no OR cae_phone.order_code = CAST(${tableAlias}.vendoor_id AS TEXT))
-            AND cae_phone.action_type IN ('extra_phone_added', 'extra_phone_edit')
-            AND cae_phone.new_value IS NOT NULL
-            AND TRIM(cae_phone.new_value) != ''
-            AND TRIM(cae_phone.new_value) != 'N/A'
-            AND TRIM(cae_phone.new_value) != ${tableAlias}.customer_phone
-            AND LENGTH(REPLACE(REPLACE(REPLACE(TRIM(cae_phone.new_value), ' ', ''), '-', ''), '+', '')) >= 10
-        )
       )`;
     case 'low_delivery':
       return `(${tableAlias}.delivery_rate IS NOT NULL AND ${tableAlias}.delivery_rate < 70 AND (${tableAlias}.delivery_rate_denom > 0 OR ${tableAlias}.total_customer_orders > 0) AND NOT (${tableAlias}.delivery_rate = 0 AND (${tableAlias}.cancel_rate = 0 OR ${tableAlias}.cancel_rate IS NULL)))`;
@@ -235,15 +225,22 @@ export function getDashboardRiskStats(targetDate?: string): {
       COUNT(DISTINCT CASE WHEN ${getRiskConditionSql('no_extra_phone', 'o')} THEN o.id END) as missingExtraPhonePrinted,
       COUNT(DISTINCT CASE WHEN ${getRiskConditionSql('low_delivery', 'o')} THEN o.id END) as lowDeliveryRatePrinted
     FROM orders o
-    LEFT JOIN (
-      SELECT order_code, id
-      FROM canonical_activity_events
-      WHERE event_timestamp >= ? AND event_timestamp < ?
-        AND (to_status = 'Printed' OR action_type = 'confirmation')
-      GROUP BY order_code
-    ) c ON c.order_code = o.random_number OR c.order_code = o.order_no OR c.order_code = CAST(o.vendoor_id AS TEXT)
-    WHERE (c.id IS NOT NULL OR substr(o.printed_date, 1, 10) = ? OR (o.printed_date >= ? AND o.printed_date < ?))
+    WHERE (
+      o.random_number IN (
+        SELECT order_code FROM canonical_activity_events
+        WHERE event_timestamp >= ? AND event_timestamp < ?
+          AND (to_status = 'Printed' OR action_type = 'confirmation')
+      )
+      OR o.order_no IN (
+        SELECT order_code FROM canonical_activity_events
+        WHERE event_timestamp >= ? AND event_timestamp < ?
+          AND (to_status = 'Printed' OR action_type = 'confirmation')
+      )
+      OR substr(o.printed_date, 1, 10) = ?
+      OR (o.printed_date >= ? AND o.printed_date < ?)
+    )
   `).get(
+    dateInterval.startCairo, dateInterval.endCairo,
     dateInterval.startCairo, dateInterval.endCairo,
     cairoDate, dateInterval.startCairo, dateInterval.endCairo
   ) as any;
@@ -284,17 +281,22 @@ export function getRiskOrdersDrilldown(params: RiskOrdersParams): RiskOrdersResu
   const todayStart = dateInterval.startCairo;
   const todayEnd = dateInterval.endCairo;
 
-  // Subquery determining whether an order is printed today
-  const todayPrintedJoin = `
-    LEFT JOIN (
-      SELECT order_code, id
-      FROM canonical_activity_events
+  // Subquery determining whether an order is printed today using indexed scans
+  const todayPrintedJoin = '';
+  const todayPrintedWhere = `(
+    o.random_number IN (
+      SELECT order_code FROM canonical_activity_events
       WHERE event_timestamp >= '${todayStart}' AND event_timestamp < '${todayEnd}'
         AND (to_status = 'Printed' OR action_type = 'confirmation')
-      GROUP BY order_code
-    ) c_today ON c_today.order_code = o.random_number OR c_today.order_code = o.order_no OR c_today.order_code = CAST(o.vendoor_id AS TEXT)
-  `;
-  const todayPrintedWhere = `(c_today.id IS NOT NULL OR substr(o.printed_date, 1, 10) = '${cairoDate}' OR (o.printed_date >= '${todayStart}' AND o.printed_date < '${todayEnd}'))`;
+    )
+    OR o.order_no IN (
+      SELECT order_code FROM canonical_activity_events
+      WHERE event_timestamp >= '${todayStart}' AND event_timestamp < '${todayEnd}'
+        AND (to_status = 'Printed' OR action_type = 'confirmation')
+    )
+    OR substr(o.printed_date, 1, 10) = '${cairoDate}'
+    OR (o.printed_date >= '${todayStart}' AND o.printed_date < '${todayEnd}')
+  )`;
 
   // 1. Compute Tab Counts across all statuses for this risk type
   const tabCountsRow = db.prepare(`

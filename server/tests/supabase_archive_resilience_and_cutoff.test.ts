@@ -46,5 +46,60 @@ test('Supabase Archive Worker: Idle and Cutoff Policy Integrity Suite', async (t
     // Confirm that the worker strictly counts 0 waiting orders because created_at_source < 2026-10-23
     const waitingOrders = (db.prepare("SELECT count(*) as c FROM orders WHERE vendoor_id = 888801 AND created_at_source >= '2026-10-23 00:00:00'").get() as any)?.c || 0;
     assert.strictEqual(waitingOrders, 0, 'Pre-cutoff orders must never be included in Supabase waiting queue');
+  await t.test('1.3 True Exponential Backoff formula verification across attempts 1..10 (max 5 min / 300,000ms with jitter)', async () => {
+    const { calculateExponentialBackoff } = await import('../supabaseArchiveWorker.ts');
+    
+    // Test base exponential progression with zero jitter for exact mathematical check
+    const step1Exact = calculateExponentialBackoff(1, 5000, 300000, 0);
+    const step2Exact = calculateExponentialBackoff(2, 5000, 300000, 0);
+    const step3Exact = calculateExponentialBackoff(3, 5000, 300000, 0);
+    const step4Exact = calculateExponentialBackoff(4, 5000, 300000, 0);
+    const step5Exact = calculateExponentialBackoff(5, 5000, 300000, 0);
+    const step6Exact = calculateExponentialBackoff(6, 5000, 300000, 0);
+    const step7Exact = calculateExponentialBackoff(7, 5000, 300000, 0);
+    const step8Exact = calculateExponentialBackoff(8, 5000, 300000, 0);
+    const step9Exact = calculateExponentialBackoff(9, 5000, 300000, 0);
+    const step10Exact = calculateExponentialBackoff(10, 5000, 300000, 0);
+
+    assert.strictEqual(step1Exact, 5000, 'Attempt 1 must be 5,000ms (5s)');
+    assert.strictEqual(step2Exact, 10000, 'Attempt 2 must be 10,000ms (10s)');
+    assert.strictEqual(step3Exact, 20000, 'Attempt 3 must be 20,000ms (20s)');
+    assert.strictEqual(step4Exact, 40000, 'Attempt 4 must be 40,000ms (40s)');
+    assert.strictEqual(step5Exact, 80000, 'Attempt 5 must be 80,000ms (80s)');
+    assert.strictEqual(step6Exact, 160000, 'Attempt 6 must be 160,000ms (160s)');
+    assert.strictEqual(step7Exact, 300000, 'Attempt 7 must be capped at 300,000ms (5 minutes)');
+    assert.strictEqual(step8Exact, 300000, 'Attempt 8 must remain capped at 300,000ms (5 minutes)');
+    assert.strictEqual(step9Exact, 300000, 'Attempt 9 must remain capped at 300,000ms (5 minutes)');
+    assert.strictEqual(step10Exact, 300000, 'Attempt 10 must remain capped at 300,000ms (5 minutes)');
+
+    // Test with random jitter (0..2000ms): verify bounds and ceiling
+    for (let attempt = 1; attempt <= 10; attempt++) {
+      const withJitter = calculateExponentialBackoff(attempt, 5000, 300000, 2000);
+      assert(withJitter <= 300000, `Delay (${withJitter}ms) at attempt ${attempt} must never exceed 300,000ms`);
+      assert(withJitter >= 5000, `Delay (${withJitter}ms) at attempt ${attempt} must be at least base delay (5000ms)`);
+    }
+  });
+
+  await t.test('1.4 Archive Worker Status reports distinct table waiting counts and refuses FULLY_ARCHIVED if records exist', async () => {
+    const status = getArchiveWorkerStatus();
+    
+    // Verify distinct fields exist
+    assert(typeof status.ordersWaiting === 'number', 'ordersWaiting must be a number');
+    assert(typeof status.eventsWaiting === 'number', 'eventsWaiting must be a number');
+    assert(typeof status.rawLogsWaiting === 'number', 'rawLogsWaiting must be a number');
+    assert(typeof status.coverageWaiting === 'number', 'coverageWaiting must be a number');
+    assert(typeof status.totalWaiting === 'number', 'totalWaiting must be a number');
+    assert.ok(status.tablesWaiting, 'tablesWaiting object must exist');
+    assert.strictEqual(typeof status.tablesWaiting.orders, 'number');
+    assert.strictEqual(typeof status.tablesWaiting.canonical_activity_events, 'number');
+    assert.strictEqual(typeof status.tablesWaiting.raw_activity_events, 'number');
+    assert.strictEqual(typeof status.tablesWaiting.historical_coverage, 'number');
+
+    // If any records are waiting, status MUST NOT be FULLY_ARCHIVED
+    if (status.totalWaiting > 0) {
+      assert.notStrictEqual(status.status, 'FULLY_ARCHIVED', 'Worker must never report FULLY_ARCHIVED when totalWaiting > 0');
+      assert.strictEqual(status.isArchiveComplete, false, 'isArchiveComplete must be false when records are pending');
+    }
   });
 });
+

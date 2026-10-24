@@ -5,6 +5,9 @@ export interface ArchiveWorkerStatus {
   isEnabled: boolean;
   isArchiving: boolean;
   isArchiveComplete: boolean;
+  isCircuitOpen: boolean;
+  consecutiveFailures: number;
+  nextScheduledAttemptAt: string | null;
   lastRunAt: string | null;
   lastSuccessAt: string | null;
   lastError: string | null;
@@ -20,6 +23,15 @@ export interface ArchiveWorkerStatus {
   rawLogsWaiting: number;
   rawLogsArchivedThisPass: number;
   rawLogsRemaining: number;
+  coverageWaiting: number;
+  coverageRemaining: number;
+  totalWaiting: number;
+  tablesWaiting: {
+    orders: number;
+    canonical_activity_events: number;
+    raw_activity_events: number;
+    historical_coverage: number;
+  };
   totalOrdersArchived: number;
   totalEventsArchived: number;
   totalRawLogsArchived: number;
@@ -31,6 +43,9 @@ const status: ArchiveWorkerStatus = {
   isEnabled: false,
   isArchiving: false,
   isArchiveComplete: false,
+  isCircuitOpen: false,
+  consecutiveFailures: 0,
+  nextScheduledAttemptAt: null,
   lastRunAt: null,
   lastSuccessAt: null,
   lastError: null,
@@ -46,6 +61,15 @@ const status: ArchiveWorkerStatus = {
   rawLogsWaiting: 0,
   rawLogsArchivedThisPass: 0,
   rawLogsRemaining: 0,
+  coverageWaiting: 0,
+  coverageRemaining: 0,
+  totalWaiting: 0,
+  tablesWaiting: {
+    orders: 0,
+    canonical_activity_events: 0,
+    raw_activity_events: 0,
+    historical_coverage: 0,
+  },
   totalOrdersArchived: 0,
   totalEventsArchived: 0,
   totalRawLogsArchived: 0,
@@ -57,11 +81,96 @@ let drainTimer: NodeJS.Timeout | null = null;
 let periodicTimer: NodeJS.Timeout | null = null;
 let scheduledIntervalMs = 300000;
 let consecutiveFailures = 0;
+let nextScheduledAttemptAt: string | null = null;
 const BATCH_SIZE = 200;
 const CHUNK_SIZE = 50;
 
+/**
+ * Real Exponential Backoff calculation with random jitter and strict ceiling of 5 minutes (300,000 ms).
+ * Formula: Math.min(maxMs, baseMs * 2^(min(failures - 1, 10))) + jitter
+ *
+ * Example progression (baseMs = 5000, maxMs = 300000, jitter = 0..2000ms):
+ * Attempt 1: ~5s (+ jitter)
+ * Attempt 2: ~10s (+ jitter)
+ * Attempt 3: ~20s (+ jitter)
+ * Attempt 4: ~40s (+ jitter)
+ * Attempt 5: ~80s (+ jitter)
+ * Attempt 6: ~160s (+ jitter)
+ * Attempt 7+: 300s (capped at 5 minutes ceiling)
+ */
+export function calculateExponentialBackoff(
+  failures: number,
+  baseMs = 5000,
+  maxMs = 300000,
+  jitterRangeMs = 2000
+): number {
+  if (failures <= 0) return 0;
+  const exponent = Math.min(failures - 1, 10);
+  const exponentialDelay = baseMs * Math.pow(2, exponent);
+  const clampedBase = Math.min(maxMs, exponentialDelay);
+  const jitter = Math.floor(Math.random() * jitterRangeMs);
+  return Math.min(maxMs, clampedBase + jitter);
+}
+
 export function getArchiveWorkerStatus(): ArchiveWorkerStatus {
-  return { ...status };
+  let covWaiting = 0;
+  try {
+    const row: any = db.prepare("SELECT count(*) as c FROM historical_coverage WHERE period_date >= '2026-10-23' AND remote_archive_status != 'REMOTE_VERIFIED'").get();
+    covWaiting = Number(row?.c || 0);
+  } catch {}
+
+  // If not actively executing a pass, re-query live SQLite counts to ensure
+  // current status reflects exact state and never falsely reports FULLY_ARCHIVED
+  if (!status.isArchiving) {
+    try {
+      const ordersCheckpoint = getCheckpoint('orders');
+      const canonCheckpoint = getCheckpoint('canonical_activity_events');
+      const rawCheckpoint = getCheckpoint('raw_activity_events');
+
+      const oWait = (db.prepare("SELECT count(*) as c FROM orders WHERE id > ? AND created_at_source >= '2026-10-23 00:00:00'").get(ordersCheckpoint.lastArchivedId) as any)?.c || 0;
+      const eWait = (db.prepare("SELECT count(*) as c FROM canonical_activity_events WHERE id > ? AND event_timestamp >= '2026-10-23 00:00:00'").get(canonCheckpoint.lastArchivedId) as any)?.c || 0;
+      const rWait = (db.prepare("SELECT count(*) as c FROM raw_activity_events WHERE id > ? AND event_timestamp >= '2026-10-23 00:00:00'").get(rawCheckpoint.lastArchivedId) as any)?.c || 0;
+
+      status.ordersWaiting = oWait;
+      status.eventsWaiting = eWait;
+      status.rawLogsWaiting = rWait;
+      status.ordersRemaining = oWait;
+      status.eventsRemaining = eWait;
+      status.rawLogsRemaining = rWait;
+
+      const totalWaitingNow = oWait + eWait + rWait + covWaiting;
+      if (totalWaitingNow > 0) {
+        status.isArchiveComplete = false;
+        if (status.status === 'FULLY_ARCHIVED' || status.status === 'IDLE') {
+          status.status = consecutiveFailures >= 2 ? 'STANDBY_LOCAL_RETAIN' : 'DRAINING';
+        }
+      } else if (status.failedCount === 0) {
+        status.isArchiveComplete = true;
+        if (status.status !== 'STANDBY_LOCAL_RETAIN' && status.status !== 'FAILED') {
+          status.status = 'FULLY_ARCHIVED';
+        }
+      }
+    } catch {}
+  }
+
+  const totalWaiting = status.ordersWaiting + status.eventsWaiting + status.rawLogsWaiting + covWaiting;
+  const isCircuitOpen = consecutiveFailures >= 2;
+
+  return {
+    ...status,
+    isCircuitOpen,
+    consecutiveFailures,
+    nextScheduledAttemptAt,
+    coverageWaiting: covWaiting,
+    coverageRemaining: covWaiting,
+    totalWaiting,
+    tablesWaiting: {
+      orders: status.ordersWaiting,
+      canonical_activity_events: status.eventsWaiting,
+      raw_activity_events: status.rawLogsWaiting,
+      historical_coverage: covWaiting,
+    },
+  };
 }
 
 function isConnectionOrTimeoutError(err: any): boolean {
@@ -89,6 +198,7 @@ function clearScheduledTimers() {
     clearTimeout(periodicTimer);
     periodicTimer = null;
   }
+  nextScheduledAttemptAt = null;
 }
 
 function getCheckpoint(entityType: string): { lastArchivedId: number; lastArchivedAt: string | null } {
@@ -228,19 +338,25 @@ export async function triggerArchivePass(): Promise<{
     // -------------------------------------------------------------------------
     // Pre-flight health ping: verify pool connectivity before starting batch operations
     // -------------------------------------------------------------------------
+    const pingCid = `arch_ping_${Date.now()}`;
     try {
-      await pgQuery('SELECT 1 as ping');
+      await pgQuery('SELECT 1 as ping', [], {
+        correlationId: pingCid,
+        operationName: 'archive_preflight_ping',
+      });
       consecutiveFailures = 0;
+      nextScheduledAttemptAt = null;
     } catch (pingErr: any) {
       consecutiveFailures++;
-      const backoffMs = Math.min(600000, Math.max(30000, consecutiveFailures * 30000));
+      const backoffMs = calculateExponentialBackoff(consecutiveFailures, 5000, 300000, 2000);
+      nextScheduledAttemptAt = new Date(Date.now() + backoffMs).toISOString();
       status.status = consecutiveFailures >= 2 ? 'STANDBY_LOCAL_RETAIN' : 'PARTIAL';
       status.batchStatus = 'FAILED';
       status.lastError = `Supabase standby (${pingErr.message}). Pending records preserved in SQLite.`;
 
       if (consecutiveFailures <= 2) {
         console.info(
-          `[SupabaseArchive] Pre-flight connection standby: ${pingErr.message}. Local records safely retained in SQLite. Backing off for ${backoffMs / 1000}s (consecutive: ${consecutiveFailures}).`
+          `[SupabaseArchive] Pre-flight connection standby: ${pingErr.message}. Local records safely retained in SQLite. Backing off for ${Math.round(backoffMs / 1000)}s with jitter (consecutive: ${consecutiveFailures}).`
         );
       }
 
@@ -544,20 +660,23 @@ export async function triggerArchivePass(): Promise<{
     if (status.isEnabled) {
       if (batchStatus === 'FAILED') {
         consecutiveFailures++;
-        const backoffMs = Math.min(600000, Math.max(30000, consecutiveFailures * 30000));
+        const backoffMs = calculateExponentialBackoff(consecutiveFailures, 5000, 300000, 2000);
+        nextScheduledAttemptAt = new Date(Date.now() + backoffMs).toISOString();
         if (consecutiveFailures <= 2) {
-          console.info(`[SupabaseArchive] Backing off next drain pass for ${backoffMs / 1000}s (consecutive: ${consecutiveFailures}, SQLite data safe).`);
+          console.info(`[SupabaseArchive] Backing off next drain pass for ${Math.round(backoffMs / 1000)}s with jitter (consecutive: ${consecutiveFailures}, SQLite data safe).`);
         }
         drainTimer = setTimeout(() => {
           triggerArchivePass().catch(() => {});
         }, backoffMs);
       } else if (totalRemaining > 0) {
         consecutiveFailures = 0;
+        nextScheduledAttemptAt = new Date(Date.now() + 6000).toISOString();
         drainTimer = setTimeout(() => {
           triggerArchivePass().catch(() => {});
         }, 6000);
       } else {
         consecutiveFailures = 0;
+        nextScheduledAttemptAt = new Date(Date.now() + scheduledIntervalMs).toISOString();
         periodicTimer = setTimeout(() => {
           triggerArchivePass().catch(() => {});
         }, scheduledIntervalMs);
@@ -576,12 +695,13 @@ export async function triggerArchivePass(): Promise<{
     };
   } catch (err: any) {
     consecutiveFailures++;
-    const backoffMs = Math.min(600000, Math.max(30000, consecutiveFailures * 30000));
+    const backoffMs = calculateExponentialBackoff(consecutiveFailures, 5000, 300000, 2000);
+    nextScheduledAttemptAt = new Date(Date.now() + backoffMs).toISOString();
     status.status = consecutiveFailures >= 2 ? 'STANDBY_LOCAL_RETAIN' : 'FAILED';
     status.batchStatus = 'FAILED';
     status.lastError = `Archive notice: ${err.message}`;
     if (consecutiveFailures <= 2) {
-      console.info(`[SupabaseArchive Notice]: ${err.message}. Data safely retained in SQLite. Retrying in ${backoffMs / 1000}s.`);
+      console.info(`[SupabaseArchive Notice]: ${err.message}. Data safely retained in SQLite. Retrying in ${Math.round(backoffMs / 1000)}s.`);
     }
 
     clearScheduledTimers();
