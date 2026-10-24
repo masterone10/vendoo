@@ -111,8 +111,8 @@ async function startServer() {
   app.listen(port, '0.0.0.0', () => {
     console.log(`[Vendoor Intelligence Server] Running on http://localhost:${port}`);
 
-    // Start background synchronization (responsive 45s interval for live tracking)
-    const syncInterval = parseInt(process.env.SYNC_INTERVAL_SECONDS || '45', 10);
+    // Start background synchronization (balanced 120s interval for reliable tracking without socket exhaustion)
+    const syncInterval = parseInt(process.env.SYNC_INTERVAL_SECONDS || '120', 10);
     syncEngine.start(syncInterval);
 
     // Start isolated Supabase background archive worker (separate 300s schedule, does not touch live counts)

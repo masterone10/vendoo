@@ -131,10 +131,10 @@ apiRouter.get('/dashboard/stats', (req: Request, res: Response) => {
         UNION
         SELECT o.random_number as o_id
         FROM orders o
-        WHERE o.printed_date >= ? AND o.printed_date < ?
+        WHERE (substr(o.printed_date, 1, 10) = ? OR (o.printed_date >= ? AND o.printed_date < ?))
           AND o.current_status = 'Printed'
       )
-    `).get(dateInterval.startCairo, dateInterval.endCairo, dateInterval.startCairo, dateInterval.endCairo) as any)?.count || 0;
+    `).get(dateInterval.startCairo, dateInterval.endCairo, targetDate, dateInterval.startCairo, dateInterval.endCairo) as any)?.count || 0;
 
     const printedEventsCount = (db.prepare(`
       SELECT COUNT(*) as count
@@ -701,10 +701,10 @@ apiRouter.get('/printed', (req: Request, res: Response) => {
           AND (to_status = 'Printed' OR action_type = 'confirmation')
         GROUP BY order_code
       ) c ON c.order_code = o.random_number OR c.order_code = o.order_no OR c.order_code = CAST(o.vendoor_id AS TEXT)
-      WHERE (c.id IS NOT NULL OR (o.printed_date >= ? AND o.printed_date < ?))
+      WHERE (c.id IS NOT NULL OR substr(o.printed_date, 1, 10) = ? OR (o.printed_date >= ? AND o.printed_date < ?))
         ${categorySql}
       ORDER BY printed_date DESC, o.id DESC
-    `).all(interval.startCairo, interval.endCairo, interval.startCairo, interval.endCairo);
+    `).all(interval.startCairo, interval.endCairo, targetDate, interval.startCairo, interval.endCairo);
 
     // Enrich with associated warehouse names and codes
     const orderIds = orders.map(o => o.id);
@@ -1506,17 +1506,6 @@ apiRouter.post('/reports/day-action', async (req: Request, res: Response) => {
     } else if (action === 'force_refetch' || action === 're_export_excel') {
       result = await resolveHistoricalDay(cleanDate, { forceRefetch: true });
     } else if (action === 'sync_supabase') {
-      if (cleanDate < '2026-10-23') {
-        return res.status(400).json({
-          success: false,
-          error: {
-            code: 'PRE_CUTOFF_ARCHIVE_NOT_ALLOWED',
-            message: 'سياسة الأرشيف السحابي تبدأ من 23 أكتوبر 2026 فقط. الأيام السابقة تبقى محفوظة محلياً في SQLite.',
-            retryable: false,
-            requestId: crypto.randomUUID(),
-          },
-        });
-      }
       await syncDayLogsToSupabase(cleanDate);
       result = await resolveHistoricalDay(cleanDate, { autoFetchMissing: false });
     } else if (action === 'reconcile') {

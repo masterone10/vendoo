@@ -87,6 +87,27 @@ export interface LogEntry {
   rawHtml?: string | null;
 }
 
+export class VendoorTimeoutError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'VendoorTimeoutError';
+  }
+}
+
+export class VendoorAuthError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'VendoorAuthError';
+  }
+}
+
+export class VendoorNetworkError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'VendoorNetworkError';
+  }
+}
+
 class VendoorClient {
   private cookieMap: Map<string, string> = new Map();
   private isAuthenticated = false;
@@ -146,8 +167,8 @@ class VendoorClient {
       });
       return res;
     } catch (err: any) {
-      if (err.name === 'AbortError') {
-        throw new Error(`Request timed out after ${timeoutMs}ms: ${url}`);
+      if (err.name === 'AbortError' || String(err.message || '').includes('aborted')) {
+        throw new VendoorTimeoutError(`Request timed out after ${timeoutMs}ms: ${url}`);
       }
       throw err;
     } finally {
@@ -319,70 +340,107 @@ class VendoorClient {
     }
 
     this.loginPromise = (async () => {
-      try {
-        this.cookieMap.clear();
+      const maxLoginAttempts = 3;
+      let lastLoginError: any = null;
 
-        // Step 1: GET Login Page (15s timeout)
-        const getRes = await this.fetchWithTimeout(`${this.baseUrl}/dashboard/login`, {
-          headers: {
-            'User-Agent': this.userAgent,
-            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-          },
-        }, 15000);
+      for (let attempt = 1; attempt <= maxLoginAttempts; attempt++) {
+        try {
+          this.cookieMap.clear();
 
-        this.updateCookies(getRes);
-        const html = await getRes.text();
-        const tokenMatch = html.match(/<input[^>]+name=["']_token["'][^>]+value=["']([^"']+)["']/i) ||
-                           html.match(/<input[^>]+value=["']([^"']+)["'][^>]+name=["']_token["']/i) ||
-                           html.match(/<meta[^>]+name=["']csrf-token["'][^>]+content=["']([^"']+)["']/i) ||
-                           html.match(/name="_token"\s+value="([^"]+)"/);
-        if (!tokenMatch) {
-          throw new Error('CSRF token not found on Vendoor login page');
+          // Step 1: GET Login Page (30s timeout)
+          const getRes = await this.fetchWithTimeout(`${this.baseUrl}/dashboard/login`, {
+            headers: {
+              'User-Agent': this.userAgent,
+              'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+            },
+          }, 30000);
+
+          this.updateCookies(getRes);
+          const html = await getRes.text();
+          const tokenMatch = html.match(/<input[^>]+name=["']_token["'][^>]+value=["']([^"']+)["']/i) ||
+                             html.match(/<input[^>]+value=["']([^"']+)["'][^>]+name=["']_token["']/i) ||
+                             html.match(/<meta[^>]+name=["']csrf-token["'][^>]+content=["']([^"']+)["']/i) ||
+                             html.match(/name="_token"\s+value="([^"]+)"/);
+          if (!tokenMatch) {
+            throw new Error('CSRF token not found on Vendoor login page');
+          }
+          const csrfToken = tokenMatch[1];
+
+          // Step 2: POST Login Form (30s timeout)
+          const bodyParams = new URLSearchParams();
+          bodyParams.append('_token', csrfToken);
+          bodyParams.append('email', this.email);
+          bodyParams.append('password', this.password);
+          bodyParams.append('remember', 'on');
+
+          const postRes = await this.fetchWithTimeout(`${this.baseUrl}/dashboard/login`, {
+            method: 'POST',
+            headers: {
+              'User-Agent': this.userAgent,
+              'Content-Type': 'application/x-www-form-urlencoded',
+              'Cookie': this.getCookieHeader(),
+              'Origin': this.baseUrl,
+              'Referer': `${this.baseUrl}/dashboard/login`,
+            },
+            body: bodyParams.toString(),
+            redirect: 'manual',
+          }, 30000);
+
+          this.updateCookies(postRes);
+
+          const redirectLoc = postRes.headers.get('location') || '';
+
+          if (redirectLoc.includes('/login') || postRes.status === 419 || postRes.status === 401) {
+            throw new VendoorAuthError('بيانات الدخول غير صحيحة أو تم رفض تسجيل الدخول من Vendoor');
+          }
+
+          if (postRes.status === 302 || postRes.status === 200) {
+            this.isAuthenticated = true;
+            this.lastLoginTime = Date.now();
+            return true;
+          }
+
+          throw new VendoorNetworkError(`Vendoor login failed with status ${postRes.status}`);
+        } catch (err: any) {
+          lastLoginError = err;
+          this.isAuthenticated = false;
+
+          // Never retry credential errors
+          if (err instanceof VendoorAuthError) {
+            throw err;
+          }
+
+          const errMsg = String(err?.message || '');
+          const isTransient =
+            err.name === 'AbortError' ||
+            errMsg.includes('Request timed out') ||
+            errMsg.includes('fetch failed') ||
+            errMsg.includes('ECONNRESET') ||
+            errMsg.includes('ETIMEDOUT') ||
+            errMsg.includes('timed out');
+
+          if (isTransient && attempt < maxLoginAttempts) {
+            const delay = 1200 * attempt;
+            await new Promise(r => setTimeout(r, delay));
+            continue;
+          }
+
+          if (attempt >= maxLoginAttempts) {
+            break;
+          }
         }
-        const csrfToken = tokenMatch[1];
-
-        // Step 2: POST Login Form
-        const bodyParams = new URLSearchParams();
-        bodyParams.append('_token', csrfToken);
-        bodyParams.append('email', this.email);
-        bodyParams.append('password', this.password);
-        bodyParams.append('remember', 'on');
-
-        const postRes = await this.fetchWithTimeout(`${this.baseUrl}/dashboard/login`, {
-          method: 'POST',
-          headers: {
-            'User-Agent': this.userAgent,
-            'Content-Type': 'application/x-www-form-urlencoded',
-            'Cookie': this.getCookieHeader(),
-            'Origin': this.baseUrl,
-            'Referer': `${this.baseUrl}/dashboard/login`,
-          },
-          body: bodyParams.toString(),
-          redirect: 'manual',
-        }, 18000);
-
-        this.updateCookies(postRes);
-
-        const redirectLoc = postRes.headers.get('location') || '';
-
-        if (redirectLoc.includes('/login') || postRes.status === 419 || postRes.status === 401) {
-          throw new Error('بيانات الدخول غير صحيحة أو تم رفض تسجيل الدخول من Vendoor');
-        }
-
-        if (postRes.status === 302 || postRes.status === 200) {
-          this.isAuthenticated = true;
-          this.lastLoginTime = Date.now();
-          return true;
-        }
-
-        throw new Error(`Vendoor login failed with status ${postRes.status}`);
-      } catch (err: any) {
-        this.isAuthenticated = false;
-        throw new Error(`Vendoor authentication error: ${err.message}`);
-      } finally {
-        this.loginPromise = null;
       }
-    })();
+
+      if (lastLoginError instanceof VendoorAuthError || lastLoginError instanceof VendoorTimeoutError) {
+        throw lastLoginError;
+      }
+      if (lastLoginError?.name === 'AbortError' || String(lastLoginError?.message || '').includes('timed out') || String(lastLoginError?.message || '').includes('aborted')) {
+        throw new VendoorTimeoutError(`Vendoor login timed out: ${lastLoginError.message}`);
+      }
+      throw new VendoorNetworkError(`Vendoor authentication error: ${lastLoginError?.message || 'Unknown error'}`);
+    })().finally(() => {
+      this.loginPromise = null;
+    });
 
     return this.loginPromise;
   }
@@ -438,7 +496,7 @@ class VendoorClient {
         'Cookie': this.getCookieHeader(),
         'Referer': `${this.baseUrl}/dashboard/orders`,
       },
-    }, 35000, 3);
+    }, 45000, 3);
 
     if (!result.ok) {
       throw new Error(`Failed to fetch orders from Vendoor: HTTP ${result.status}`);
@@ -452,39 +510,53 @@ class VendoorClient {
   }
 
   public async fetchCustomerIntelligence(phone: string, currentOrderId?: number): Promise<ParsedCustomerHistory> {
-    await this.ensureAuthenticated();
-
     const cleanPhone = phone.trim();
     const query = currentOrderId ? `?current_order_id=${currentOrderId}` : '';
-    const res = await this.fetchWithTimeout(`${this.baseUrl}/searchPhone/${cleanPhone}${query}`, {
-      headers: {
-        'User-Agent': this.userAgent,
-        'X-Requested-With': 'XMLHttpRequest',
-        'Accept': 'application/json',
-        'Cookie': this.getCookieHeader(),
-      },
-    }, 8000);
+    
+    let json: any = {};
+    try {
+      await this.ensureAuthenticated();
 
-    let activeRes = res;
-    if (activeRes.status === 400 || activeRes.status === 401 || activeRes.status === 419 || activeRes.url.includes('/login')) {
-      this.isAuthenticated = false;
-      await this.login();
-      activeRes = await this.fetchWithTimeout(`${this.baseUrl}/searchPhone/${cleanPhone}${query}`, {
-        headers: {
-          'User-Agent': this.userAgent,
-          'X-Requested-With': 'XMLHttpRequest',
-          'Accept': 'application/json',
-          'Cookie': this.getCookieHeader(),
+      const result = await this.fetchTextWithRetry(
+        `${this.baseUrl}/searchPhone/${cleanPhone}${query}`,
+        {
+          headers: {
+            'User-Agent': this.userAgent,
+            'X-Requested-With': 'XMLHttpRequest',
+            'Accept': 'application/json',
+            'Cookie': this.getCookieHeader(),
+          },
         },
-      }, 8000);
-      this.updateCookies(activeRes);
-    }
+        8000,
+        2
+      );
 
-    if (!activeRes.ok) {
-      throw new Error(`Failed to query customer history for phone ${cleanPhone}: HTTP ${activeRes.status}`);
+      if (result.ok && result.text) {
+        try {
+          json = JSON.parse(result.text);
+        } catch {
+          json = {};
+        }
+      }
+    } catch (err: any) {
+      // Return safe empty history structure without throwing unhandled network error
+      // Return safe empty history structure without throwing unhandled network error
+      return {
+        phone: cleanPhone,
+        totalOrders: null,
+        deliveriesNum: null,
+        deliveriesDenom: null,
+        deliveryRate: null,
+        cancelsNum: null,
+        cancelsDenom: null,
+        cancelRate: null,
+        repetitionsCount: null,
+        lastOrderStatus: null,
+        lastOrderElapsed: null,
+        warningText: null,
+        rawProDetailsHtml: '',
+      };
     }
-
-    const json = await activeRes.json();
 
     const result: ParsedCustomerHistory = {
       phone: cleanPhone,
@@ -623,17 +695,23 @@ class VendoorClient {
     return url;
   }
 
-  public buildExcelExportUrl(startDate = '', endDate = ''): URL {
+  public buildExcelExportUrl(startDate = '', endDate = '', useSlashes = false): URL {
     const url = new URL(`${this.baseUrl}/dashboard/log/xls/all`);
-    const cleanStart = (startDate || '').trim().slice(0, 10);
-    const cleanEnd = (endDate || cleanStart).trim().slice(0, 10);
+    const rawStart = (startDate || '').trim();
+    const rawEnd = (endDate || rawStart).trim();
+    const cleanStart = rawStart.replace(/\//g, '-').slice(0, 10);
+    const cleanEnd = rawEnd.replace(/\//g, '-').slice(0, 10);
+
+    const formattedStart = useSlashes ? cleanStart.replace(/-/g, '/') : cleanStart;
+    const formattedEnd = useSlashes ? cleanEnd.replace(/-/g, '/') : cleanEnd;
+
     if (cleanStart) {
-      url.searchParams.set('start_date', cleanStart);
-      url.searchParams.set('from_date', cleanStart);
+      url.searchParams.set('start_date', formattedStart);
+      url.searchParams.set('from_date', formattedStart);
     }
     if (cleanEnd) {
-      url.searchParams.set('end_date', cleanEnd);
-      url.searchParams.set('to_date', cleanEnd);
+      url.searchParams.set('end_date', formattedEnd);
+      url.searchParams.set('to_date', formattedEnd);
     }
     return url;
   }
@@ -797,9 +875,10 @@ class VendoorClient {
   public async exportSystemLogsExcel(startDate: string, endDate: string): Promise<Buffer> {
     await this.ensureAuthenticated();
 
-    const url = this.buildExcelExportUrl(startDate, endDate);
+    // 1. Try standard dash format (YYYY-MM-DD)
+    const url = this.buildExcelExportUrl(startDate, endDate, false);
 
-    const result = await this.fetchBufferWithRetry(
+    let result = await this.fetchBufferWithRetry(
       url.toString(),
       {
         headers: {
@@ -812,26 +891,52 @@ class VendoorClient {
       3
     );
 
+    let buffer = result.buffer;
+    let isHtml = false;
+    if (buffer && buffer.length > 0) {
+      const sample = buffer.slice(0, 512).toString('utf8').trim().toLowerCase();
+      isHtml =
+        sample.startsWith('<!doctype') ||
+        sample.startsWith('<html') ||
+        sample.includes('<head>') ||
+        sample.includes('<body') ||
+        sample.includes('action="/login"');
+    }
+
+    // 2. If primary failed or returned HTML, try explicit slash format (YYYY/MM/DD e.g. 2026/10/10)
+    if (!result.ok || isHtml || !buffer || buffer.length === 0) {
+      const slashUrl = this.buildExcelExportUrl(startDate, endDate, true);
+      const altResult = await this.fetchBufferWithRetry(
+        slashUrl.toString(),
+        {
+          headers: {
+            'User-Agent': this.userAgent,
+            'Cookie': this.getCookieHeader(),
+            'Referer': `${this.baseUrl}/dashboard/log/system`,
+          },
+        },
+        45000,
+        2
+      );
+      if (altResult.ok && altResult.buffer && altResult.buffer.length > 200) {
+        const altSample = altResult.buffer.slice(0, 512).toString('utf8').trim().toLowerCase();
+        const altIsHtml = altSample.startsWith('<!doctype') || altSample.startsWith('<html') || altSample.includes('action="/login"');
+        if (!altIsHtml) {
+          return altResult.buffer;
+        }
+      }
+    }
+
     if (!result.ok) {
       throw new Error(`Failed to export system logs Excel from Vendoor: HTTP ${result.status}`);
     }
-
-    const buffer = result.buffer;
 
     if (!buffer || buffer.length === 0) {
       throw new Error('ملف Excel المستخرج من Vendoor فارغ تماماً');
     }
 
-    // Validate that response is NOT an HTML error or login page
-    const sample = buffer.slice(0, 512).toString('utf8').trim().toLowerCase();
-    const isHtml =
-      sample.startsWith('<!doctype') ||
-      sample.startsWith('<html') ||
-      sample.includes('<head>') ||
-      sample.includes('<body') ||
-      sample.includes('action="/login"');
-
     if (isHtml) {
+      const sample = buffer.slice(0, 512).toString('utf8').trim().toLowerCase();
       if (sample.includes('/login') || sample.includes('password')) {
         this.isAuthenticated = false;
         throw new Error('فشل تنزيل ملف Excel: الجلسة منتهية أو تم التحويل لصفحة تسجيل الدخول');

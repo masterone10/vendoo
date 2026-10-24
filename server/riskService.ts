@@ -242,10 +242,10 @@ export function getDashboardRiskStats(targetDate?: string): {
         AND (to_status = 'Printed' OR action_type = 'confirmation')
       GROUP BY order_code
     ) c ON c.order_code = o.random_number OR c.order_code = o.order_no OR c.order_code = CAST(o.vendoor_id AS TEXT)
-    WHERE (c.id IS NOT NULL OR (o.printed_date >= ? AND o.printed_date < ?))
+    WHERE (c.id IS NOT NULL OR substr(o.printed_date, 1, 10) = ? OR (o.printed_date >= ? AND o.printed_date < ?))
   `).get(
     dateInterval.startCairo, dateInterval.endCairo,
-    dateInterval.startCairo, dateInterval.endCairo
+    cairoDate, dateInterval.startCairo, dateInterval.endCairo
   ) as any;
 
   return {
@@ -294,7 +294,7 @@ export function getRiskOrdersDrilldown(params: RiskOrdersParams): RiskOrdersResu
       GROUP BY order_code
     ) c_today ON c_today.order_code = o.random_number OR c_today.order_code = o.order_no OR c_today.order_code = CAST(o.vendoor_id AS TEXT)
   `;
-  const todayPrintedWhere = `(c_today.id IS NOT NULL OR (o.printed_date >= '${todayStart}' AND o.printed_date < '${todayEnd}'))`;
+  const todayPrintedWhere = `(c_today.id IS NOT NULL OR substr(o.printed_date, 1, 10) = '${cairoDate}' OR (o.printed_date >= '${todayStart}' AND o.printed_date < '${todayEnd}'))`;
 
   // 1. Compute Tab Counts across all statuses for this risk type
   const tabCountsRow = db.prepare(`

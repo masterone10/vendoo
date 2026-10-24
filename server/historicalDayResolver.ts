@@ -115,11 +115,9 @@ export async function resolveHistoricalDay(
 
     // -------------------------------------------------------------------------
     // Case A & B: Check Supabase PostgreSQL Archive
-    // CLOUD ARCHIVE POLICY: Remote archive begins from 2026-10-23.
-    // Days prior to 2026-10-23 are stored locally in SQLite and not queried from remote.
-    // Query/restore from Supabase ONLY when local data is absent and autoFetchMissing is enabled.
+    // Query/restore from Supabase when local data is absent and autoFetchMissing is enabled.
     // -------------------------------------------------------------------------
-    if (!forceRefetch && cleanDate >= '2026-10-23' && isSupabaseConfigured() && !hasLocalData && autoFetchMissing) {
+    if (!forceRefetch && isSupabaseConfigured() && !hasLocalData && autoFetchMissing) {
       options.onProgress?.('CHECKING_STORAGE', 'جاري فحص أرشيف Supabase البعيد...', 0, 1, 0);
       try {
         const restoreRes = await fetchDayLogsFromSupabase(cleanDate);
@@ -204,8 +202,7 @@ export async function resolveHistoricalDay(
       (cov?.completion_status === 'UNVERIFIED_SOURCE');
 
     if (!forceRefetch && isImported && hasLocalData) {
-      // If not yet verified on Supabase, trigger background sync (only for dates >= 2026-10-23)
-      if (cleanDate >= '2026-10-23' && isSupabaseConfigured() && cov?.remote_archive_status !== 'REMOTE_VERIFIED') {
+      if (isSupabaseConfigured() && cov?.remote_archive_status !== 'REMOTE_VERIFIED') {
         syncDayLogsToSupabase(cleanDate).catch(() => {});
       }
 
@@ -557,9 +554,9 @@ export async function resolveHistoricalDay(
 
     const nowIso = new Date().toISOString();
 
-    // Sync to Supabase & verify (enforce cloud archive start date 2026-10-23)
+    // Sync to Supabase & verify
     let remoteStatus: 'REMOTE_VERIFIED' | 'REMOTE_SYNCED' | 'PENDING_REMOTE' | 'REMOTE_FAILED' | 'NONE' = 'NONE';
-    if (cleanDate >= '2026-10-23' && isSupabaseConfigured() && finalStatus !== 'FAILED') {
+    if (isSupabaseConfigured() && finalStatus !== 'FAILED') {
       options.onProgress?.('SAVING_RECORDS', 'جاري المزامنة والتحقق من Supabase...', pagesRead, pagesDiscovered, finalRawCount);
       try {
         const supaSync = await syncDayLogsToSupabase(cleanDate);

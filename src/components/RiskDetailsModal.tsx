@@ -139,6 +139,8 @@ export const RiskDetailsModal: React.FC<RiskDetailsModalProps> = ({
     return () => clearTimeout(timer);
   }, [searchInput]);
 
+  const autoSwitchedRef = React.useRef(false);
+
   // Reset tab and page when modal opens or riskType changes
   useEffect(() => {
     if (isOpen) {
@@ -146,6 +148,7 @@ export const RiskDetailsModal: React.FC<RiskDetailsModalProps> = ({
       setSearchInput('');
       setDebouncedSearch('');
       setPage(0);
+      autoSwitchedRef.current = false;
     }
   }, [isOpen, riskType, initialTab]);
 
@@ -170,6 +173,12 @@ export const RiskDetailsModal: React.FC<RiskDetailsModalProps> = ({
       }
       const json: RiskOrdersApiResponse = await res.json();
       setData(json);
+
+      // If user opened on today_printed but today has 0 and all has items, auto-switch to 'all' so orders appear immediately
+      if (activeTab === 'today_printed' && json.tabCounts?.today_printed === 0 && (json.tabCounts?.all || 0) > 0 && !autoSwitchedRef.current) {
+        autoSwitchedRef.current = true;
+        setActiveTab('all');
+      }
     } catch (err) {
       console.error('Failed to fetch risk orders drilldown:', err);
     } finally {
@@ -536,8 +545,22 @@ export const RiskDetailsModal: React.FC<RiskDetailsModalProps> = ({
               <div className="p-16 flex flex-col items-center justify-center gap-2 text-slate-500">
                 <AlertTriangle className="w-8 h-8 text-slate-600 mb-1" />
                 <span className="text-sm font-semibold text-slate-400">لا توجد طلبات مطابقة لهذا الفلتر</span>
-                <span className="text-xs text-slate-500">
-                  {searchInput ? 'جرّب البحث بمعيار مختلف أو مسح حقل البحث' : 'كل الطلبات تفي بالمعايير التشغيلية المحددة'}
+                <span className="text-xs text-slate-500 text-center max-w-md">
+                  {activeTab === 'today_printed' && (data?.tabCounts?.all || 0) > 0 ? (
+                    <span>
+                      لا توجد طلبات مؤكدة لهذا اليوم في هذا الفلتر، ولكن يوجد{' '}
+                      <button
+                        onClick={() => { setActiveTab('all'); setPage(0); }}
+                        className="text-amber-400 font-bold underline hover:text-amber-300 cursor-pointer"
+                      >
+                        {data?.tabCounts?.all} طلب في إجمالي النظام (اضغط هنا للعرض)
+                      </button>
+                    </span>
+                  ) : searchInput ? (
+                    'جرّب البحث بمعيار مختلف أو مسح حقل البحث'
+                  ) : (
+                    'كل الطلبات تفي بالمعايير التشغيلية المحددة'
+                  )}
                 </span>
               </div>
             ) : (

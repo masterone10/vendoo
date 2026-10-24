@@ -559,7 +559,7 @@ export async function runHistoricalLogJob(targetDate: string): Promise<void> {
         notes: `تصدير Excel أصلي مباشر من Vendoor: تم التحقق من ${excelRes.entries.length} حركة بنجاح`,
       });
 
-      if (targetDate >= '2026-10-23' && isSupabaseConfigured()) {
+      if (isSupabaseConfigured()) {
         syncDayLogsToSupabase(targetDate).catch(e => console.warn('[HistoricalLogs] Supabase background sync error:', e.message));
       }
 
@@ -650,7 +650,7 @@ export async function runHistoricalLogJob(targetDate: string): Promise<void> {
       notes: hasFailedPage ? `سحب جزئي: توقف عند الصفحة ${job.pagesFetched}/${pagesDiscovered}` : `سحب مرقّم مكتمل: ${job.pagesFetched} صفحة`,
     });
 
-    if (targetDate >= '2026-10-23' && finalStatus === 'COMPLETE' && isSupabaseConfigured()) {
+    if (finalStatus === 'COMPLETE' && isSupabaseConfigured()) {
       syncDayLogsToSupabase(targetDate).catch(e => console.warn('[HistoricalLogs] Supabase background sync error:', e.message));
     }
 

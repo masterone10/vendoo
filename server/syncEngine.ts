@@ -437,12 +437,12 @@ export class SyncEngine {
     this.status.isRunning = true;
     console.log(`[SyncEngine] Starting background sync worker (interval: ${intervalSeconds}s)...`);
 
-    // Defer initial sync cycle by 3s so the Express server finishes binding and passing health checks
+    // Defer initial sync cycle by 10s so the Express and Vite dev servers finish binding and pre-warming
     setTimeout(() => {
       this.runFullSyncCycle('INITIAL').catch(err => {
-        console.error('[SyncEngine] Initial sync error:', err.message);
+        console.warn('[SyncEngine] Initial sync deferred:', err.message);
       });
-    }, 3000);
+    }, 10000);
 
     this.intervalTimer = setInterval(() => {
       if (this.isSyncing) {
@@ -1055,24 +1055,35 @@ export class SyncEngine {
           break;
         } catch (fbErr: any) {
           firstBatchError = fbErr;
-          console.warn(`[SyncEngine] Attempt ${attempt}/3 fetching initial orders batch failed: ${fbErr.message}`);
           if (attempt < 3) {
+            console.info(`[SyncEngine] Notice: Initial orders batch attempt ${attempt}/3 delayed (${fbErr.message}). Retrying in ${1200 * attempt}ms...`);
             await new Promise(r => setTimeout(r, 1200 * attempt));
+          } else {
+            console.warn(`[SyncEngine] Initial orders batch attempt 3/3 did not complete: ${fbErr.message}`);
           }
         }
       }
 
       if (!firstBatch) {
+        if (runType === 'PERIODIC') {
+          console.info(`[SyncEngine] Periodic sync deferred: upstream temporarily unavailable (${firstBatchError?.message || 'timeout'}). Local data is intact; retrying next cycle.`);
+          this.status.currentPhase = 'IDLE';
+          this.status.cycleState = 'IDLE';
+          this.status.skippedTicksCount = (this.status.skippedTicksCount || 0) + 1;
+          const intervalSec = this.status.configuredIntervalSeconds || 120;
+          this.status.nextScheduledRunAt = new Date(Date.now() + intervalSec * 1000).toISOString();
+          return;
+        }
         throw new Error(`Failed to fetch initial orders batch after 3 attempts: ${firstBatchError?.message || 'Unknown error'}`);
       }
 
       const totalOrdersInSource = firstBatch.recordsTotal;
       const hotThreshold = getHotThresholdDate();
       const existingOrdersCount = (db.prepare('SELECT count(*) as c FROM orders').get() as any)?.c || 0;
-      const isPeriodic = runType === 'PERIODIC' || (existingOrdersCount > 2000 && runType === 'INITIAL');
-      // When database already has historical data, only scan top 200 orders (2 pages).
-      // Only do a deep 30-day scan if the database is brand new (0 orders) or explicitly RECONCILIATION.
-      const maxScanOrders = isPeriodic ? 200 : 25000;
+      // Keep initial and periodic background cycles fast, bounded and lightweight (<= 200 orders / 2 pages).
+      // Deep 30-day scans are only performed when explicitly requested via RECONCILIATION.
+      const isPeriodic = runType !== 'RECONCILIATION';
+      const maxScanOrders = (runType === 'RECONCILIATION') ? 25000 : 200;
 
       let newOrdersInserted = 0;
       let existingOrdersExamined = 0;
@@ -1428,15 +1439,18 @@ export class SyncEngine {
       this.status.consecutiveFailures = 0;
       this.status.lastError = hasFailedPage ? errorMessage : null;
       this.status.currentPhase = 'IDLE';
-      this.status.cycleState = hasFailedPage ? 'PARTIAL' : 'SUCCESS';
+
+      // Decouple component health: if confirmation age check timed out, mark cycle PARTIAL rather than SUCCESS
+      const confAgeUnavailable = this.status.confirmationAgeStatus?.state === 'NOT_AVAILABLE';
+      const isDegraded = hasFailedPage || confAgeUnavailable;
+      const finalStatus = isDegraded ? 'PARTIAL' : 'SUCCESS';
+      this.status.cycleState = finalStatus;
 
       const intervalSec = this.status.configuredIntervalSeconds || parseInt(process.env.SYNC_INTERVAL_SECONDS || '45', 10);
       this.status.nextScheduledRunAt = new Date(Date.now() + intervalSec * 1000).toISOString();
 
-      const finalStatus = hasFailedPage ? 'PARTIAL' : 'SUCCESS';
-
       console.log(
-        `[SyncEngine] ${runType} sync completed (${finalStatus}) in ${phaseTimings.totalDurationMs}ms: ` +
+        `[SyncEngine] ${runType} sync completed (${finalStatus}, confAges=${this.status.confirmationAgeStatus?.state || 'N/A'}) in ${phaseTimings.totalDurationMs}ms: ` +
         `Raw=${rawRowsReceived}, Valid=${validRecordsParsed}, Unique=${uniqueSourceIds}, ` +
         `DupsAcrossPages=${duplicatesAcrossPages}, DupsWithinPage=${duplicatesWithinPage}, ` +
         `RecheckTopDups=${recheckTopDuplicates}, RecheckTopNew=${recheckTopNewOrders}, Invalid=${invalidRecordsCount}, ` +
@@ -1500,12 +1514,20 @@ export class SyncEngine {
         err?.message?.includes('aborted') ||
         err?.message?.includes('fetch failed') ||
         err?.message?.includes('ETIMEDOUT') ||
-        err?.message?.includes('ECONNRESET');
+        err?.message?.includes('timed out') ||
+        err?.message?.includes('Request timed out') ||
+        err?.message?.includes('ECONNRESET') ||
+        err?.message?.includes('socket hang up') ||
+        err?.message?.includes('EAI_AGAIN');
 
       if (err.message?.includes('VENDOOR_EMAIL') || err.message?.includes('VENDOOR_PASSWORD')) {
         console.warn('[SyncEngine] Authentication credentials missing:', err.message);
       } else if (isTransientAbort) {
-        console.warn(`[SyncEngine] Transient network or timeout condition during ${runType} sync (${err.message}). Safe retry scheduled for next tick.`);
+        if (runType === 'PERIODIC') {
+          console.info(`[SyncEngine] Periodic sync deferred: transient network timeout. Safe retry on next tick.`);
+        } else {
+          console.warn(`[SyncEngine] Transient network condition during ${runType} sync. Safe retry on next tick.`);
+        }
       } else {
         console.error('[SyncEngine Detailed Error]:', err);
       }
@@ -1516,9 +1538,15 @@ export class SyncEngine {
       }
       errorMessage = err.message;
       this.status.lastError = errorMessage;
-      this.status.consecutiveFailures++;
-      this.status.currentPhase = 'ERROR';
-      this.status.cycleState = 'ERROR';
+
+      if (runType === 'PERIODIC' && isTransientAbort) {
+        this.status.currentPhase = 'IDLE';
+        this.status.cycleState = 'IDLE';
+      } else {
+        this.status.consecutiveFailures++;
+        this.status.currentPhase = 'ERROR';
+        this.status.cycleState = 'ERROR';
+      }
 
       const durationMs = Date.now() - tCycleStart;
       this.status.lastDurationMs = durationMs;
@@ -2116,7 +2144,7 @@ export class SyncEngine {
           );
         } catch (err: any) {
           failedEnrichments++;
-          console.info(`[SyncEngine] Non-blocking customer enrichment deferred for ${item.customer_phone}: ${err.message}`);
+          console.debug(`[SyncEngine] Customer enrichment deferred for ${item.customer_phone}`);
           try {
             db.prepare(`UPDATE orders SET customer_history_checked_at = ? WHERE id = ?`).run(nowIso, item.id);
           } catch {}

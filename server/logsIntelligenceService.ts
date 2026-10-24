@@ -165,7 +165,6 @@ export async function ensureCoverageForRange(
   if (missingDates.length > 0 && isSupabaseConfigured()) {
     for (let i = missingDates.length - 1; i >= 0; i--) {
       const d = missingDates[i];
-      if (d < '2026-10-23') continue; // Remote archive strictly begins from 2026-10-23
 
       job.stage = 'CHECKING_STORAGE';
       job.stageLabelAr = `جاري استرجاع اللوجز من Supabase (${d})`;
@@ -456,7 +455,7 @@ export async function ensureCoverageForRange(
         dayStatus === 'COMPLETE' ? new Date().toISOString() : null
       );
 
-      if (date >= '2026-10-23' && isSupabaseConfigured() && dayStatus === 'COMPLETE') {
+      if (isSupabaseConfigured() && dayStatus === 'COMPLETE') {
         syncDayLogsToSupabase(date).catch(() => {});
       }
     } catch (dayErr: any) {
