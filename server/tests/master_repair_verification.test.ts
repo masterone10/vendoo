@@ -26,8 +26,14 @@ async function test(name: string, fn: () => void | Promise<void>) {
 
 async function runMasterVerification() {
   // Test 1: Production bundle verification
-  await test('Ver 1: dist-server/server.js exists, compiles cleanly, and distPath resolves', () => {
+  await test('Ver 1: dist-server/server.js exists, compiles cleanly, and distPath resolves', async () => {
     const distServerPath = path.resolve(process.cwd(), 'dist-server/server.js');
+    if (!fs.existsSync(distServerPath)) {
+      const { execSync } = await import('node:child_process');
+      try {
+        execSync('npm run build', { stdio: 'pipe' });
+      } catch {}
+    }
     assert.strictEqual(fs.existsSync(distServerPath), true, 'dist-server/server.js must exist after build');
     const content = fs.readFileSync(distServerPath, 'utf-8');
     assert.strictEqual(content.includes('import.meta.url === `file://${process.argv[1]}`'), false, 'Must not self-execute importSqliteToSupabase on server bundle');

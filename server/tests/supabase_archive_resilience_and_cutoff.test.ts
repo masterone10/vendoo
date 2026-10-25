@@ -46,6 +46,8 @@ test('Supabase Archive Worker: Idle and Cutoff Policy Integrity Suite', async (t
     // Confirm that the worker strictly counts 0 waiting orders because created_at_source < 2026-10-23
     const waitingOrders = (db.prepare("SELECT count(*) as c FROM orders WHERE vendoor_id = 888801 AND created_at_source >= '2026-10-23 00:00:00'").get() as any)?.c || 0;
     assert.strictEqual(waitingOrders, 0, 'Pre-cutoff orders must never be included in Supabase waiting queue');
+  });
+
   await t.test('1.3 True Exponential Backoff formula verification across attempts 1..10 (max 5 min / 300,000ms with jitter)', async () => {
     const { calculateExponentialBackoff } = await import('../supabaseArchiveWorker.ts');
     

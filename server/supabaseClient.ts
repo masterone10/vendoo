@@ -118,6 +118,7 @@ export function getSupabasePool(): pg.Pool {
       query_timeout: 30000,
       keepAlive: true,
       keepAliveInitialDelayMillis: 10000,
+      allowExitOnIdle: true,
     });
 
     const currentPoolInstance = pool;
