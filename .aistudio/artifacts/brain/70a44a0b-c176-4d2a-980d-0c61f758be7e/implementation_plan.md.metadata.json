@@ -1,6 +1,6 @@
 {
-  "summary":  "خطة هندسية متكاملة لفحص وإصلاح اتصالات Supabase PostgreSQL بشكل جذري:\n- توحيد pg.Pool على مستوى العملية كـ Singleton مشترك واحد.\n- إلغاء هدم وإعادة بناء الـ Pool عند انتهاء مهلة الاتصالات الخاملة (idle socket drop).\n- الانتقال إلى Supabase Session Pooler عبر منفذ 5432 مع حماية المصادقة SCRAM-SHA-256.\n- عزل قياس زمن الاتصال (Pool wait vs Auth vs SQL Execution) مع إضافة Correlation ID.\n- ضبط حجم الـ Pool على 3 اتصالات متوازية مع تسلسل الدفعات وتراجع أسي مع Jitter واحتفاظ كامل بالبيانات في SQLite.",
-  "updatedAt":  "2026-10-24T11:46:01.951579665Z",
+  "summary":  "خطة هندسية شاملة لإصلاح مزامنة أوردرات NEW في Vendoor، وتصحيح معامل فلترة الحالات (category[]) وإلغاء سقف الصفحات، ومطابقة كافة الأوردرات بين Vendoor وقاعدة البيانات والداشبورد.",
+  "updatedAt":  "2026-10-25T08:10:21.974912173Z",
   "requestFeedback":  true,
   "userFacing":  true
 }
