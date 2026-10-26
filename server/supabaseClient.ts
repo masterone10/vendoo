@@ -1198,3 +1198,160 @@ export async function reconcileAbsentOrdersInSupabase(
   }
 }
 
+/**
+ * Upserts a batch of orders directly into both current_operational_orders and orders in Supabase
+ */
+export async function upsertCurrentOperationalOrdersToSupabase(
+  orders: any[],
+  statusName: string,
+  scanRunId: string,
+  nowIso?: string
+): Promise<{ upserted: number }> {
+  if (!isSupabaseConfigured() || !orders || orders.length === 0) {
+    return { upserted: 0 };
+  }
+
+  const now = nowIso || new Date().toISOString();
+  const pool = getSupabasePool();
+  let upserted = 0;
+  const CHUNK_SIZE = 50;
+
+  for (let i = 0; i < orders.length; i += CHUNK_SIZE) {
+    const chunk = orders.slice(i, i + CHUNK_SIZE);
+    const cooValuesSql: string[] = [];
+    const cooParams: any[] = [];
+    let pIdx = 1;
+
+    for (const ord of chunk) {
+      const vId = ord.vendoor_id || ord.id;
+      if (!vId) continue;
+
+      const rnd = ord.random_number || `VND_${vId}`;
+      const orderNo = ord.order_no || null;
+      const orderType = ord.order_type || 'regular';
+      const statusRaw = ord.status || ord.status_raw || null;
+      const affCode = ord.affiliate_code || null;
+      const affName = ord.affiliate_name || null;
+      const affId = ord.affiliate_id || null;
+      const custName = ord.full_name || ord.customer_name || null;
+      const custPhone = ord.phone || ord.customer_phone || '';
+      const custPhoneExtra = ord.phone_extra || ord.customer_phone_extra || null;
+      const extraPhoneStatus = ord.extra_phone_status || 'NOT_RETRIEVED';
+      const extraPhoneValid = typeof ord.extra_phone_valid === 'number' ? ord.extra_phone_valid : 0;
+      const gov = ord.governrate_name || ord.governorate || null;
+      const addr = ord.address || null;
+      const addrQuality = ord.address_quality_status || 'NOT_RETRIEVED';
+      const totPrice = parseFloat(String(ord.total_price || 0)) || 0;
+      const shipCost = parseFloat(String(ord.shipping_cost || 0)) || 0;
+      const totOrder = parseFloat(String(ord.total_order || 0)) || 0;
+      const createdAtSrc = ord.created_at || ord.created_at_source || now;
+      const distinctMerchantCount = ord.distinct_merchant_count || 1;
+      const multiMerchantFlag = ord.multi_merchant_flag || 0;
+      const distinctWarehouseCount = ord.distinct_warehouse_count || 1;
+      const multiWarehouseFlag = ord.multi_warehouse_flag || 0;
+      const deliveryRate = ord.delivery_rate !== undefined ? ord.delivery_rate : null;
+      const deliveryRateNum = ord.delivery_rate_num !== undefined ? ord.delivery_rate_num : null;
+      const deliveryRateDenom = ord.delivery_rate_denom !== undefined ? ord.delivery_rate_denom : null;
+      const cancelRate = ord.cancel_rate !== undefined ? ord.cancel_rate : null;
+      const cancelRateNum = ord.cancel_rate_num !== undefined ? ord.cancel_rate_num : null;
+      const cancelRateDenom = ord.cancel_rate_denom !== undefined ? ord.cancel_rate_denom : null;
+      const totalCustomerOrders = ord.total_customer_orders !== undefined ? ord.total_customer_orders : null;
+      const custLastStatus = ord.customer_last_order_status || null;
+      const custLastElapsed = ord.customer_last_order_elapsed || null;
+      const phoneRepetitionCount = ord.phone_repetition_count || 0;
+      const custWarning = ord.customer_delivery_warning || null;
+      const confAgeCat = ord.confirmation_age_category || null;
+      const stateEntryAt = ord.state_entry_at || now;
+
+      cooValuesSql.push(`(
+        $${pIdx++}, $${pIdx++}, $${pIdx++}, $${pIdx++}, $${pIdx++}, $${pIdx++},
+        $${pIdx++}, $${pIdx++}, $${pIdx++}, $${pIdx++}, $${pIdx++}, $${pIdx++},
+        $${pIdx++}, $${pIdx++}, $${pIdx++}, $${pIdx++}, $${pIdx++}, $${pIdx++},
+        $${pIdx++}, $${pIdx++}, $${pIdx++}, $${pIdx++}, $${pIdx++}, $${pIdx++},
+        $${pIdx++}, $${pIdx++}, $${pIdx++}, $${pIdx++}, $${pIdx++}, $${pIdx++},
+        $${pIdx++}, $${pIdx++}, $${pIdx++}, $${pIdx++}, $${pIdx++}, $${pIdx++},
+        $${pIdx++}, $${pIdx++}, $${pIdx++}, $${pIdx++}, $${pIdx++}, $${pIdx++}
+      )`);
+
+      cooParams.push(
+        vId, rnd, orderNo, orderType, statusName, statusRaw,
+        affCode, affName, affId, custName, custPhone, custPhoneExtra,
+        extraPhoneStatus, extraPhoneValid, gov, addr, addrQuality,
+        totPrice, shipCost, totOrder, createdAtSrc,
+        distinctMerchantCount, multiMerchantFlag, distinctWarehouseCount, multiWarehouseFlag,
+        deliveryRate, deliveryRateNum, deliveryRateDenom, cancelRate, cancelRateNum, cancelRateDenom,
+        totalCustomerOrders, custLastStatus, custLastElapsed, phoneRepetitionCount, custWarning,
+        confAgeCat, stateEntryAt, 'VALID', now, scanRunId, now
+      );
+    }
+
+    if (cooValuesSql.length === 0) continue;
+
+    const cooQuery = `
+      INSERT INTO current_operational_orders (
+        vendoor_id, random_number, order_no, order_type, current_status, status_raw,
+        affiliate_code, affiliate_name, affiliate_id, customer_name, customer_phone, customer_phone_extra,
+        extra_phone_status, extra_phone_valid, governorate, address, address_quality_status,
+        total_price, shipping_cost, total_order, created_at_source,
+        distinct_merchant_count, multi_merchant_flag, distinct_warehouse_count, multi_warehouse_flag,
+        delivery_rate, delivery_rate_num, delivery_rate_denom, cancel_rate, cancel_rate_num, cancel_rate_denom,
+        total_customer_orders, customer_last_order_status, customer_last_order_elapsed, phone_repetition_count, customer_delivery_warning,
+        confirmation_age_category, state_entry_at, validation_status, last_observed_at, last_scan_run_id, updated_at
+      ) VALUES ${cooValuesSql.join(', ')}
+      ON CONFLICT (vendoor_id) DO UPDATE SET
+        current_status = EXCLUDED.current_status,
+        status_raw = COALESCE(EXCLUDED.status_raw, current_operational_orders.status_raw),
+        random_number = COALESCE(EXCLUDED.random_number, current_operational_orders.random_number),
+        order_no = COALESCE(EXCLUDED.order_no, current_operational_orders.order_no),
+        customer_name = COALESCE(EXCLUDED.customer_name, current_operational_orders.customer_name),
+        customer_phone = COALESCE(EXCLUDED.customer_phone, current_operational_orders.customer_phone),
+        governorate = COALESCE(EXCLUDED.governorate, current_operational_orders.governorate),
+        address = COALESCE(EXCLUDED.address, current_operational_orders.address),
+        total_order = CASE WHEN EXCLUDED.total_order > 0 THEN EXCLUDED.total_order ELSE current_operational_orders.total_order END,
+        distinct_merchant_count = EXCLUDED.distinct_merchant_count,
+        multi_merchant_flag = EXCLUDED.multi_merchant_flag,
+        distinct_warehouse_count = EXCLUDED.distinct_warehouse_count,
+        multi_warehouse_flag = EXCLUDED.multi_warehouse_flag,
+        delivery_rate = COALESCE(EXCLUDED.delivery_rate, current_operational_orders.delivery_rate),
+        last_observed_at = EXCLUDED.last_observed_at,
+        last_scan_run_id = EXCLUDED.last_scan_run_id,
+        updated_at = EXCLUDED.updated_at
+    `;
+
+    try {
+      await pool.query(cooQuery, cooParams);
+      upserted += chunk.length;
+    } catch (err: any) {
+      console.warn('[SupabaseClient] Error upserting to current_operational_orders:', err.message);
+    }
+  }
+
+  // Also dual-write to master orders table
+  await upsertOrdersBatchToSupabase(orders, nowIso);
+
+  return { upserted };
+}
+
+/**
+ * When a 100% complete scan of a status finishes, remove from current_operational_orders
+ * any orders that were in that status but not seen in the latest scanRunId.
+ */
+export async function finalizeOperationalStatusScan(
+  statusName: string,
+  scanRunId: string
+): Promise<{ removedCount: number }> {
+  if (!isSupabaseConfigured()) return { removedCount: 0 };
+  const pool = getSupabasePool();
+  try {
+    const res = await pool.query(`
+      DELETE FROM current_operational_orders
+      WHERE current_status = $1 AND (last_scan_run_id != $2 OR last_scan_run_id IS NULL)
+      RETURNING id
+    `, [statusName, scanRunId]);
+    return { removedCount: res.rowCount || 0 };
+  } catch (err: any) {
+    console.warn('[SupabaseClient] Error finalizing operational status scan:', err.message);
+    return { removedCount: 0 };
+  }
+}
+

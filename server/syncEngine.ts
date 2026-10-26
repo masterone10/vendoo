@@ -20,7 +20,11 @@ import {
   isSupabaseConfigured,
   upsertOrdersBatchToSupabase,
   reconcileAbsentOrdersInSupabase,
+  upsertCurrentOperationalOrdersToSupabase,
+  finalizeOperationalStatusScan,
+  getSupabasePool,
 } from './supabaseClient.ts';
+import { isPrimaryPostgres } from './unifiedDb.ts';
 import { parseLogActionDetails } from './logDetailsParser.ts';
 import { persistLogEntries } from './historicalLogsService.ts';
 
@@ -1021,6 +1025,73 @@ export class SyncEngine {
    * 4. Synchronizes confirmation ages, system logs, and customer enrichment with bounded concurrency.
    * 5. Tracks comprehensive phase timings and explicit audit metrics.
    */
+  /**
+   * Authoritative production sync: paginates 100% of active operational statuses
+   * ('New', 'Pending', 'Processing', 'Canceling') directly into Supabase current_operational_orders
+   * and master orders table.
+   */
+  public async syncAllOperationalStatuses(scanRunId = crypto.randomUUID()): Promise<{
+    totalReported: number;
+    totalFetched: number;
+    totalUpserted: number;
+    statusBreakdown: Record<string, { reported: number; fetched: number; upserted: number }>;
+  }> {
+    const statuses = ['New', 'Pending', 'Processing', 'Canceling'];
+    const statusBreakdown: Record<string, { reported: number; fetched: number; upserted: number }> = {};
+    let totalReported = 0;
+    let totalFetched = 0;
+    let totalUpserted = 0;
+    const nowIso = new Date().toISOString();
+
+    for (const statusName of statuses) {
+      let pageOffset = 0;
+      const pageSize = 200;
+      let statusReported = 0;
+      let statusFetched = 0;
+      let statusUpserted = 0;
+
+      while (true) {
+        let batch: { recordsTotal: number; recordsFiltered: number; data: VendoorRawOrder[] } | null = null;
+        for (let attempt = 1; attempt <= 3; attempt++) {
+          try {
+            batch = await vendoorClient.fetchOrdersBatch(pageOffset, pageSize, statusName);
+            break;
+          } catch (err: any) {
+            if (attempt === 3) throw err;
+            await new Promise(r => setTimeout(r, 400 * attempt));
+          }
+        }
+
+        if (!batch) break;
+        statusReported = typeof batch.recordsFiltered === 'number' && batch.recordsFiltered >= 0
+          ? batch.recordsFiltered
+          : batch.recordsTotal;
+
+        const ordersList = batch.data || [];
+        statusFetched += ordersList.length;
+
+        if (ordersList.length > 0) {
+          const upRes = await upsertCurrentOperationalOrdersToSupabase(ordersList, nowIso, statusName, scanRunId);
+          statusUpserted += upRes.upserted;
+        }
+
+        pageOffset += pageSize;
+        if (pageOffset >= statusReported || ordersList.length < pageSize) {
+          break;
+        }
+      }
+
+      await finalizeOperationalStatusScan(statusName, scanRunId);
+      statusBreakdown[statusName] = { reported: statusReported, fetched: statusFetched, upserted: statusUpserted };
+      totalReported += statusReported;
+      totalFetched += statusFetched;
+      totalUpserted += statusUpserted;
+      console.log(`[SyncEngine] Supabase Operational Sync for ${statusName}: Reported=${statusReported}, Fetched=${statusFetched}, Upserted=${statusUpserted}`);
+    }
+
+    return { totalReported, totalFetched, totalUpserted, statusBreakdown };
+  }
+
   public async runFullSyncCycle(runType: 'INITIAL' | 'PERIODIC' | 'RECONCILIATION' | 'MANUAL') {
     if (this.isSyncing) return;
 
@@ -1039,6 +1110,62 @@ export class SyncEngine {
     this.status.lastSyncStartedAt = nowIso;
     this.status.currentPhase = 'SCANNING_ORDERS';
     this.status.cycleState = 'RUNNING';
+
+    // -------------------------------------------------------------------------
+    // Single Source of Truth in Production: Direct-to-Supabase Sync
+    // -------------------------------------------------------------------------
+    if (isPrimaryPostgres()) {
+      try {
+        console.log(`[SyncEngine] Running authoritative Supabase PostgreSQL sync cycle (${runType})...`);
+        const scanRunId = crypto.randomUUID();
+
+        // 1. Sync all 4 active operational statuses directly into Supabase
+        this.status.currentPhase = 'SYNCING_SUPABASE_OPERATIONAL';
+        const opRes = await this.syncAllOperationalStatuses(scanRunId);
+
+        // 2. Query total orders in Supabase current_operational_orders
+        const pool = getSupabasePool();
+        const cooCountRes = await pool.query(`SELECT COUNT(*)::int as c FROM current_operational_orders`);
+        this.status.totalOrdersInDb = cooCountRes.rows[0]?.c || 0;
+
+        // 3. Record completed sync run in Supabase sync_runs table
+        const durationMs = Date.now() - tCycleStart;
+        try {
+          await pool.query(`
+            INSERT INTO sync_runs (
+              run_type, status, orders_scanned, orders_created, orders_updated,
+              raw_rows_received, valid_records_parsed, unique_source_ids,
+              duration_ms, started_at, completed_at
+            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+          `, [
+            runType, 'SUCCESS', opRes.totalFetched, opRes.totalUpserted, 0,
+            opRes.totalFetched, opRes.totalFetched, opRes.totalFetched,
+            durationMs, nowIso, new Date().toISOString()
+          ]);
+        } catch (srErr: any) {
+          console.warn('[SyncEngine] Failed to write to sync_runs in Supabase:', srErr.message);
+        }
+
+        this.status.lastSuccessfulSyncAt = new Date().toISOString();
+        this.status.lastSyncCompletedAt = new Date().toISOString();
+        this.status.cycleState = 'SUCCESS';
+        this.status.currentPhase = 'IDLE';
+        this.status.lastDurationMs = durationMs;
+        this.status.lastError = null;
+        this.status.consecutiveFailures = 0;
+        this.isSyncing = false;
+        console.log(`[SyncEngine] Authoritative Supabase sync cycle complete in ${durationMs}ms: ActiveOrders=${this.status.totalOrdersInDb}`);
+        return;
+      } catch (supaSyncErr: any) {
+        console.error('[SyncEngine] Error in authoritative Supabase sync cycle:', supaSyncErr);
+        this.status.lastError = supaSyncErr.message;
+        this.status.cycleState = 'ERROR';
+        this.status.currentPhase = 'IDLE';
+        this.status.consecutiveFailures = (this.status.consecutiveFailures || 0) + 1;
+        this.isSyncing = false;
+        return;
+      }
+    }
 
     const phaseTimings: PhaseTimings = {
       ordersFetchMs: 0,

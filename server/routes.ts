@@ -25,6 +25,18 @@ import {
 import {
   getUnifiedDashboardStats,
   getUnifiedOrdersList,
+  getUnifiedOrderDetail,
+  getUnifiedPendingOrders,
+  getUnifiedProcessingOrders,
+  getUnifiedCancelingOrders,
+  getUnifiedPrintedOrders,
+  getUnifiedCanceledOrders,
+  getUnifiedRiskOrdersDrilldown,
+  getUnifiedLogs,
+  getUnifiedTeamPerformance,
+  getUnifiedAlerts,
+  resolveUnifiedAlert,
+  getUnifiedOperationalReports,
   getSystemDiagnostic,
   isPrimaryPostgres,
   getDataSourceIdentifier,
@@ -118,21 +130,34 @@ apiRouter.get('/dashboard/stats', async (req: Request, res: Response) => {
     let dayCumulative: any;
     let todayActivity: any;
 
-    // 1. Try unified Supabase PostgreSQL first (in production)
-    const unifiedStats = await getUnifiedDashboardStats(targetDate);
-    if (unifiedStats) {
-      currentCounts = unifiedStats.currentCounts;
-      todayActivity = unifiedStats.todayActivity;
-      dayCumulative = {
-        Pending: { uniqueOrders: todayActivity.Pending, totalEvents: todayActivity.pendingEvents },
-        Processing: { uniqueOrders: todayActivity.Processing, totalEvents: todayActivity.processingEvents },
-        Canceling: { uniqueOrders: todayActivity.Canceling, totalEvents: todayActivity.cancelingEvents },
-        Printed: { uniqueOrders: todayActivity.Printed, totalEvents: todayActivity.printedEvents },
-        Canceled: { uniqueOrders: todayActivity.Canceled, totalEvents: todayActivity.cancelEvents },
-      };
-    } else {
-      // 2. Fallback to SQLite (in test environments or if Supabase is offline)
-      const activeStatesRaw: any[] = isToday
+    // 1. Authoritative Supabase PostgreSQL in production
+    if (isPrimaryPostgres()) {
+      try {
+        const unifiedStats = await getUnifiedDashboardStats(targetDate);
+        if (unifiedStats) {
+          const syncStatus = syncEngine.getStatus();
+          const todayLogsCoverage = syncEngine.getTodayLogsCoverage();
+          return res.json({
+            ...unifiedStats,
+            syncStatus,
+            todayLogsCoverage,
+            dataSource: 'SUPABASE_POSTGRES',
+            dataSourceName: getDataSourceIdentifier(),
+          });
+        }
+      } catch (err: any) {
+        console.error('Supabase getUnifiedDashboardStats error:', err);
+        return res.status(503).json({
+          error: 'Supabase Database Degraded or Unavailable',
+          details: err.message,
+          databaseType: 'SUPABASE_POSTGRES',
+          connectionStatus: 'DEGRADED',
+        });
+      }
+    }
+
+    // 2. Fallback to SQLite strictly for offline test environments
+    const activeStatesRaw: any[] = isToday
         ? db.prepare(`
             SELECT current_status, COUNT(*) as count
             FROM orders
@@ -317,7 +342,6 @@ apiRouter.get('/dashboard/stats', async (req: Request, res: Response) => {
         cancelingEvents: cancelingTotalEvents,
         cancelEvents: cancelEventsCount,
       };
-    }
 
     // 3. Confirmation Age counts
     const confStatus = syncEngine.getStatus().confirmationAgeStatus;
@@ -463,7 +487,7 @@ apiRouter.get('/dashboard/stats', async (req: Request, res: Response) => {
 });
 
 // 2b. Risk Drilldown Orders Endpoint (100% consistent with dashboard cards & system state)
-apiRouter.get('/dashboard/risk-orders', (req: Request, res: Response) => {
+apiRouter.get('/dashboard/risk-orders', async (req: Request, res: Response) => {
   try {
     const riskType = (req.query.riskType as any) || 'multi_merchant';
     const tab = (req.query.tab as string) || 'all';
@@ -471,6 +495,22 @@ apiRouter.get('/dashboard/risk-orders', (req: Request, res: Response) => {
     const page = Math.max(0, parseInt((req.query.page as string) || '0', 10));
     const limit = Math.min(100, Math.max(1, parseInt((req.query.limit as string) || '50', 10)));
     const date = req.query.date as string | undefined;
+
+    if (isPrimaryPostgres()) {
+      try {
+        const result = await getUnifiedRiskOrdersDrilldown({
+          riskType,
+          tab,
+          search,
+          page,
+          limit,
+          date,
+        });
+        return res.json({ ...result, dataSource: 'SUPABASE_POSTGRES' });
+      } catch (err: any) {
+        return res.status(503).json({ error: err.message, connectionStatus: 'DEGRADED' });
+      }
+    }
 
     const result = getRiskOrdersDrilldown({
       riskType,
@@ -688,9 +728,32 @@ apiRouter.get('/orders', async (req: Request, res: Response) => {
 });
 
 // 4. Single Order Details
-apiRouter.get('/orders/:code', (req: Request, res: Response) => {
+apiRouter.get('/orders/:code', async (req: Request, res: Response) => {
   try {
     const code = req.params.code;
+
+    if (isPrimaryPostgres()) {
+      try {
+        const orderData = await getUnifiedOrderDetail(code);
+        if (!orderData) {
+          res.status(404).json({ error: 'Order not found' });
+          return;
+        }
+        res.json({
+          order: orderData,
+          items: orderData.items || [],
+          timeline: orderData.timeline || [],
+          alerts: orderData.alerts || [],
+          customerObservations: orderData.customerObservations || [],
+          sourceLogs: orderData.timeline || [],
+          dataSource: 'SUPABASE_POSTGRES',
+        });
+        return;
+      } catch (err: any) {
+        return res.status(503).json({ error: err.message, connectionStatus: 'DEGRADED' });
+      }
+    }
+
     const order: any = db.prepare('SELECT * FROM orders WHERE random_number = ? OR vendoor_id = ?').get(code, code);
 
     if (!order) {
@@ -747,11 +810,26 @@ apiRouter.get('/orders/:code', (req: Request, res: Response) => {
 });
 
 // 5. Printed View (Scoped to date, backed by Vendoor logs & transitions)
-apiRouter.get('/printed', (req: Request, res: Response) => {
+apiRouter.get('/printed', async (req: Request, res: Response) => {
   try {
     const { category = 'all', date } = req.query;
     const cairoToday = getCairoDateString();
     const targetDate = typeof date === 'string' && date.trim() ? date.trim().slice(0, 10) : cairoToday;
+
+    if (isPrimaryPostgres()) {
+      try {
+        const result = await getUnifiedPrintedOrders(targetDate, category as string);
+        return res.json({
+          date: targetDate,
+          orders: result.orders,
+          total: result.total,
+          dataSource: 'SUPABASE_POSTGRES',
+        });
+      } catch (err: any) {
+        return res.status(503).json({ error: err.message, connectionStatus: 'DEGRADED' });
+      }
+    }
+
     const interval = getCairoDateInterval(targetDate);
 
     let categorySql = '';
@@ -830,11 +908,26 @@ apiRouter.get('/printed', (req: Request, res: Response) => {
 });
 
 // 5b. Canceled Orders View (Strictly derived from Vendoor activity logs for target date)
-apiRouter.get('/canceled', (req: Request, res: Response) => {
+apiRouter.get('/canceled', async (req: Request, res: Response) => {
   try {
     const { date } = req.query;
     const cairoToday = getCairoDateString();
     const targetDate = typeof date === 'string' && date.trim() ? date.trim().slice(0, 10) : cairoToday;
+
+    if (isPrimaryPostgres()) {
+      try {
+        const result = await getUnifiedCanceledOrders(targetDate);
+        return res.json({
+          date: targetDate,
+          total: result.total,
+          orders: result.orders,
+          dataSource: 'SUPABASE_POSTGRES',
+        });
+      } catch (err: any) {
+        return res.status(503).json({ error: err.message, connectionStatus: 'DEGRADED' });
+      }
+    }
+
     const interval = getCairoDateInterval(targetDate);
 
     const logs: any[] = db.prepare(`
@@ -865,8 +958,17 @@ apiRouter.get('/canceled', (req: Request, res: Response) => {
 });
 
 // 6. Pending Orders Categorized by Age (Shared 5 buckets)
-apiRouter.get('/pending', (_req: Request, res: Response) => {
+apiRouter.get('/pending', async (_req: Request, res: Response) => {
   try {
+    if (isPrimaryPostgres()) {
+      try {
+        const result = await getUnifiedPendingOrders();
+        return res.json({ ...result, dataSource: 'SUPABASE_POSTGRES' });
+      } catch (err: any) {
+        return res.status(503).json({ error: err.message, connectionStatus: 'DEGRADED' });
+      }
+    }
+
     const orders: any[] = db.prepare(`
       SELECT
         id, vendoor_id, random_number, customer_name, customer_phone,
@@ -894,8 +996,17 @@ apiRouter.get('/pending', (_req: Request, res: Response) => {
 });
 
 // 7. Processing Orders Categorized by Age (Shared 5 buckets, from source logs)
-apiRouter.get('/processing', (_req: Request, res: Response) => {
+apiRouter.get('/processing', async (_req: Request, res: Response) => {
   try {
+    if (isPrimaryPostgres()) {
+      try {
+        const result = await getUnifiedProcessingOrders();
+        return res.json({ ...result, dataSource: 'SUPABASE_POSTGRES' });
+      } catch (err: any) {
+        return res.status(503).json({ error: err.message, connectionStatus: 'DEGRADED' });
+      }
+    }
+
     const orders: any[] = db.prepare(`
       SELECT
         id, vendoor_id, random_number, customer_name, customer_phone,
@@ -924,16 +1035,52 @@ apiRouter.get('/processing', (_req: Request, res: Response) => {
   }
 });
 
+// 7b. Canceling Orders
+apiRouter.get('/canceling', async (_req: Request, res: Response) => {
+  try {
+    if (isPrimaryPostgres()) {
+      try {
+        const result = await getUnifiedCancelingOrders();
+        return res.json({ ...result, dataSource: 'SUPABASE_POSTGRES' });
+      } catch (err: any) {
+        return res.status(503).json({ error: err.message, connectionStatus: 'DEGRADED' });
+      }
+    }
+    const orders: any[] = db.prepare(`SELECT * FROM orders WHERE current_status = 'Canceling' ORDER BY id DESC`).all();
+    res.json({ orders, total: orders.length });
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // 8. Team Performance Based on Canonical Activity Events
 apiRouter.get('/team', async (req: Request, res: Response) => {
   try {
     const { period, date, startDate, endDate, syncIfMissing } = req.query;
 
+    const effectiveDate = (date as string) || (period === 'today' ? getCairoDateString() : (startDate as string) || getCairoDateString());
+
+    if (isPrimaryPostgres()) {
+      try {
+        const performance = await getUnifiedTeamPerformance(effectiveDate);
+        return res.json({
+          date: effectiveDate,
+          employees: performance,
+          totalActions: performance.reduce((sum: number, e: any) => sum + parseInt(e.total_actions || '0', 10), 0),
+          uniqueOrders: performance.reduce((sum: number, e: any) => sum + parseInt(e.unique_orders || '0', 10), 0),
+          confirmationsCount: performance.reduce((sum: number, e: any) => sum + parseInt(e.confirmations_count || '0', 10), 0),
+          cancellationsCount: performance.reduce((sum: number, e: any) => sum + parseInt(e.cancellations_count || '0', 10), 0),
+          dataSource: 'SUPABASE_POSTGRES',
+        });
+      } catch (err: any) {
+        return res.status(503).json({ error: err.message, connectionStatus: 'DEGRADED' });
+      }
+    }
+
     let dateLabel = '';
     const conditions: string[] = [];
     const params: any[] = [];
 
-    const effectiveDate = (date as string) || (period === 'today' ? getCairoDateString() : '');
     if (effectiveDate) {
       dateLabel = effectiveDate;
       const interval = getCairoDateInterval(effectiveDate);
@@ -1255,9 +1402,19 @@ apiRouter.get('/team/:actorName/events', (req: Request, res: Response) => {
 });
 
 // 10. Alerts Management
-apiRouter.get('/alerts', (req: Request, res: Response) => {
+apiRouter.get('/alerts', async (req: Request, res: Response) => {
   try {
     const { status, type, severity } = req.query;
+
+    if (isPrimaryPostgres()) {
+      try {
+        const alerts = await getUnifiedAlerts({ status: status as string });
+        return res.json({ alerts, total: alerts.length, dataSource: 'SUPABASE_POSTGRES' });
+      } catch (err: any) {
+        return res.status(503).json({ error: err.message, connectionStatus: 'DEGRADED' });
+      }
+    }
+
     const conditions: string[] = [];
     const params: any[] = [];
 
@@ -1302,11 +1459,20 @@ apiRouter.get('/alerts', (req: Request, res: Response) => {
   }
 });
 
-apiRouter.post('/alerts/:id/resolve', (req: Request, res: Response) => {
+apiRouter.post('/alerts/:id/resolve', async (req: Request, res: Response) => {
   try {
     const alertId = parseInt(req.params.id, 10);
     const { notes = '', resolvedBy = 'مشرف العمليات' } = req.body;
     const nowIso = new Date().toISOString();
+
+    if (isPrimaryPostgres()) {
+      try {
+        await resolveUnifiedAlert(alertId, notes, resolvedBy);
+        return res.json({ success: true, alertId, resolvedAt: nowIso, dataSource: 'SUPABASE_POSTGRES' });
+      } catch (err: any) {
+        return res.status(503).json({ error: err.message, connectionStatus: 'DEGRADED' });
+      }
+    }
 
     const info = db.prepare(`
       UPDATE alerts SET
@@ -1867,9 +2033,23 @@ apiRouter.get('/reports/logs-export', (req: Request, res: Response) => {
 });
 
 // 11. Comprehensive Operational Reports
-apiRouter.get('/reports', (req: Request, res: Response) => {
+apiRouter.get('/reports', async (req: Request, res: Response) => {
   try {
     const { startDate, endDate, period } = req.query;
+
+    if (isPrimaryPostgres()) {
+      try {
+        const reports = await getUnifiedOperationalReports({
+          startDate: startDate as string,
+          endDate: endDate as string,
+          period: period as string,
+        });
+        return res.json({ ...reports, dataSource: 'SUPABASE_POSTGRES' });
+      } catch (err: any) {
+        return res.status(503).json({ error: err.message, connectionStatus: 'DEGRADED' });
+      }
+    }
+
     let sDate = (startDate as string) || '';
     let eDate = (endDate as string) || '';
 

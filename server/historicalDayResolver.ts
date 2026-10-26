@@ -63,6 +63,43 @@ export async function resolveHistoricalDay(
   const promise = (async (): Promise<ResolvedDayResult> => {
     const interval = getCairoDateInterval(cleanDate);
 
+    // In production, Supabase PostgreSQL is authoritative; check directly without slow SQLite restoration
+    const { isPrimaryPostgres, getSupabasePool } = await import('./unifiedDb.ts');
+    if (isPrimaryPostgres() && !forceRefetch) {
+      try {
+        const pool = getSupabasePool();
+        const [canonRes, covRes] = await Promise.all([
+          pool.query(
+            `SELECT COUNT(*)::int as c FROM canonical_activity_events WHERE event_timestamp >= $1 AND event_timestamp < $2`,
+            [interval.startCairo, interval.endCairo]
+          ),
+          pool.query(
+            `SELECT completion_status, data_source FROM historical_coverage WHERE period_date = $1 AND source_domain = 'logs' LIMIT 1`,
+            [cleanDate]
+          ),
+        ]);
+        const canonC = Number(canonRes.rows[0]?.c || 0);
+        const covRow = covRes.rows[0];
+
+        if (canonC > 0 || (covRow && (covRow.completion_status === 'COMPLETE' || covRow.completion_status === 'EMPTY_VERIFIED'))) {
+          return {
+            date: cleanDate,
+            decision: 'USE_SUPABASE_ARCHIVE',
+            dataSource: 'SUPABASE_ARCHIVE',
+            completionStatus: covRow?.completion_status || 'COMPLETE',
+            localStorageStatus: 'LOCAL_SAVED',
+            remoteArchiveStatus: 'REMOTE_VERIFIED',
+            rawRecordsCount: canonC,
+            canonicalEventsCount: canonC,
+            loadedFromCache: true,
+            messageAr: 'البيانات موثقة ومطابقة في أرشيف Supabase السحابي بنجاح',
+          };
+        }
+      } catch (supaErr: any) {
+        console.warn(`[HistoricalDayResolver] Direct Supabase check failed for ${cleanDate}:`, supaErr.message);
+      }
+    }
+
     // 0. Only repair raw-to-canonical gaps if uncanonical records exist locally
     const uncanonicalCount = (db.prepare(`
       SELECT COUNT(*) as c FROM raw_activity_events r
