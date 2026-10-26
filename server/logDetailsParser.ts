@@ -276,24 +276,14 @@ export function parseLogActionDetails(rawText: string, actorName = '', orderCode
     return result;
   }
 
-  // 10. SHIPPING WAYBILL (رقم البوليصة):
-  if (t.includes('رقم البوليصة') || t.includes('البوليصة')) {
-    result.actionType = 'waybill_edit';
-    result.actionLabelAr = 'تعديل / إضافة رقم البوليصة';
-    result.fieldName = 'رقم البوليصة';
-    result.toStatus = null;
-    result.fromStatus = null;
-    result.summaryAr = t;
-    result.isAdministrative = true;
-    return result;
-  }
-
-  // 11. PRINTING / CONFIRMATION (Rule: Printed = تأكيد الأوردر):
+  // 10. PRINTING / CONFIRMATION (Rule: Printed = تأكيد الأوردر / طبع البوليصة / طبع الاوردر):
   if (
     t.includes('طبع الاوردر') ||
     t.includes('طباعة الاوردر') ||
     t.includes('طبع الفاتورة') ||
     t.includes('طباعة الفاتورة') ||
+    t.includes('طبع البوليصة') ||
+    t.includes('طباعة البوليصة') ||
     t.includes('تأكيد الطلب') ||
     t.toLowerCase() === 'printed' ||
     t === 'مطبوع'
@@ -305,6 +295,18 @@ export function parseLogActionDetails(rawText: string, actorName = '', orderCode
     result.toStatus = 'Printed';
     result.summaryAr = 'تأكيد الأوردر (Printed)';
     result.isAdministrative = false;
+    return result;
+  }
+
+  // 11. SHIPPING WAYBILL (رقم البوليصة):
+  if (t.includes('رقم البوليصة') || t.includes('البوليصة')) {
+    result.actionType = 'waybill_edit';
+    result.actionLabelAr = 'تعديل / إضافة رقم البوليصة';
+    result.fieldName = 'رقم البوليصة';
+    result.toStatus = null;
+    result.fromStatus = null;
+    result.summaryAr = t;
+    result.isAdministrative = true;
     return result;
   }
 

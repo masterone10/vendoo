@@ -11,7 +11,7 @@
     "clean": "rm -rf dist dist-server",
     "lint": "tsc --noEmit",
     "test": "tsx server/tests/run_all_tests.ts",
-    "test:unit": "tsx server/tests/requirements_verification.test.ts && tsx server/tests/team_status_transition_dedup.test.ts && tsx server/tests/comprehensive_report_dedup_and_parity.test.ts && tsx server/tests/printed_risk_day_scoped.test.ts",
+    "test:unit": "tsx server/tests/requirements_verification.test.ts && tsx server/tests/team_status_transition_dedup.test.ts && tsx server/tests/comprehensive_report_dedup_and_parity.test.ts && tsx server/tests/printed_risk_day_scoped.test.ts && tsx server/tests/orders_new_sync_and_parity_555.test.ts",
     "test:integration": "tsx server/tests/acceptance.test.ts && tsx server/tests/isolated_logs_pipeline_verification.test.ts && tsx server/tests/reports_failure_and_state_verification.test.ts"
   },
   "dependencies": {

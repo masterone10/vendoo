@@ -2,7 +2,6 @@ import crypto from 'node:crypto';
 import * as XLSX from 'xlsx';
 import { db, getCairoDateInterval, isDateInHot, saveCoverageRecord } from './db.ts';
 import { vendoorClient, type LogEntry } from './vendoorClient.ts';
-import { syncEngine } from './syncEngine.ts';
 import { parseLogActionDetails } from './logDetailsParser.ts';
 import { normalizeDateStringToCairo, findMatchingField, HEADER_ALIASES } from './batchLogsImporter.ts';
 import { isSupabaseConfigured, syncDayLogsToSupabase } from './supabaseClient.ts';
@@ -610,22 +609,76 @@ export async function runHistoricalLogJob(targetDate: string): Promise<void> {
     job.pagesFetched = 1;
     job.eventsSaved = totalSaved;
 
+    // Check existing coverage to support smart resumption
+    const existingCov: any = db.prepare(`
+      SELECT pages_read, pages_discovered, records_saved FROM historical_coverage
+      WHERE period_date = ? AND source_domain = 'logs'
+    `).get(targetDate);
+
+    const startPage = (existingCov && existingCov.pages_read > 1 && existingCov.pages_discovered > existingCov.pages_read)
+      ? existingCov.pages_read + 1
+      : 2;
+
+    job.pagesFetched = Math.max(1, existingCov?.pages_read || 1);
+
     // Paginate through remaining pages
-    for (let p = 2; p <= pagesDiscovered; p++) {
-      try {
-        const nextBatch = await vendoorClient.fetchSystemLogs(p, targetDate, targetDate);
-        const batchRes = persistLogEntries(nextBatch.entries, interval, {
-          dataSource: 'VENDOOR_FETCH',
-          strictInterval: true,
-        });
-        totalSaved += batchRes.saved;
-        job.pagesFetched = p;
-        job.eventsSaved = totalSaved;
-      } catch (pageErr: any) {
-        console.warn(`[HistoricalLogs] Page ${p} failed for ${targetDate}:`, pageErr.message);
+    for (let p = startPage; p <= pagesDiscovered; p++) {
+      let pageSuccess = false;
+      let lastErr: any = null;
+
+      for (let attempt = 1; attempt <= 3; attempt++) {
+        try {
+          if (p > 2 && attempt === 1) {
+            await new Promise(r => setTimeout(r, 60));
+          }
+          const nextBatch = await vendoorClient.fetchSystemLogs(p, targetDate, targetDate);
+          
+          if (nextBatch.totalPages > pagesDiscovered) {
+            pagesDiscovered = nextBatch.totalPages;
+            job.pagesTotal = pagesDiscovered;
+          }
+
+          if (nextBatch.entries && nextBatch.entries.length > 0) {
+            const batchRes = persistLogEntries(nextBatch.entries, interval, {
+              dataSource: 'VENDOOR_FETCH',
+              strictInterval: true,
+            });
+            totalSaved += batchRes.saved;
+          }
+
+          job.pagesFetched = p;
+          job.eventsSaved = totalSaved;
+          pageSuccess = true;
+          break;
+        } catch (pageErr: any) {
+          lastErr = pageErr;
+          if (attempt < 3) {
+            await new Promise(r => setTimeout(r, 500 * attempt));
+          }
+        }
+      }
+
+      if (!pageSuccess) {
+        console.warn(`[HistoricalLogs] Page ${p} failed for ${targetDate} after 3 attempts:`, lastErr?.message);
         hasFailedPage = true;
-        job.errorMessage = `فشل في الصفحة ${p}: ${pageErr.message}`;
+        job.errorMessage = `فشل في الصفحة ${p}: ${lastErr?.message}`;
         break;
+      }
+
+      // Checkpoint every 10 pages
+      if (p % 10 === 0 || p === pagesDiscovered) {
+        saveCoverageRecord({
+          periodDate: targetDate,
+          sourceDomain: 'logs',
+          storageTier: 'HOT',
+          pagesDiscovered: pagesDiscovered,
+          pagesRead: job.pagesFetched,
+          recordsExtracted: totalSaved,
+          recordsSaved: totalSaved,
+          completionStatus: job.pagesFetched >= pagesDiscovered && !hasFailedPage ? 'COMPLETE' : 'PARTIAL',
+          lastAttemptedAt: new Date().toISOString(),
+          notes: `سحب جاري: تم استيفاء صفحة ${job.pagesFetched}/${pagesDiscovered}`,
+        });
       }
     }
 

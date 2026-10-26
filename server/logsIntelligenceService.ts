@@ -287,6 +287,7 @@ export async function ensureCoverageForRange(
             const fromPage = existingCov.pages_read + 1;
             let toPage = existingCov.pages_discovered;
             let allResumeSucceeded = true;
+            let lastSuccessfulPage = existingCov.pages_read;
 
             for (let p = fromPage; p <= toPage; p++) {
               let pageFetched = false;
@@ -306,6 +307,7 @@ export async function ensureCoverageForRange(
                   totalSaved += nextRes.saved;
                   job.eventsSaved = totalSaved;
                   pageFetched = true;
+                  lastSuccessfulPage = p;
                   break;
                 } catch {
                   if (attempt < 3) await new Promise(r => setTimeout(r, 600 * attempt));
@@ -313,20 +315,19 @@ export async function ensureCoverageForRange(
               }
               if (!pageFetched) {
                 allResumeSucceeded = false;
+                hasFailedPage = true;
                 break;
               }
             }
 
-            if (allResumeSucceeded) {
-              dayPagesTotal = toPage;
-              dayPagesFetched = toPage;
-              totalPagesDiscovered += (toPage - existingCov.pages_read);
-              totalPagesRead += (toPage - existingCov.pages_read);
-              job.pagesTotal = Math.max(job.pagesTotal, totalPagesDiscovered);
-              job.pagesFetched = totalPagesRead;
-              bulkLoaded = true;
-              dayStatus = 'COMPLETE';
-            }
+            dayPagesTotal = toPage;
+            dayPagesFetched = lastSuccessfulPage;
+            totalPagesDiscovered += (toPage - existingCov.pages_read);
+            totalPagesRead += (lastSuccessfulPage - existingCov.pages_read);
+            job.pagesTotal = Math.max(job.pagesTotal, totalPagesDiscovered);
+            job.pagesFetched = totalPagesRead;
+            bulkLoaded = true;
+            dayStatus = allResumeSucceeded ? 'COMPLETE' : 'PARTIAL';
           } catch {
             bulkLoaded = false;
           }

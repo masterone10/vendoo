@@ -1050,3 +1050,151 @@ export async function restoreMissingOrdersFromSupabase(
   return { restored, failed };
 }
 
+/**
+ * Batch upserts orders into Supabase PostgreSQL directly for instant shared persistence.
+ */
+export async function upsertOrdersBatchToSupabase(orders: any[], nowIso?: string): Promise<{ upserted: number }> {
+  if (!isSupabaseConfigured() || !orders || orders.length === 0) {
+    return { upserted: 0 };
+  }
+
+  const now = nowIso || new Date().toISOString();
+  const pool = getSupabasePool();
+  let upserted = 0;
+  const CHUNK_SIZE = 50;
+
+  for (let i = 0; i < orders.length; i += CHUNK_SIZE) {
+    const chunk = orders.slice(i, i + CHUNK_SIZE);
+    const valuesSql: string[] = [];
+    const params: any[] = [];
+    let pIdx = 1;
+
+    for (const ord of chunk) {
+      const vId = ord.vendoor_id || ord.id;
+      if (!vId) continue;
+
+      let statusClean = ord.current_status;
+      if (!statusClean && ord.status) {
+        const s = String(ord.status).replace(/<[^>]+>/g, '').trim();
+        if (s.includes('Printed') || s.includes('طباعة') || s.includes('مطبوع')) statusClean = 'Printed';
+        else if (s.includes('Pending') || s.includes('معلق')) statusClean = 'Pending';
+        else if (s.includes('Processing') || s.includes('قيد التجهيز')) statusClean = 'Processing';
+        else if (s.includes('Cancel') || s.includes('ملغي')) statusClean = 'Canceled';
+        else if (s.includes('New') || s.includes('جديد')) statusClean = 'New';
+        else statusClean = s || 'New';
+      }
+      if (!statusClean) statusClean = 'New';
+
+      valuesSql.push(`(
+        $${pIdx++}, $${pIdx++}, $${pIdx++}, $${pIdx++}, $${pIdx++}, $${pIdx++},
+        $${pIdx++}, $${pIdx++}, $${pIdx++}, $${pIdx++}, $${pIdx++}, $${pIdx++},
+        $${pIdx++}, $${pIdx++}, $${pIdx++}, $${pIdx++}, $${pIdx++},
+        $${pIdx++}, $${pIdx++}, $${pIdx++}, $${pIdx++}
+      )`);
+
+      params.push(
+        vId,
+        ord.random_number || `VND_${vId}`,
+        ord.order_no || null,
+        ord.order_type || 'اوردر جديد',
+        statusClean,
+        ord.status || ord.status_raw || null,
+        ord.affiliate_code || null,
+        ord.affiliate_name || null,
+        ord.full_name || ord.customer_name || null,
+        ord.phone || ord.customer_phone || '',
+        ord.governrate_name || ord.governorate || null,
+        ord.address || null,
+        parseFloat(String(ord.total_price || 0)) || 0,
+        parseFloat(String(ord.shipping_cost || 0)) || 0,
+        parseFloat(String(ord.total_order || 0)) || 0,
+        ord.created_at || ord.created_at_source || now,
+        'VALIDATED',
+        'HOT',
+        now,
+        now,
+        now
+      );
+    }
+
+    if (valuesSql.length === 0) continue;
+
+    const queryText = `
+      INSERT INTO orders (
+        vendoor_id, random_number, order_no, order_type, current_status, status_raw,
+        affiliate_code, affiliate_name, customer_name, customer_phone, governorate, address,
+        total_price, shipping_cost, total_order, created_at_source,
+        validation_status, storage_tier, last_observed_at, created_at, updated_at
+      ) VALUES ${valuesSql.join(', ')}
+      ON CONFLICT (vendoor_id) DO UPDATE SET
+        current_status = EXCLUDED.current_status,
+        status_raw = COALESCE(EXCLUDED.status_raw, orders.status_raw),
+        random_number = COALESCE(EXCLUDED.random_number, orders.random_number),
+        order_no = COALESCE(EXCLUDED.order_no, orders.order_no),
+        customer_name = COALESCE(EXCLUDED.customer_name, orders.customer_name),
+        customer_phone = COALESCE(EXCLUDED.customer_phone, orders.customer_phone),
+        governorate = COALESCE(EXCLUDED.governorate, orders.governorate),
+        address = COALESCE(EXCLUDED.address, orders.address),
+        total_order = CASE WHEN EXCLUDED.total_order > 0 THEN EXCLUDED.total_order ELSE orders.total_order END,
+        validation_status = 'VALIDATED',
+        last_observed_at = EXCLUDED.last_observed_at,
+        updated_at = EXCLUDED.updated_at
+    `;
+
+    try {
+      await pool.query(queryText, params);
+      upserted += chunk.length;
+    } catch (err: any) {
+      console.warn('[SupabaseClient] Error batch upserting orders:', err.message);
+    }
+  }
+
+  return { upserted };
+}
+
+/**
+ * Reconciles absent orders in Supabase after an authoritative complete scan
+ */
+export async function reconcileAbsentOrdersInSupabase(
+  statusName: string,
+  activeVendoorIds: Set<number>,
+  nowIso?: string
+): Promise<void> {
+  if (!isSupabaseConfigured() || activeVendoorIds.size === 0) return;
+
+  try {
+    const pool = getSupabasePool();
+    const idArray = Array.from(activeVendoorIds);
+
+    // 1. For orders absent from live view, update from canonical logs if a transition is recorded
+    await pool.query(`
+      UPDATE orders o
+      SET current_status = c.to_status,
+          validation_status = 'RESOLVED_VIA_AUDIT_LOGS',
+          updated_at = NOW()
+      FROM (
+        SELECT DISTINCT ON (order_code) order_code, to_status, event_timestamp
+        FROM canonical_activity_events
+        WHERE to_status IS NOT NULL
+        ORDER BY order_code, event_timestamp DESC
+      ) c
+      WHERE c.order_code = o.random_number
+        AND o.current_status = $1
+        AND NOT (o.vendoor_id = ANY($2))
+    `, [statusName, idArray]);
+
+    // 2. For remaining orders absent from live view without canonical event,
+    // mark validation_status = 'UNRESOLVED_ABSENT_FROM_VIEW' so they never inflate active live balance!
+    await pool.query(`
+      UPDATE orders
+      SET validation_status = 'UNRESOLVED_ABSENT_FROM_VIEW',
+          updated_at = NOW()
+      WHERE current_status = $1
+        AND NOT (vendoor_id = ANY($2))
+        AND validation_status != 'UNRESOLVED_ABSENT_FROM_VIEW'
+    `, [statusName, idArray]);
+  } catch (err: any) {
+    console.warn('[SupabaseClient] Error reconciling absent orders in Supabase:', err.message);
+  }
+}
+

@@ -477,6 +477,8 @@ class VendoorClient {
         'Delivered': '8',
       };
       const mappedVal = statusMap[statusFilter] || statusFilter;
+      // Vendoor DataTable uses #category_filter (mapped to d.category) as the true order status filter
+      url.searchParams.set('category', mappedVal);
       url.searchParams.set('status_filter', mappedVal);
     }
     if (startDate) {

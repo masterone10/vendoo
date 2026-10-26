@@ -16,7 +16,13 @@ import {
   type ConfirmationRow,
   type LogEntry,
 } from './vendoorClient.ts';
+import {
+  isSupabaseConfigured,
+  upsertOrdersBatchToSupabase,
+  reconcileAbsentOrdersInSupabase,
+} from './supabaseClient.ts';
 import { parseLogActionDetails } from './logDetailsParser.ts';
+import { persistLogEntries } from './historicalLogsService.ts';
 
 export interface CategoryDetailItem {
   status: 'SUCCESS' | 'TIMEOUT' | 'ERROR' | 'PENDING' | 'NOT_AVAILABLE';
@@ -44,6 +50,24 @@ export interface AbsentOrdersSummary {
   confirmedViaLogs: number;
   preservedUnresolved: number;
   unresolvedRandomNumbers: string[];
+}
+
+export interface StatusOrdersSyncResult {
+  status: string;
+  sourceTotalReported: number;
+  pagesDiscovered: number;
+  pagesRead: number;
+  totalOrdersFetched: number;
+  uniqueOrdersFetched: number;
+  newOrdersInserted: number;
+  existingOrdersUpdated: number;
+  statusChangesCount: number;
+  isComplete: boolean;
+  failedPageStart?: number | null;
+  error?: string | null;
+  missingFromLocalCount: number;
+  localTotalInStatus: number;
+  unresolvedCount: number;
 }
 
 export interface DetailedSyncMetrics {
@@ -1044,7 +1068,15 @@ export class SyncEngine {
     try {
       console.log(`[SyncEngine] Starting ${runType} sync cycle at ${nowIso}...`);
 
-      // 1. Scan Orders: First page to get total and initial batch
+      // 1a. Authoritative Full Sync of active 'New' orders: Paginates 100% of New orders without 200-order cap
+      this.status.currentPhase = 'SCANNING_NEW_ORDERS';
+      console.log(`[SyncEngine] Running full active NEW orders sync (100% pagination without 200-order cap)...`);
+      const newOrdersSync = await this.syncOrdersByStatus('New', 200, nowIso);
+      console.log(`[SyncEngine] NEW orders sync finished: SourceReported=${newOrdersSync.sourceTotalReported}, Fetched=${newOrdersSync.totalOrdersFetched}, Inserted=${newOrdersSync.newOrdersInserted}, LocalTotal=${newOrdersSync.localTotalInStatus}, Complete=${newOrdersSync.isComplete}`);
+      this.status.totalOrdersInDb = (db.prepare('SELECT count(*) as c FROM orders').get() as any)?.c || 0;
+
+      // 1b. Scan Recent Orders Stream: General overview across all statuses
+      this.status.currentPhase = 'SCANNING_ORDERS';
       const tOrdersStart = Date.now();
       let firstBatch: { recordsTotal: number; recordsFiltered: number; data: VendoorRawOrder[] } | null = null;
       let firstBatchError: any = null;
@@ -1080,10 +1112,9 @@ export class SyncEngine {
       const totalOrdersInSource = firstBatch.recordsTotal;
       const hotThreshold = getHotThresholdDate();
       const existingOrdersCount = (db.prepare('SELECT count(*) as c FROM orders').get() as any)?.c || 0;
-      // Keep initial and periodic background cycles fast, bounded and lightweight (<= 200 orders / 2 pages).
-      // Deep 30-day scans are only performed when explicitly requested via RECONCILIATION.
+      // Allow deep scanning across HOT orders without artificial 200-order cap
       const isPeriodic = runType !== 'RECONCILIATION';
-      const maxScanOrders = (runType === 'RECONCILIATION') ? 25000 : 200;
+      const maxScanOrders = (runType === 'RECONCILIATION') ? 25000 : 2000;
 
       let newOrdersInserted = 0;
       let existingOrdersExamined = 0;
@@ -1121,6 +1152,13 @@ export class SyncEngine {
           try { db.exec('ROLLBACK;'); } catch {}
           throw txErr;
         }
+
+        if (isSupabaseConfigured()) {
+          upsertOrdersBatchToSupabase(ordersBatch, nowIso).catch((err) => {
+            console.warn('[SyncEngine] Dual-write to Supabase warning:', err.message);
+          });
+        }
+
         return { newInBatch, changesInBatch };
       };
 
@@ -1730,189 +1768,341 @@ export class SyncEngine {
   }
 
   /**
+   * Synchronizes full population of orders for a specified status (e.g. 'New', 'Processing', 'Pending')
+   * Paginates through 100% of discovered pages until source reports no further records.
+   * Never caps at 200 orders, retries failed pages with exponential backoff, and ensures zero duplication.
+   */
+  public async syncOrdersByStatus(statusName = 'New', batchSize = 200, nowIsoStr?: string): Promise<StatusOrdersSyncResult> {
+    const nowIso = nowIsoStr || new Date().toISOString();
+    const seenIds = new Set<number>();
+    let newOrdersInserted = 0;
+    let existingOrdersUpdated = 0;
+    let statusChangesCount = 0;
+    let isComplete = false;
+    let failedPageStart: number | null = null;
+    let scanError: string | null = null;
+    let sourceTotalReported = 0;
+    let pagesRead = 0;
+    let pagesDiscovered = 0;
+
+    try {
+      // 1. Fetch initial batch (start = 0)
+      let firstBatch: { recordsTotal: number; recordsFiltered: number; data: VendoorRawOrder[] } | null = null;
+      let firstBatchError: any = null;
+
+      for (let attempt = 1; attempt <= 3; attempt++) {
+        try {
+          firstBatch = await vendoorClient.fetchOrdersBatch(0, batchSize, statusName);
+          break;
+        } catch (err: any) {
+          firstBatchError = err;
+          if (attempt < 3) {
+            console.warn(`[SyncEngine] Retry ${attempt}/3 fetching initial ${statusName} orders batch: ${err.message}`);
+            await new Promise(r => setTimeout(r, 400 * attempt));
+          }
+        }
+      }
+
+      if (!firstBatch) {
+        throw new Error(`Failed to fetch initial ${statusName} orders batch after 3 attempts: ${firstBatchError?.message || 'Unknown error'}`);
+      }
+
+      sourceTotalReported = typeof firstBatch.recordsFiltered === 'number' && firstBatch.recordsFiltered >= 0
+        ? firstBatch.recordsFiltered
+        : firstBatch.recordsTotal;
+
+      pagesDiscovered = Math.max(1, Math.ceil(sourceTotalReported / batchSize));
+
+      const processBatch = (ordersList: VendoorRawOrder[]) => {
+        db.exec('BEGIN TRANSACTION;');
+        try {
+          for (const rawOrder of ordersList) {
+            if (!rawOrder || typeof rawOrder.id !== 'number') continue;
+            seenIds.add(rawOrder.id);
+            const res = this.upsertCanonicalOrder(rawOrder, nowIso);
+            if (res.isNew) {
+              newOrdersInserted++;
+            } else {
+              if (res.businessFieldsChanged || res.statusChanged) {
+                existingOrdersUpdated++;
+              }
+              if (res.statusChanged) {
+                statusChangesCount++;
+              }
+            }
+          }
+          db.exec('COMMIT;');
+        } catch (e) {
+          try { db.exec('ROLLBACK;'); } catch {}
+          throw e;
+        }
+
+        if (isSupabaseConfigured()) {
+          upsertOrdersBatchToSupabase(ordersList, nowIso).catch((err) => {
+            console.warn('[SyncEngine] Background Supabase upsert error:', err.message);
+          });
+        }
+      };
+
+      if (firstBatch.data && firstBatch.data.length > 0) {
+        processBatch(firstBatch.data);
+      }
+      pagesRead = 1;
+
+      // 2. Paginate remaining pages until sourceTotalReported is exhausted
+      for (let start = batchSize; start < sourceTotalReported; start += batchSize) {
+        let batchFetched = false;
+        let lastErr: any = null;
+
+        for (let attempt = 1; attempt <= 3; attempt++) {
+          try {
+            if (attempt === 1) {
+              await new Promise(r => setTimeout(r, 50));
+            }
+            const nextBatch = await vendoorClient.fetchOrdersBatch(start, batchSize, statusName);
+            if (nextBatch.data && nextBatch.data.length > 0) {
+              processBatch(nextBatch.data);
+            }
+            batchFetched = true;
+            pagesRead++;
+            break;
+          } catch (pErr: any) {
+            lastErr = pErr;
+            if (attempt < 3) {
+              console.warn(`[SyncEngine] Retry ${attempt}/3 fetching ${statusName} orders at offset ${start}: ${pErr.message}`);
+              await new Promise(r => setTimeout(r, 400 * attempt));
+            }
+          }
+        }
+
+        if (!batchFetched) {
+          failedPageStart = start;
+          scanError = `Page at start ${start} failed after 3 attempts: ${lastErr?.message || 'timeout'}`;
+          console.error(`[SyncEngine] ${scanError}`);
+          break;
+        }
+      }
+
+      if (failedPageStart === null) {
+        isComplete = true;
+      }
+    } catch (err: any) {
+      scanError = err.message;
+      console.error(`[SyncEngine] Error during ${statusName} orders sync:`, err.message);
+    }
+
+    // 3. Status reconciliation for absent local records if crawl was complete
+    let unresolvedCount = 0;
+    if (isComplete && seenIds.size > 0) {
+      const localInStatus: any[] = db.prepare(`
+        SELECT id, vendoor_id, random_number, current_status
+        FROM orders
+        WHERE current_status = ?
+      `).all(statusName);
+
+      const findLatestStatusEventStmt = db.prepare(`
+        SELECT to_status, actor_name, event_timestamp
+        FROM canonical_activity_events
+        WHERE order_code = ? AND action_type = 'status_change' AND to_status IS NOT NULL
+        ORDER BY event_timestamp DESC
+        LIMIT 1
+      `);
+
+      db.exec('BEGIN TRANSACTION;');
+      try {
+        for (const loc of localInStatus) {
+          if (!seenIds.has(loc.vendoor_id)) {
+            const ev: any = findLatestStatusEventStmt.get(loc.random_number);
+            if (ev && ev.to_status && ev.to_status !== loc.current_status) {
+              db.prepare(`
+                UPDATE orders
+                SET current_status = ?,
+                    validation_status = 'RESOLVED_VIA_AUDIT_LOGS',
+                    last_observed_at = ?,
+                    updated_at = ?
+                WHERE id = ?
+              `).run(ev.to_status, nowIso, nowIso, loc.id);
+
+              db.prepare(`
+                INSERT INTO order_status_events (
+                  order_id, random_number, from_status, to_status, actor_name,
+                  event_time_source, storage_tier, observed_at, source_channel
+                ) VALUES (?, ?, ?, ?, ?, ?, 'HOT', ?, 'vendoor_audit_log')
+              `).run(loc.id, loc.random_number, loc.current_status, ev.to_status, ev.actor_name || 'سجلات فيندور', ev.event_timestamp, nowIso);
+            } else {
+              // Retain current status, mark validation status as unresolved absent
+              // STRICT REQUIREMENT: NEVER mark as Canceled blindly!
+              db.prepare(`
+                UPDATE orders
+                SET validation_status = 'UNRESOLVED_ABSENT_FROM_VIEW',
+                    last_observed_at = ?,
+                    updated_at = ?
+                WHERE id = ?
+              `).run(nowIso, nowIso, loc.id);
+              unresolvedCount++;
+            }
+          }
+        }
+        db.exec('COMMIT;');
+      } catch (e) {
+        try { db.exec('ROLLBACK;'); } catch {}
+      }
+
+      if (isComplete && seenIds.size > 0 && isSupabaseConfigured()) {
+        try {
+          await reconcileAbsentOrdersInSupabase(statusName, seenIds, nowIso);
+        } catch (rErr: any) {
+          console.warn('[SyncEngine] Supabase reconcile absent orders error:', rErr.message);
+        }
+      }
+    }
+
+    const localTotalInStatus = (db.prepare(`
+      SELECT COUNT(*) as c FROM orders WHERE current_status = ?
+    `).get(statusName) as any)?.c || 0;
+
+    const missingFromLocal = Math.max(0, sourceTotalReported - localTotalInStatus);
+
+    return {
+      status: statusName,
+      sourceTotalReported,
+      pagesDiscovered,
+      pagesRead,
+      totalOrdersFetched: seenIds.size,
+      uniqueOrdersFetched: seenIds.size,
+      newOrdersInserted,
+      existingOrdersUpdated,
+      statusChangesCount,
+      isComplete,
+      failedPageStart,
+      error: scanError,
+      missingFromLocalCount: missingFromLocal,
+      localTotalInStatus,
+      unresolvedCount,
+    };
+  }
+
+  /**
    * Sync System Logs into Raw Activity and Canonical Events with full day coverage from 00:00 Cairo
    */
   public async syncSystemLogs(nowIso: string, targetDate?: string): Promise<{ totalLogs: number; newSaved: number; hasErrors: boolean }> {
     let hasErrors = false;
+    let totalLogs = 0;
+    let newCanonicalCount = 0;
+
     try {
       if (!vendoorClient.isConfigured()) {
         return { totalLogs: 0, newSaved: 0, hasErrors: false };
       }
 
       const dateToSync = targetDate || getCairoDateString();
+      const interval = getCairoDateInterval(dateToSync);
       const existingCov = getCoverageRecord('logs', dateToSync);
-      const isAlreadyComplete = existingCov?.completion_status === 'COMPLETE';
+      const isAlreadyComplete = existingCov?.completion_status === 'COMPLETE' &&
+        !(existingCov.pages_discovered > 1 && existingCov.pages_read < existingCov.pages_discovered);
 
+      // Fetch page 1 first to capture newest incoming logs
       const firstPage = await vendoorClient.fetchSystemLogs(1, dateToSync, dateToSync);
-      const totalPages = Math.max(1, firstPage.totalPages);
-      // When day is incomplete, do not cap at 20 pages; read all discovered pages up to safe max 100
-      const maxPages = isAlreadyComplete ? Math.min(totalPages, 5) : Math.min(totalPages, 100);
+      let totalPages = Math.max(1, firstPage.totalPages);
+      totalLogs += (firstPage.entries?.length || 0);
 
-      const insertRawStmt = db.prepare(`
-        INSERT OR IGNORE INTO raw_activity_events (
-          source_hash, order_code, actor_name, raw_action_text,
-          event_timestamp, storage_tier, observed_at, page_source,
-          vendoor_order_id, raw_html, details_json
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-      `);
+      // Process and persist page 1 with strict Cairo interval filtering and zero-loss deduplication
+      const p1Res = persistLogEntries(firstPage.entries, interval, {
+        dataSource: 'VENDOOR_FETCH',
+        strictInterval: true,
+      });
+      newCanonicalCount += p1Res.saved;
 
-      const insertCanonicalStmt = db.prepare(`
-        INSERT INTO canonical_activity_events (
-          raw_event_id, order_code, actor_name, action_type,
-          from_status, to_status, event_timestamp, storage_tier, is_system_actor, created_at,
-          order_id, order_match_status, is_administrative, field_name, old_value, new_value, details_json
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-      `);
+      let actualPagesRead = 1;
 
-      const findOrderStmt = db.prepare(`
-        SELECT id FROM orders 
-        WHERE random_number = ? OR order_no = ? OR CAST(vendoor_id AS TEXT) = ?
-        LIMIT 1
-      `);
+      // Fast exit ONLY if today was already confirmed complete AND no new entries appeared on page 1
+      if (isAlreadyComplete && p1Res.saved === 0 && !targetDate) {
+        actualPagesRead = totalPages;
+      } else {
+        // If day was previously partially crawled, resume from existingCov.pages_read + 1!
+        // No 100-page artificial ceiling: crawl all pages up to totalPages (e.g. 224)
+        const startPage = isAlreadyComplete
+          ? 2
+          : (existingCov?.pages_read && existingCov.pages_read > 1 && existingCov.pages_read < totalPages)
+          ? existingCov.pages_read + 1
+          : 2;
 
-      let totalLogs = 0;
-      let newCanonicalCount = 0;
+        let targetEndPage = isAlreadyComplete ? Math.min(totalPages, 5) : totalPages;
+        actualPagesRead = Math.max(1, existingCov?.pages_read || 1);
 
-      const processEntries = (entries: LogEntry[]): number => {
-        let newOnPage = 0;
-        db.exec('BEGIN TRANSACTION;');
-        try {
-          for (const entry of entries) {
-            totalLogs++;
-            const rawText = decodeHtmlEntities(entry.rawActionText || '');
-            const hashInput = `${entry.orderCode}_${entry.actorName}_${rawText}_${entry.eventTimestamp}`;
-            const sourceHash = crypto.createHash('sha256').update(hashInput).digest('hex');
-            const logTier = isDateInHot(entry.eventTimestamp) ? 'HOT' : 'COLD';
+        for (let p = startPage; p <= targetEndPage; p++) {
+          let pageFetched = false;
+          let lastPageErr: any = null;
 
-            const parsed = parseLogActionDetails(rawText, entry.actorName || '', entry.orderCode || '');
-            const detailsJson = JSON.stringify(parsed);
+          for (let attempt = 1; attempt <= 3; attempt++) {
+            try {
+              if (p > 2 && attempt === 1) {
+                await new Promise(r => setTimeout(r, 60)); // pacing to avoid connection thrashing
+              }
+              const pageData = await vendoorClient.fetchSystemLogs(p, dateToSync, dateToSync);
+              totalLogs += (pageData.entries?.length || 0);
 
-            const rawResult = insertRawStmt.run(
-              sourceHash,
-              entry.orderCode || null,
-              entry.actorName || 'غير معروف',
-              rawText,
-              entry.eventTimestamp,
-              logTier,
-              nowIso,
-              'log/system',
-              entry.vendoorOrderId || null,
-              entry.rawHtml || null,
-              detailsJson
-            );
+              if (pageData.entries && pageData.entries.length > 0) {
+                const batchRes = persistLogEntries(pageData.entries, interval, {
+                  dataSource: 'VENDOOR_FETCH',
+                  strictInterval: true,
+                });
+                newCanonicalCount += batchRes.saved;
+              }
 
-            if (rawResult.changes > 0) {
-              newOnPage++;
-              const rawId = Number(rawResult.lastInsertRowid);
-              const isSystem = (entry.actorName || '').toLowerCase().includes('system') || (entry.actorName || '').includes('تلقائي') || (entry.actorName || '').includes('النظام') ? 1 : 0;
-
-              // Check if matches an order
-              let matchedOrderId: number | null = null;
-              let matchStatus = 'UNRESOLVED';
-              if (!entry.orderCode) {
-                matchStatus = 'GENERAL_LOG';
-              } else {
-                const ordRow: any = findOrderStmt.get(entry.orderCode, entry.orderCode, entry.orderCode);
-                if (ordRow) {
-                  matchedOrderId = ordRow.id;
-                  matchStatus = 'MATCHED';
+              // Dynamic discovery: expand targetEndPage & totalPages if higher page count is revealed
+              if (pageData.totalPages > totalPages) {
+                totalPages = pageData.totalPages;
+                if (!isAlreadyComplete) {
+                  targetEndPage = totalPages;
                 }
               }
 
-              insertCanonicalStmt.run(
-                rawId,
-                entry.orderCode || null,
-                entry.actorName || 'غير معروف',
-                parsed.actionType,
-                parsed.fromStatus,
-                parsed.toStatus,
-                entry.eventTimestamp,
-                logTier,
-                isSystem,
-                nowIso,
-                matchedOrderId,
-                matchStatus,
-                parsed.isAdministrative ? 1 : 0,
-                parsed.fieldName,
-                parsed.oldValue,
-                parsed.newValue,
-                detailsJson
-              );
-              newCanonicalCount++;
-
-              // Reflect extra phone additions immediately in orders table
-              if (parsed.actionType === 'extra_phone_added' || parsed.actionType === 'extra_phone_edit') {
-                const rawNew = (parsed.newValue || '').trim();
-                const cleanPhone = rawNew.replace(/[\s\-\+]/g, '');
-                const isValid = /^(01[0125]\d{8}|201[0125]\d{8})$/.test(cleanPhone);
-                const isPresent = cleanPhone.length >= 10 && isValid;
-                const status = isPresent ? 'PRESENT' : (rawNew === '' ? 'CONFIRMED_ABSENT' : 'INVALID');
-
-                try {
-                  db.prepare(`
-                    UPDATE orders
-                    SET customer_phone_extra = ?,
-                        extra_phone_valid = ?,
-                        extra_phone_status = ?,
-                        updated_at = ?
-                    WHERE (id = ? OR random_number = ? OR order_no = ? OR CAST(vendoor_id AS TEXT) = ?)
-                  `).run(
-                    rawNew || null,
-                    isValid ? 1 : 0,
-                    status,
-                    entry.eventTimestamp || nowIso,
-                    matchedOrderId || -1,
-                    entry.orderCode,
-                    entry.orderCode,
-                    entry.orderCode
-                  );
-                } catch (phoneErr: any) {
-                  console.warn('[SyncEngine] Phone update error:', phoneErr.message);
-                }
+              actualPagesRead = p;
+              pageFetched = true;
+              break;
+            } catch (pageErr: any) {
+              lastPageErr = pageErr;
+              if (attempt < 3) {
+                console.warn(`[SyncEngine] Retrying page ${p} (${attempt}/3) for ${dateToSync}:`, pageErr.message);
+                await new Promise(r => setTimeout(r, 600 * attempt));
               }
             }
           }
-          db.exec('COMMIT;');
-        } catch (txErr) {
-          db.exec('ROLLBACK;');
-          throw txErr;
-        }
-        return newOnPage;
-      };
 
-      // Process first page
-      let actualPagesRead = 1;
-      const newOnFirstPage = processEntries(firstPage.entries);
-
-      // Fast exit ONLY if today was already confirmed complete AND no new entries appeared on page 1
-      if (isAlreadyComplete && newOnFirstPage === 0 && !targetDate) {
-        // Fast exit: no new logs on page 1 since last sync cycle
-      } else {
-        // Scan backwards through all discovered pages until the whole day from 00:00 Cairo is ingested
-        for (let p = 2; p <= maxPages; p++) {
-          try {
-            const pageData = await vendoorClient.fetchSystemLogs(p, dateToSync, dateToSync);
-            if (!pageData.entries || pageData.entries.length === 0) {
-              break;
-            }
-            actualPagesRead = p;
-            const newOnPage = processEntries(pageData.entries);
-            // If already complete, we can stop when encountering a known page
-            if (isAlreadyComplete && newOnPage === 0) {
-              break;
-            }
-          } catch (pageErr: any) {
-            console.warn(`[SyncEngine] Page ${p} log fetch failed:`, pageErr.message);
+          if (!pageFetched) {
+            console.warn(`[SyncEngine] Page ${p} log fetch failed after 3 attempts for ${dateToSync}:`, lastPageErr?.message);
             hasErrors = true;
             break;
+          }
+
+          // Persist intermediate progress checkpoint every 10 pages or at completion
+          if (p % 10 === 0 || p === targetEndPage) {
+            saveCoverageRecord({
+              accountId: 'primary',
+              sourceDomain: 'logs',
+              periodDate: dateToSync,
+              storageTier: isDateInHot(dateToSync) ? 'HOT' : 'COLD',
+              pagesDiscovered: totalPages,
+              pagesRead: actualPagesRead,
+              recordsExtracted: totalLogs,
+              recordsSaved: newCanonicalCount,
+              completionStatus: actualPagesRead >= totalPages && !hasErrors ? 'COMPLETE' : 'PARTIAL',
+              lastAttemptedAt: nowIso,
+              completedAt: actualPagesRead >= totalPages && !hasErrors ? nowIso : null,
+              notes: actualPagesRead >= totalPages && !hasErrors
+                ? `مكتمل: تم استيفاء كافة الصفحات (${actualPagesRead}/${totalPages})`
+                : `جاري الاستكمال: تم حفظ حتى صفحة (${actualPagesRead}/${totalPages})`,
+            });
           }
         }
       }
 
-      // Record historical coverage
-      const finalCompletionStatus: 'COMPLETE' | 'PARTIAL' | 'FAILED' = hasErrors
-        ? 'PARTIAL'
-        : (actualPagesRead >= totalPages || isAlreadyComplete ? 'COMPLETE' : 'PARTIAL');
+      // Record final coverage for this cycle
+      const isNowComplete = !hasErrors && (actualPagesRead >= totalPages || isAlreadyComplete);
+      const finalCompletionStatus: 'COMPLETE' | 'PARTIAL' | 'FAILED' = isNowComplete
+        ? 'COMPLETE'
+        : (actualPagesRead > 0 ? 'PARTIAL' : 'FAILED');
 
       saveCoverageRecord({
         accountId: 'primary',
@@ -1926,6 +2116,9 @@ export class SyncEngine {
         completionStatus: finalCompletionStatus,
         lastAttemptedAt: nowIso,
         completedAt: finalCompletionStatus === 'COMPLETE' ? nowIso : null,
+        notes: finalCompletionStatus === 'COMPLETE'
+          ? `مكتمل: تم استيفاء كافة الصفحات (${actualPagesRead}/${totalPages})`
+          : `سحب جزئي: تم حفظ حتى صفحة (${actualPagesRead}/${totalPages})`,
       });
 
       return { totalLogs, newSaved: newCanonicalCount, hasErrors };
@@ -1958,9 +2151,14 @@ export class SyncEngine {
       `).get(interval.startCairo, interval.endCairo) as any)?.c || 0;
     } catch {}
 
-    const completionStatus: 'COMPLETE' | 'RUNNING' | 'PARTIAL' | 'FAILED' | 'NOT_SYNCED' = isSyncing
+    let completionStatus: 'COMPLETE' | 'RUNNING' | 'PARTIAL' | 'FAILED' | 'NOT_SYNCED' = isSyncing
       ? 'RUNNING'
       : (cov?.completion_status as any || 'NOT_SYNCED');
+
+    // Strict guard: if marked COMPLETE but pages_read < pages_discovered, enforce PARTIAL
+    if (completionStatus === 'COMPLETE' && cov && cov.pages_discovered > 1 && cov.pages_read < cov.pages_discovered) {
+      completionStatus = 'PARTIAL';
+    }
 
     return {
       completionStatus,

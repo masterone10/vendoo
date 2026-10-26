@@ -22,6 +22,13 @@ import {
   isSupabaseConfigured,
   syncDayLogsToSupabase,
 } from './supabaseClient.ts';
+import {
+  getUnifiedDashboardStats,
+  getUnifiedOrdersList,
+  getSystemDiagnostic,
+  isPrimaryPostgres,
+  getDataSourceIdentifier,
+} from './unifiedDb.ts';
 import { runSqliteToSupabaseImport } from './importSqliteToSupabase.ts';
 import {
   getOrFetchHistoricalLogs,
@@ -63,17 +70,31 @@ apiRouter.use((_req, res, next) => {
 });
 
 // 1. Health & Sync Status
-apiRouter.get('/health', (_req: Request, res: Response) => {
+apiRouter.get('/health', async (_req: Request, res: Response) => {
   const syncStatus = syncEngine.getStatus();
+  const connStatus = await checkSupabaseConnection(false);
   res.json({
     status: 'ok',
     timestamp: new Date().toISOString(),
     sync: syncStatus,
+    databaseType: isPrimaryPostgres() && connStatus.isConnected ? 'SUPABASE_POSTGRES' : 'SQLITE_FALLBACK',
+    dataSourceName: getDataSourceIdentifier(),
+    supabaseConnected: connStatus.isConnected,
   });
 });
 
+// 1b. Production System Diagnostic (Safe, privacy-preserving, instance & data source tracking)
+apiRouter.get('/system/diagnostic', async (_req: Request, res: Response) => {
+  try {
+    const diagnostic = await getSystemDiagnostic();
+    res.json(diagnostic);
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // 2. Dashboard KPIs & Aggregations with Global Business Date
-apiRouter.get('/dashboard/stats', (req: Request, res: Response) => {
+apiRouter.get('/dashboard/stats', async (req: Request, res: Response) => {
   try {
     const rawDate = typeof req.query.date === 'string' && req.query.date.trim() ? req.query.date.trim().slice(0, 10) : '';
     const cairoToday = getCairoDateString();
@@ -83,29 +104,10 @@ apiRouter.get('/dashboard/stats', (req: Request, res: Response) => {
     const coverageRecord = getCoverageRecord('orders', targetDate);
     const coverageStatus = isToday ? 'LIVE' : (coverageRecord?.completion_status || 'NOT_SYNCED');
 
-    // 2. Target Date Activity
+    // Target Date Activity Interval
     const dateInterval = getCairoDateInterval(targetDate);
 
-    // 1. Status Counts:
-    // Active workflow states (New, Pending, Processing, Canceling) reflect authoritative active population.
-    // Printed reflects orders confirmed/printed on targetDate (backed by Vendoor logs & transitions).
-    // Canceled reflects orders canceled on targetDate strictly from Vendoor logs.
-    const activeStatesRaw: any[] = isToday
-      ? db.prepare(`
-          SELECT current_status, COUNT(*) as count
-          FROM orders
-          WHERE current_status IN ('New', 'Pending', 'Processing', 'Canceling')
-          GROUP BY current_status
-        `).all()
-      : db.prepare(`
-          SELECT current_status, COUNT(*) as count
-          FROM orders
-          WHERE created_at_source >= ? AND created_at_source < ?
-            AND current_status IN ('New', 'Pending', 'Processing', 'Canceling')
-          GROUP BY current_status
-        `).all(dateInterval.startCairo, dateInterval.endCairo);
-
-    const currentCounts = {
+    let currentCounts = {
       New: 0,
       Pending: 0,
       Processing: 0,
@@ -113,175 +115,209 @@ apiRouter.get('/dashboard/stats', (req: Request, res: Response) => {
       Printed: 0,
       Canceled: 0,
     };
+    let dayCumulative: any;
+    let todayActivity: any;
 
-    for (const r of activeStatesRaw) {
-      if (r.current_status in currentCounts) {
-        (currentCounts as any)[r.current_status] = r.count;
+    // 1. Try unified Supabase PostgreSQL first (in production)
+    const unifiedStats = await getUnifiedDashboardStats(targetDate);
+    if (unifiedStats) {
+      currentCounts = unifiedStats.currentCounts;
+      todayActivity = unifiedStats.todayActivity;
+      dayCumulative = {
+        Pending: { uniqueOrders: todayActivity.Pending, totalEvents: todayActivity.pendingEvents },
+        Processing: { uniqueOrders: todayActivity.Processing, totalEvents: todayActivity.processingEvents },
+        Canceling: { uniqueOrders: todayActivity.Canceling, totalEvents: todayActivity.cancelingEvents },
+        Printed: { uniqueOrders: todayActivity.Printed, totalEvents: todayActivity.printedEvents },
+        Canceled: { uniqueOrders: todayActivity.Canceled, totalEvents: todayActivity.cancelEvents },
+      };
+    } else {
+      // 2. Fallback to SQLite (in test environments or if Supabase is offline)
+      const activeStatesRaw: any[] = isToday
+        ? db.prepare(`
+            SELECT current_status, COUNT(*) as count
+            FROM orders
+            WHERE current_status IN ('New', 'Pending', 'Processing', 'Canceling')
+              AND validation_status != 'UNRESOLVED_ABSENT_FROM_VIEW'
+            GROUP BY current_status
+          `).all()
+        : db.prepare(`
+            SELECT current_status, COUNT(*) as count
+            FROM orders
+            WHERE created_at_source >= ? AND created_at_source < ?
+              AND current_status IN ('New', 'Pending', 'Processing', 'Canceling')
+              AND validation_status != 'UNRESOLVED_ABSENT_FROM_VIEW'
+            GROUP BY current_status
+          `).all(dateInterval.startCairo, dateInterval.endCairo);
+
+      for (const r of activeStatesRaw) {
+        if (r.current_status in currentCounts) {
+          (currentCounts as any)[r.current_status] = r.count;
+        }
       }
-    }
 
-    // Authoritative Printed Count for targetDate (distinct orders confirmed on that date)
-    const printedForDateCount = (db.prepare(`
-      SELECT COUNT(DISTINCT o_id) as count FROM (
-        SELECT c.order_code as o_id
+      // Authoritative Printed Count for targetDate (distinct orders confirmed on that date)
+      const printedForDateCount = (db.prepare(`
+        SELECT COUNT(DISTINCT o_id) as count FROM (
+          SELECT c.order_code as o_id
+          FROM canonical_activity_events c
+          WHERE c.event_timestamp >= ? AND c.event_timestamp < ?
+            AND (c.to_status = 'Printed' OR c.action_type = 'confirmation')
+            AND c.order_code IS NOT NULL AND c.order_code != ''
+          UNION
+          SELECT o.random_number as o_id
+          FROM orders o
+          WHERE (substr(o.printed_date, 1, 10) = ? OR (o.printed_date >= ? AND o.printed_date < ?))
+            AND o.current_status = 'Printed'
+        )
+      `).get(dateInterval.startCairo, dateInterval.endCairo, targetDate, dateInterval.startCairo, dateInterval.endCairo) as any)?.count || 0;
+
+      const printedEventsCount = (db.prepare(`
+        SELECT COUNT(*) as count
         FROM canonical_activity_events c
         WHERE c.event_timestamp >= ? AND c.event_timestamp < ?
           AND (c.to_status = 'Printed' OR c.action_type = 'confirmation')
           AND c.order_code IS NOT NULL AND c.order_code != ''
-        UNION
-        SELECT o.random_number as o_id
-        FROM orders o
-        WHERE (substr(o.printed_date, 1, 10) = ? OR (o.printed_date >= ? AND o.printed_date < ?))
-          AND o.current_status = 'Printed'
-      )
-    `).get(dateInterval.startCairo, dateInterval.endCairo, targetDate, dateInterval.startCairo, dateInterval.endCairo) as any)?.count || 0;
+      `).get(dateInterval.startCairo, dateInterval.endCairo) as any)?.count || printedForDateCount;
 
-    const printedEventsCount = (db.prepare(`
-      SELECT COUNT(*) as count
-      FROM canonical_activity_events c
-      WHERE c.event_timestamp >= ? AND c.event_timestamp < ?
-        AND (c.to_status = 'Printed' OR c.action_type = 'confirmation')
-        AND c.order_code IS NOT NULL AND c.order_code != ''
-    `).get(dateInterval.startCairo, dateInterval.endCairo) as any)?.count || printedForDateCount;
+      // Authoritative Canceled Count for targetDate (strictly from verified Vendoor logs)
+      const canceledForDateCount = (db.prepare(`
+        SELECT COUNT(DISTINCT c.order_code) as count
+        FROM canonical_activity_events c
+        WHERE c.event_timestamp >= ? AND c.event_timestamp < ?
+          AND (c.to_status = 'Canceled' OR c.action_type = 'order_canceled')
+          AND c.order_code IS NOT NULL AND c.order_code != ''
+      `).get(dateInterval.startCairo, dateInterval.endCairo) as any)?.count || 0;
 
-    // Authoritative Canceled Count for targetDate (strictly from verified Vendoor logs)
-    const canceledForDateCount = (db.prepare(`
-      SELECT COUNT(DISTINCT c.order_code) as count
-      FROM canonical_activity_events c
-      WHERE c.event_timestamp >= ? AND c.event_timestamp < ?
-        AND (c.to_status = 'Canceled' OR c.action_type = 'order_canceled')
-        AND c.order_code IS NOT NULL AND c.order_code != ''
-    `).get(dateInterval.startCairo, dateInterval.endCairo) as any)?.count || 0;
+      const cancelEventsCount = (db.prepare(`
+        SELECT COUNT(*) as count
+        FROM canonical_activity_events c
+        WHERE c.event_timestamp >= ? AND c.event_timestamp < ?
+          AND (c.to_status = 'Canceled' OR c.action_type = 'order_canceled')
+          AND c.order_code IS NOT NULL AND c.order_code != ''
+      `).get(dateInterval.startCairo, dateInterval.endCairo) as any)?.count || canceledForDateCount;
 
-    const cancelEventsCount = (db.prepare(`
-      SELECT COUNT(*) as count
-      FROM canonical_activity_events c
-      WHERE c.event_timestamp >= ? AND c.event_timestamp < ?
-        AND (c.to_status = 'Canceled' OR c.action_type = 'order_canceled')
-        AND c.order_code IS NOT NULL AND c.order_code != ''
-    `).get(dateInterval.startCairo, dateInterval.endCairo) as any)?.count || canceledForDateCount;
+      currentCounts.Printed = printedForDateCount;
+      currentCounts.Canceled = canceledForDateCount;
 
-    currentCounts.Printed = printedForDateCount;
-    currentCounts.Canceled = canceledForDateCount;
+      // Distinct unique orders and total events that entered Pending today
+      const pendingStats = (db.prepare(`
+        SELECT 
+          COUNT(DISTINCT o_id) as unique_orders,
+          COUNT(*) as total_events
+        FROM (
+          SELECT order_code as o_id FROM canonical_activity_events
+          WHERE event_timestamp >= ? AND event_timestamp < ?
+            AND to_status = 'Pending'
+            AND order_code IS NOT NULL AND order_code != ''
+          UNION ALL
+          SELECT random_number as o_id FROM order_status_events
+          WHERE observed_at >= ? AND observed_at < ?
+            AND to_status = 'Pending'
+            AND random_number IS NOT NULL AND random_number != ''
+            AND NOT EXISTS (
+              SELECT 1 FROM canonical_activity_events c
+              WHERE c.order_code = order_status_events.random_number
+                AND c.event_timestamp >= ? AND c.event_timestamp < ?
+                AND c.to_status = 'Pending'
+            )
+        )
+      `).get(
+        dateInterval.startCairo, dateInterval.endCairo,
+        dateInterval.startCairo, dateInterval.endCairo,
+        dateInterval.startCairo, dateInterval.endCairo
+      ) as any);
+      const pendingUniqueOrders = pendingStats?.unique_orders || 0;
+      const pendingTotalEvents = pendingStats?.total_events || 0;
 
-    // Distinct unique orders and total events that entered Pending today from canonical logs (plus memory transitions fallback)
-    const pendingStats = (db.prepare(`
-      SELECT 
-        COUNT(DISTINCT o_id) as unique_orders,
-        COUNT(*) as total_events
-      FROM (
-        SELECT order_code as o_id FROM canonical_activity_events
-        WHERE event_timestamp >= ? AND event_timestamp < ?
-          AND to_status = 'Pending'
-          AND order_code IS NOT NULL AND order_code != ''
-        UNION ALL
-        SELECT random_number as o_id FROM order_status_events
-        WHERE observed_at >= ? AND observed_at < ?
-          AND to_status = 'Pending'
-          AND random_number IS NOT NULL AND random_number != ''
-          AND NOT EXISTS (
-            SELECT 1 FROM canonical_activity_events c
-            WHERE c.order_code = order_status_events.random_number
-              AND c.event_timestamp >= ? AND c.event_timestamp < ?
-              AND c.to_status = 'Pending'
-          )
-      )
-    `).get(
-      dateInterval.startCairo, dateInterval.endCairo,
-      dateInterval.startCairo, dateInterval.endCairo,
-      dateInterval.startCairo, dateInterval.endCairo
-    ) as any);
-    const pendingUniqueOrders = pendingStats?.unique_orders || 0;
-    const pendingTotalEvents = pendingStats?.total_events || 0;
+      // Distinct unique orders and total events that entered Processing today
+      const processingStats = (db.prepare(`
+        SELECT 
+          COUNT(DISTINCT o_id) as unique_orders,
+          COUNT(*) as total_events
+        FROM (
+          SELECT order_code as o_id FROM canonical_activity_events
+          WHERE event_timestamp >= ? AND event_timestamp < ?
+            AND to_status = 'Processing'
+            AND order_code IS NOT NULL AND order_code != ''
+          UNION ALL
+          SELECT random_number as o_id FROM order_status_events
+          WHERE observed_at >= ? AND observed_at < ?
+            AND to_status = 'Processing'
+            AND random_number IS NOT NULL AND random_number != ''
+            AND NOT EXISTS (
+              SELECT 1 FROM canonical_activity_events c
+              WHERE c.order_code = order_status_events.random_number
+                AND c.event_timestamp >= ? AND c.event_timestamp < ?
+                AND c.to_status = 'Processing'
+            )
+        )
+      `).get(
+        dateInterval.startCairo, dateInterval.endCairo,
+        dateInterval.startCairo, dateInterval.endCairo,
+        dateInterval.startCairo, dateInterval.endCairo
+      ) as any);
+      const processingUniqueOrders = processingStats?.unique_orders || 0;
+      const processingTotalEvents = processingStats?.total_events || 0;
 
-    // Distinct unique orders and total events that entered Processing today
-    const processingStats = (db.prepare(`
-      SELECT 
-        COUNT(DISTINCT o_id) as unique_orders,
-        COUNT(*) as total_events
-      FROM (
-        SELECT order_code as o_id FROM canonical_activity_events
-        WHERE event_timestamp >= ? AND event_timestamp < ?
-          AND to_status = 'Processing'
-          AND order_code IS NOT NULL AND order_code != ''
-        UNION ALL
-        SELECT random_number as o_id FROM order_status_events
-        WHERE observed_at >= ? AND observed_at < ?
-          AND to_status = 'Processing'
-          AND random_number IS NOT NULL AND random_number != ''
-          AND NOT EXISTS (
-            SELECT 1 FROM canonical_activity_events c
-            WHERE c.order_code = order_status_events.random_number
-              AND c.event_timestamp >= ? AND c.event_timestamp < ?
-              AND c.to_status = 'Processing'
-          )
-      )
-    `).get(
-      dateInterval.startCairo, dateInterval.endCairo,
-      dateInterval.startCairo, dateInterval.endCairo,
-      dateInterval.startCairo, dateInterval.endCairo
-    ) as any);
-    const processingUniqueOrders = processingStats?.unique_orders || 0;
-    const processingTotalEvents = processingStats?.total_events || 0;
+      // Distinct unique orders and total events that entered Canceling today
+      const cancelingStats = (db.prepare(`
+        SELECT 
+          COUNT(DISTINCT o_id) as unique_orders,
+          COUNT(*) as total_events
+        FROM (
+          SELECT order_code as o_id FROM canonical_activity_events
+          WHERE event_timestamp >= ? AND event_timestamp < ?
+            AND to_status = 'Canceling'
+            AND order_code IS NOT NULL AND order_code != ''
+          UNION ALL
+          SELECT random_number as o_id FROM order_status_events
+          WHERE observed_at >= ? AND observed_at < ?
+            AND to_status = 'Canceling'
+            AND random_number IS NOT NULL AND random_number != ''
+            AND NOT EXISTS (
+              SELECT 1 FROM canonical_activity_events c
+              WHERE c.order_code = order_status_events.random_number
+                AND c.event_timestamp >= ? AND c.event_timestamp < ?
+                AND c.to_status = 'Canceling'
+            )
+        )
+      `).get(
+        dateInterval.startCairo, dateInterval.endCairo,
+        dateInterval.startCairo, dateInterval.endCairo,
+        dateInterval.startCairo, dateInterval.endCairo
+      ) as any);
+      const cancelingUniqueOrders = cancelingStats?.unique_orders || 0;
+      const cancelingTotalEvents = cancelingStats?.total_events || 0;
 
-    // Distinct unique orders and total events that entered Canceling today
-    const cancelingStats = (db.prepare(`
-      SELECT 
-        COUNT(DISTINCT o_id) as unique_orders,
-        COUNT(*) as total_events
-      FROM (
-        SELECT order_code as o_id FROM canonical_activity_events
-        WHERE event_timestamp >= ? AND event_timestamp < ?
-          AND to_status = 'Canceling'
-          AND order_code IS NOT NULL AND order_code != ''
-        UNION ALL
-        SELECT random_number as o_id FROM order_status_events
-        WHERE observed_at >= ? AND observed_at < ?
-          AND to_status = 'Canceling'
-          AND random_number IS NOT NULL AND random_number != ''
-          AND NOT EXISTS (
-            SELECT 1 FROM canonical_activity_events c
-            WHERE c.order_code = order_status_events.random_number
-              AND c.event_timestamp >= ? AND c.event_timestamp < ?
-              AND c.to_status = 'Canceling'
-          )
-      )
-    `).get(
-      dateInterval.startCairo, dateInterval.endCairo,
-      dateInterval.startCairo, dateInterval.endCairo,
-      dateInterval.startCairo, dateInterval.endCairo
-    ) as any);
-    const cancelingUniqueOrders = cancelingStats?.unique_orders || 0;
-    const cancelingTotalEvents = cancelingStats?.total_events || 0;
+      const createdOnDate = (db.prepare(`
+        SELECT COUNT(*) as count
+        FROM orders
+        WHERE created_at_source >= ? AND created_at_source < ?
+      `).get(dateInterval.startCairo, dateInterval.endCairo) as any)?.count || 0;
 
-    const createdOnDate = (db.prepare(`
-      SELECT COUNT(*) as count
-      FROM orders
-      WHERE created_at_source >= ? AND created_at_source < ?
-    `).get(dateInterval.startCairo, dateInterval.endCairo) as any)?.count || 0;
+      dayCumulative = {
+        Pending: { uniqueOrders: pendingUniqueOrders, totalEvents: pendingTotalEvents },
+        Processing: { uniqueOrders: processingUniqueOrders, totalEvents: processingTotalEvents },
+        Canceling: { uniqueOrders: cancelingUniqueOrders, totalEvents: cancelingTotalEvents },
+        Printed: { uniqueOrders: printedForDateCount, totalEvents: printedEventsCount },
+        Canceled: { uniqueOrders: canceledForDateCount, totalEvents: cancelEventsCount },
+      };
 
-    const dayCumulative = {
-      Pending: { uniqueOrders: pendingUniqueOrders, totalEvents: pendingTotalEvents },
-      Processing: { uniqueOrders: processingUniqueOrders, totalEvents: processingTotalEvents },
-      Canceling: { uniqueOrders: cancelingUniqueOrders, totalEvents: cancelingTotalEvents },
-      Printed: { uniqueOrders: printedForDateCount, totalEvents: printedEventsCount },
-      Canceled: { uniqueOrders: canceledForDateCount, totalEvents: cancelEventsCount },
-    };
-
-    const todayActivity = {
-      Created: createdOnDate,
-      Printed: printedForDateCount,
-      Pending: pendingUniqueOrders,
-      Processing: processingUniqueOrders,
-      Canceling: cancelingUniqueOrders,
-      Canceled: canceledForDateCount,
-      createdEvents: createdOnDate,
-      printedEvents: printedEventsCount,
-      pendingEvents: pendingTotalEvents,
-      processingEvents: processingTotalEvents,
-      cancelingEvents: cancelingTotalEvents,
-      cancelEvents: cancelEventsCount,
-    };
+      todayActivity = {
+        Created: createdOnDate,
+        Printed: printedForDateCount,
+        Pending: pendingUniqueOrders,
+        Processing: processingUniqueOrders,
+        Canceling: cancelingUniqueOrders,
+        Canceled: canceledForDateCount,
+        createdEvents: createdOnDate,
+        printedEvents: printedEventsCount,
+        pendingEvents: pendingTotalEvents,
+        processingEvents: processingTotalEvents,
+        cancelingEvents: cancelingTotalEvents,
+        cancelEvents: cancelEventsCount,
+      };
+    }
 
     // 3. Confirmation Age counts
     const confStatus = syncEngine.getStatus().confirmationAgeStatus;
@@ -382,6 +418,11 @@ apiRouter.get('/dashboard/stats', (req: Request, res: Response) => {
 
     const syncStatus = syncEngine.getStatus();
     const todayLogsCoverage = syncEngine.getTodayLogsCoverage();
+    const dayLogsCov = getCoverageRecord('logs', targetDate);
+    const isLogsComplete = isToday
+      ? todayLogsCoverage.completionStatus === 'COMPLETE'
+      : (dayLogsCov?.completion_status === 'COMPLETE' || dayLogsCov?.completion_status === 'EMPTY_VERIFIED') &&
+        !(dayLogsCov?.pages_discovered > 1 && dayLogsCov?.pages_read < dayLogsCov?.pages_discovered);
 
     res.json({
       selectedDate: targetDate,
@@ -406,10 +447,13 @@ apiRouter.get('/dashboard/stats', (req: Request, res: Response) => {
       todayActivity,
       dayCumulative,
       todayLogsCoverage,
+      dayLogsCoverage: dayLogsCov,
+      isLogsComplete,
       pendingAge,
       processingAge,
       syncStatus,
-      databaseMode: isSupabaseConfigured() ? 'SUPABASE_POSTGRES' : 'SQLITE_AWAITING_CONFIG',
+      databaseMode: isPrimaryPostgres() ? 'SUPABASE_POSTGRES' : 'SQLITE_FALLBACK',
+      dataSourceName: getDataSourceIdentifier(),
       supabaseConfigured: isSupabaseConfigured(),
     });
   } catch (err: any) {
@@ -445,7 +489,7 @@ apiRouter.get('/dashboard/risk-orders', (req: Request, res: Response) => {
 });
 
 // 3. Orders List with dynamic filtering and pagination
-apiRouter.get('/orders', (req: Request, res: Response) => {
+apiRouter.get('/orders', async (req: Request, res: Response) => {
   try {
     const {
       status,
@@ -462,6 +506,40 @@ apiRouter.get('/orders', (req: Request, res: Response) => {
 
     const pageNum = Math.max(1, parseInt(page as string, 10));
     const pageSize = Math.min(100, Math.max(1, parseInt(limit as string, 10)));
+
+    if (isPrimaryPostgres()) {
+      const unified = await getUnifiedOrdersList({
+        status: typeof status === 'string' ? status : undefined,
+        search: typeof search === 'string' ? search : undefined,
+        page: pageNum,
+        limit: pageSize,
+        date: typeof date === 'string' ? date : undefined,
+        startDate: typeof startDate === 'string' ? startDate : undefined,
+        endDate: typeof endDate === 'string' ? endDate : undefined,
+        multiMerchant: multiMerchant === '1',
+        lowDelivery: lowDelivery === '1',
+        noExtraPhone: noExtraPhone === '1',
+      });
+
+      if (unified) {
+        const enrichedOrders = unified.orders.map(o => ({
+          ...o,
+          warehouseCodes: o.warehouseCodes || [],
+          warehouseNames: o.warehouseNames || [],
+          merchantCodes: o.merchantCodes || [],
+        }));
+
+        return res.json({
+          orders: enrichedOrders,
+          total: unified.total,
+          page: pageNum,
+          limit: pageSize,
+          totalPages: Math.ceil(unified.total / pageSize),
+          dataSource: 'SUPABASE_POSTGRES',
+        });
+      }
+    }
+
     const offset = (pageNum - 1) * pageSize;
 
     const conditions: string[] = [];
@@ -500,8 +578,12 @@ apiRouter.get('/orders', (req: Request, res: Response) => {
         conditions.push(`((canceling_date >= ? AND canceling_date < ?) OR EXISTS (SELECT 1 FROM canonical_activity_events c WHERE (c.order_code = orders.random_number OR c.order_id = orders.id) AND c.event_timestamp >= ? AND c.event_timestamp < ? AND c.to_status = 'Canceled'))`);
         params.push(interval.startCairo, interval.endCairo, interval.startCairo, interval.endCairo);
       } else {
-        conditions.push('created_at_source >= ? AND created_at_source < ?');
-        params.push(interval.startCairo, interval.endCairo);
+        if (status === 'New' && (date as string).slice(0, 10) === getCairoDateString()) {
+          // Live active snapshot of New orders reflects total live system balance matching Dashboard KPI
+        } else {
+          conditions.push('created_at_source >= ? AND created_at_source < ?');
+          params.push(interval.startCairo, interval.endCairo);
+        }
       }
     }
 
@@ -2804,6 +2886,59 @@ apiRouter.post('/sync/trigger', async (_req: Request, res: Response) => {
     res.json({ success: true, status });
   } catch (err: any) {
     res.status(500).json({ error: err.message });
+  }
+});
+
+// 15b. Explicit Resume System Logs Pagination for Today or Target Date
+apiRouter.post('/sync/logs-resume', async (req: Request, res: Response) => {
+  try {
+    const rawDate = typeof req.body?.date === 'string' && req.body.date.trim() ? req.body.date.trim().slice(0, 10) : '';
+    const cairoToday = getCairoDateString();
+    const targetDate = rawDate || cairoToday;
+    const nowIso = new Date().toISOString();
+
+    const result = await syncEngine.syncSystemLogs(nowIso, targetDate);
+    const todayLogsCoverage = syncEngine.getTodayLogsCoverage();
+    const dayLogsCov = getCoverageRecord('logs', targetDate);
+
+    res.json({
+      success: true,
+      result,
+      todayLogsCoverage,
+      dayLogsCoverage: dayLogsCov,
+      isComplete: targetDate === cairoToday ? todayLogsCoverage.completionStatus === 'COMPLETE' : dayLogsCov?.completion_status === 'COMPLETE',
+    });
+  } catch (err: any) {
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// 15c. Full Active Orders Sync by Status (e.g. 'New')
+apiRouter.post('/sync/orders/new', async (_req: Request, res: Response) => {
+  try {
+    const result = await syncEngine.syncOrdersByStatus('New', 200);
+    res.json({ success: true, result });
+  } catch (err: any) {
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+apiRouter.get('/sync/orders/new-audit', async (_req: Request, res: Response) => {
+  try {
+    const { vendoorClient } = await import('./vendoorClient.ts');
+    await vendoorClient.ensureAuthenticated();
+    const batch = await vendoorClient.fetchOrdersBatch(0, 10, 'New');
+    const sourceCount = typeof batch.recordsFiltered === 'number' ? batch.recordsFiltered : batch.recordsTotal;
+    const localCount = (db.prepare("SELECT COUNT(*) as c FROM orders WHERE current_status = 'New'").get() as any)?.c || 0;
+    res.json({
+      success: true,
+      sourceReportedNew: sourceCount,
+      localNewInDb: localCount,
+      difference: sourceCount - localCount,
+      matches: sourceCount === localCount,
+    });
+  } catch (err: any) {
+    res.status(500).json({ success: false, error: err.message });
   }
 });
 

@@ -148,6 +148,7 @@ export default function App() {
               onNavigateToPending={() => setCurrentTab('pending')}
               onNavigateToProcessing={() => setCurrentTab('processing')}
               onNavigateToAlerts={() => setCurrentTab('alerts')}
+              onRefreshStats={() => fetchStats(selectedBusinessDate)}
             />
           )}
 

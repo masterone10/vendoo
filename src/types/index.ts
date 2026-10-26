@@ -150,6 +150,8 @@ export interface DashboardStats {
     isSyncing: boolean;
     lastAttemptedAt?: string | null;
   };
+  dayLogsCoverage?: any;
+  isLogsComplete?: boolean;
   pendingAge: {
     lessThanTwoDays: number;
     twoToFourDays: number;

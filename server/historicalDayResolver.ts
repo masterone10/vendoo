@@ -359,9 +359,11 @@ export async function resolveHistoricalDay(
           cov.pages_discovered > cov.pages_read
         );
 
+        let attemptedResume = false;
         let resumedSuccessfully = false;
 
         if (canResumePagination) {
+          attemptedResume = true;
           try {
             const fromPage = cov.pages_read + 1;
             let toPage = cov.pages_discovered;
@@ -417,21 +419,23 @@ export async function resolveHistoricalDay(
 
               if (!pageFetched) {
                 allPagesSucceeded = false;
+                isPartial = true;
+                fetchError = `تعذر استكمال صفحة ${p}: ${lastPageErr?.message}`;
                 break;
               }
             }
 
             if (allPagesSucceeded) {
               resumedSuccessfully = true;
-            } else {
-              console.warn(`[HistoricalDayResolver] Smart resume incomplete for ${cleanDate}, falling back to full verified re-pull`);
             }
           } catch (resumeErr: any) {
-            console.warn(`[HistoricalDayResolver] Smart resume failed for ${cleanDate}: ${resumeErr.message}, falling back to full verified re-pull`);
+            console.warn(`[HistoricalDayResolver] Smart resume failed for ${cleanDate}: ${resumeErr.message}`);
+            isPartial = true;
+            fetchError = resumeErr.message;
           }
         }
 
-        if (!resumedSuccessfully) {
+        if (!attemptedResume) {
           // 1. Fetch Page 1
           const p1 = await vendoorClient.fetchSystemLogs(1, cleanDate, cleanDate);
           pagesDiscovered = Math.max(1, p1.totalPages);

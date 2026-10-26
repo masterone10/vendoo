@@ -13,6 +13,7 @@ import {
   ChevronLeft,
   ChevronDown,
   Check,
+  Play,
 } from 'lucide-react';
 import { DashboardStats } from '../types';
 import { RiskDetailsModal, RiskType } from './RiskDetailsModal';
@@ -26,6 +27,7 @@ interface DashboardViewProps {
   onNavigateToPending: () => void;
   onNavigateToProcessing: () => void;
   onNavigateToAlerts: () => void;
+  onRefreshStats?: () => void;
 }
 
 export const DashboardView: React.FC<DashboardViewProps> = ({
@@ -37,6 +39,7 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
   onNavigateToPending,
   onNavigateToProcessing,
   onNavigateToAlerts,
+  onRefreshStats,
 }) => {
   if (!stats) {
     return (
@@ -63,6 +66,25 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
   const [selectedRiskType, setSelectedRiskType] = useState<RiskType | null>(null);
   const [riskScope, setRiskScope] = useState<'today' | 'all'>('today');
   const [isRiskScopeOpen, setIsRiskScopeOpen] = useState(false);
+  const [isResumingLogs, setIsResumingLogs] = useState(false);
+
+  const handleResumeLogs = async () => {
+    setIsResumingLogs(true);
+    try {
+      const res = await fetch('/api/sync/logs-resume', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ date: selectedDate }),
+      });
+      if (res.ok) {
+        onRefreshStats?.();
+      }
+    } catch (e) {
+      console.error('Failed to resume logs:', e);
+    } finally {
+      setIsResumingLogs(false);
+    }
+  };
 
   return (
     <div className="p-6 space-y-6 max-w-7xl mx-auto">
@@ -81,7 +103,7 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
         {/* Today's Logs Retrieval & Parity Indicator */}
         {stats.isToday && todayLogsCoverage && (
           <div className="flex items-center gap-2 text-xs">
-            {todayLogsCoverage.isSyncing || todayLogsCoverage.completionStatus === 'RUNNING' ? (
+            {todayLogsCoverage.isSyncing || todayLogsCoverage.completionStatus === 'RUNNING' || isResumingLogs ? (
               <div className="flex items-center gap-2 px-3 py-1.5 rounded-lg bg-sky-500/10 border border-sky-500/20 text-sky-400">
                 <RotateCw className="w-3.5 h-3.5 animate-spin" />
                 <span>جاري استرداد سجلات اليوم من 00:00 (صفحة {todayLogsCoverage.pagesRead} من {todayLogsCoverage.pagesDiscovered || '...'})</span>
@@ -92,9 +114,20 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
                 <span>سجلات اليوم مكتملة ومطابقة من 00:00 · ({todayLogsCoverage.recordsSaved} حركة مسجلة)</span>
               </div>
             ) : todayLogsCoverage.completionStatus === 'PARTIAL' ? (
-              <div className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-amber-500/10 border border-amber-500/20 text-amber-400">
-                <AlertTriangle className="w-3.5 h-3.5" />
-                <span>تغطية جزئية لسجلات اليوم ({todayLogsCoverage.pagesRead} من {todayLogsCoverage.pagesDiscovered} صفحة)</span>
+              <div className="flex flex-wrap items-center gap-2 px-3 py-1.5 rounded-lg bg-amber-500/10 border border-amber-500/30 text-amber-400">
+                <div className="flex items-center gap-1.5">
+                  <AlertTriangle className="w-3.5 h-3.5 text-amber-400 shrink-0" />
+                  <span>تغطية جزئية لسجلات اليوم ({todayLogsCoverage.pagesRead} من {todayLogsCoverage.pagesDiscovered} صفحة)</span>
+                </div>
+                <button
+                  onClick={handleResumeLogs}
+                  disabled={isResumingLogs}
+                  className="px-2.5 py-0.5 rounded bg-amber-500/20 hover:bg-amber-500/30 text-amber-300 font-bold text-[11px] border border-amber-500/40 transition-colors flex items-center gap-1 cursor-pointer disabled:opacity-50"
+                  title="استكمال جلب الصفحات المتبقية حتى اكتمال اليوم"
+                >
+                  <Play className="w-3 h-3 fill-current" />
+                  <span>استكمال السحب الآن (صفحة {todayLogsCoverage.pagesRead + 1} إلى {todayLogsCoverage.pagesDiscovered})</span>
+                </button>
               </div>
             ) : null}
           </div>
@@ -196,17 +229,43 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
           {/* 5. Printed - Cumulative unique orders confirmed today */}
           <button
             onClick={() => onFilterStatus('Printed')}
-            className="text-right p-4 rounded-xl bg-slate-900 border border-slate-800 hover:border-emerald-500/30 hover:bg-slate-800/60 transition-all cursor-pointer group"
+            className={`text-right p-4 rounded-xl bg-slate-900 border transition-all cursor-pointer group ${
+              stats.isToday && todayLogsCoverage?.completionStatus === 'PARTIAL'
+                ? 'border-amber-500/40 hover:border-amber-500/60'
+                : 'border-slate-800 hover:border-emerald-500/30'
+            } hover:bg-slate-800/60`}
           >
             <div className="flex items-center justify-between text-xs text-emerald-400 mb-2">
               <span className="font-medium">مطبوع / مؤكد</span>
-              <span className="text-[10px] px-1.5 py-0.5 rounded bg-emerald-500/15 text-emerald-400 font-mono">تراكمي اليوم</span>
+              {stats.isToday && todayLogsCoverage?.completionStatus === 'PARTIAL' ? (
+                <span className="text-[10px] px-1.5 py-0.5 rounded bg-amber-500/20 text-amber-300 border border-amber-500/30 font-mono font-medium">
+                  ⚠️ جزئي ({todayLogsCoverage.pagesRead}/{todayLogsCoverage.pagesDiscovered} ص)
+                </span>
+              ) : stats.isToday && todayLogsCoverage?.completionStatus === 'FAILED' ? (
+                <span className="text-[10px] px-1.5 py-0.5 rounded bg-rose-500/20 text-rose-300 border border-rose-500/30 font-mono font-medium">
+                  ❌ توقف الاتصال
+                </span>
+              ) : (
+                <span className="text-[10px] px-1.5 py-0.5 rounded bg-emerald-500/15 text-emerald-400 font-mono">
+                  تراكمي اليوم
+                </span>
+              )}
             </div>
-            <div className="text-2xl font-bold font-mono text-emerald-400">
+            <div className={`text-2xl font-bold font-mono ${
+              stats.isToday && todayLogsCoverage?.completionStatus === 'PARTIAL' ? 'text-amber-300' : 'text-emerald-400'
+            }`}>
               {currentCounts.Printed}
             </div>
-            <div className="mt-1 text-[10px] text-emerald-400/80 font-medium truncate">
-              {dayCumulative?.Printed?.totalEvents ?? todayActivity.printedEvents ?? currentCounts.Printed} حركة تأكيد مسجلة
+            <div className="mt-1 text-[10px] text-slate-400 font-medium truncate">
+              {stats.isToday && todayLogsCoverage?.completionStatus === 'PARTIAL' ? (
+                <span className="text-amber-400/90 font-medium">
+                  تراكمي جزئي حتى ص {todayLogsCoverage.pagesRead} · قيد الاستكمال
+                </span>
+              ) : (
+                <span className="text-emerald-400/80">
+                  {dayCumulative?.Printed?.totalEvents ?? todayActivity.printedEvents ?? currentCounts.Printed} حركة تأكيد مسجلة
+                </span>
+              )}
             </div>
             <div className="mt-1 text-[11px] text-slate-500 flex items-center justify-between">
               <span>أوردرات مؤكدة اليوم</span>
@@ -217,17 +276,43 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
           {/* 6. Canceled - Cumulative unique orders canceled today */}
           <button
             onClick={() => onFilterStatus('Canceled')}
-            className="text-right p-4 rounded-xl bg-slate-900 border border-slate-800 hover:border-rose-500/30 hover:bg-slate-800/60 transition-all cursor-pointer group"
+            className={`text-right p-4 rounded-xl bg-slate-900 border transition-all cursor-pointer group ${
+              stats.isToday && todayLogsCoverage?.completionStatus === 'PARTIAL'
+                ? 'border-amber-500/40 hover:border-amber-500/60'
+                : 'border-slate-800 hover:border-rose-500/30'
+            } hover:bg-slate-800/60`}
           >
             <div className="flex items-center justify-between text-xs text-rose-400 mb-2">
               <span className="font-medium">ملغي نهائي</span>
-              <span className="text-[10px] px-1.5 py-0.5 rounded bg-rose-500/15 text-rose-400 font-mono">تراكمي اليوم</span>
+              {stats.isToday && todayLogsCoverage?.completionStatus === 'PARTIAL' ? (
+                <span className="text-[10px] px-1.5 py-0.5 rounded bg-amber-500/20 text-amber-300 border border-amber-500/30 font-mono font-medium">
+                  ⚠️ جزئي ({todayLogsCoverage.pagesRead}/{todayLogsCoverage.pagesDiscovered} ص)
+                </span>
+              ) : stats.isToday && todayLogsCoverage?.completionStatus === 'FAILED' ? (
+                <span className="text-[10px] px-1.5 py-0.5 rounded bg-rose-500/20 text-rose-300 border border-rose-500/30 font-mono font-medium">
+                  ❌ توقف الاتصال
+                </span>
+              ) : (
+                <span className="text-[10px] px-1.5 py-0.5 rounded bg-rose-500/15 text-rose-400 font-mono">
+                  تراكمي اليوم
+                </span>
+              )}
             </div>
-            <div className="text-2xl font-bold font-mono text-rose-400">
+            <div className={`text-2xl font-bold font-mono ${
+              stats.isToday && todayLogsCoverage?.completionStatus === 'PARTIAL' ? 'text-amber-300' : 'text-rose-400'
+            }`}>
               {currentCounts.Canceled}
             </div>
-            <div className="mt-1 text-[10px] text-rose-400/80 font-medium truncate">
-              {dayCumulative?.Canceled?.totalEvents ?? todayActivity.cancelEvents ?? currentCounts.Canceled} حركة إلغاء مسجلة
+            <div className="mt-1 text-[10px] text-slate-400 font-medium truncate">
+              {stats.isToday && todayLogsCoverage?.completionStatus === 'PARTIAL' ? (
+                <span className="text-amber-400/90 font-medium">
+                  تراكمي جزئي حتى ص {todayLogsCoverage.pagesRead} · قيد الاستكمال
+                </span>
+              ) : (
+                <span className="text-rose-400/80">
+                  {dayCumulative?.Canceled?.totalEvents ?? todayActivity.cancelEvents ?? currentCounts.Canceled} حركة إلغاء مسجلة
+                </span>
+              )}
             </div>
             <div className="mt-1 text-[11px] text-slate-500 flex items-center justify-between">
               <span>أوردرات أُلغيت اليوم</span>
