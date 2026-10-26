@@ -50,6 +50,7 @@ import {
 import {
   ensureCoverageForRange,
   generateLogsIntelligenceReport,
+  generateUnifiedLogsIntelligenceReport,
   getRangeJobStatus,
   getDrilldownLogs,
 } from './logsIntelligenceService.ts';
@@ -85,11 +86,14 @@ apiRouter.use((_req, res, next) => {
 apiRouter.get('/health', async (_req: Request, res: Response) => {
   const syncStatus = syncEngine.getStatus();
   const connStatus = await checkSupabaseConnection(false);
+  const isPostgres = isPrimaryPostgres();
   res.json({
     status: 'ok',
     timestamp: new Date().toISOString(),
     sync: syncStatus,
-    databaseType: isPrimaryPostgres() && connStatus.isConnected ? 'SUPABASE_POSTGRES' : 'SQLITE_FALLBACK',
+    databaseType: isPostgres
+      ? (connStatus.isConnected ? 'SUPABASE_POSTGRES' : 'SUPABASE_POSTGRES_DISCONNECTED')
+      : 'SQLITE_TEST',
     dataSourceName: getDataSourceIdentifier(),
     supabaseConnected: connStatus.isConnected,
   });
@@ -548,34 +552,43 @@ apiRouter.get('/orders', async (req: Request, res: Response) => {
     const pageSize = Math.min(100, Math.max(1, parseInt(limit as string, 10)));
 
     if (isPrimaryPostgres()) {
-      const unified = await getUnifiedOrdersList({
-        status: typeof status === 'string' ? status : undefined,
-        search: typeof search === 'string' ? search : undefined,
-        page: pageNum,
-        limit: pageSize,
-        date: typeof date === 'string' ? date : undefined,
-        startDate: typeof startDate === 'string' ? startDate : undefined,
-        endDate: typeof endDate === 'string' ? endDate : undefined,
-        multiMerchant: multiMerchant === '1',
-        lowDelivery: lowDelivery === '1',
-        noExtraPhone: noExtraPhone === '1',
-      });
-
-      if (unified) {
-        const enrichedOrders = unified.orders.map(o => ({
-          ...o,
-          warehouseCodes: o.warehouseCodes || [],
-          warehouseNames: o.warehouseNames || [],
-          merchantCodes: o.merchantCodes || [],
-        }));
-
-        return res.json({
-          orders: enrichedOrders,
-          total: unified.total,
+      try {
+        const unified = await getUnifiedOrdersList({
+          status: typeof status === 'string' ? status : undefined,
+          search: typeof search === 'string' ? search : undefined,
           page: pageNum,
           limit: pageSize,
-          totalPages: Math.ceil(unified.total / pageSize),
-          dataSource: 'SUPABASE_POSTGRES',
+          date: typeof date === 'string' ? date : undefined,
+          startDate: typeof startDate === 'string' ? startDate : undefined,
+          endDate: typeof endDate === 'string' ? endDate : undefined,
+          multiMerchant: multiMerchant === '1',
+          lowDelivery: lowDelivery === '1',
+          noExtraPhone: noExtraPhone === '1',
+        });
+
+        if (unified) {
+          const enrichedOrders = unified.orders.map(o => ({
+            ...o,
+            warehouseCodes: o.warehouseCodes || [],
+            warehouseNames: o.warehouseNames || [],
+            merchantCodes: o.merchantCodes || [],
+          }));
+
+          return res.json({
+            orders: enrichedOrders,
+            total: unified.total,
+            page: pageNum,
+            limit: pageSize,
+            totalPages: Math.ceil(unified.total / pageSize),
+            dataSource: 'SUPABASE_POSTGRES',
+          });
+        }
+      } catch (err: any) {
+        console.error('Unified /orders error:', err);
+        return res.status(503).json({
+          error: 'Supabase Database Degraded or Unavailable',
+          details: err.message,
+          databaseType: 'SUPABASE_POSTGRES',
         });
       }
     }
@@ -1583,7 +1596,12 @@ apiRouter.get('/reports/logs-intelligence', async (req: Request, res: Response) 
         jobStatus.stage === 'COMPUTING_METRICS' ||
         jobStatus.stage === 'PREPARING_REPORT');
 
-    let report = generateLogsIntelligenceReport(sDate, eDate);
+    let report: any;
+    if (isPrimaryPostgres()) {
+      report = await generateUnifiedLogsIntelligenceReport(sDate, eDate);
+    } else {
+      report = generateLogsIntelligenceReport(sDate, eDate);
+    }
 
     if (shouldAutoFetch && !isJobActive && (!report.coverage.isFullyComplete || !jobStatus)) {
       ensureCoverageForRange(sDate, eDate).catch(err => {

@@ -1071,7 +1071,7 @@ export class SyncEngine {
         statusFetched += ordersList.length;
 
         if (ordersList.length > 0) {
-          const upRes = await upsertCurrentOperationalOrdersToSupabase(ordersList, nowIso, statusName, scanRunId);
+          const upRes = await upsertCurrentOperationalOrdersToSupabase(ordersList, statusName, scanRunId, nowIso);
           statusUpserted += upRes.upserted;
         }
 

@@ -5,11 +5,12 @@ import express from 'express';
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { initDatabase } from './server/db.ts';
+import { initDatabase, DB_PATH } from './server/db.ts';
 import { apiRouter } from './server/routes.ts';
 import { syncEngine } from './server/syncEngine.ts';
 import { startSupabaseArchiveWorker } from './server/supabaseArchiveWorker.ts';
-import { shutdownSupabasePool } from './server/supabaseClient.ts';
+import { shutdownSupabasePool, checkSupabaseConnection } from './server/supabaseClient.ts';
+import { isPrimaryPostgres, getDataSourceIdentifier } from './server/unifiedDb.ts';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -85,7 +86,13 @@ app.use((err: any, _req: express.Request, res: express.Response, _next: express.
 });
 
 async function startServer() {
-  const isProduction = process.env.NODE_ENV === 'production';
+  const distCandidateA = path.resolve(__dirname, 'dist');
+  const distCandidateB = path.resolve(process.cwd(), 'dist');
+  const distPath = fs.existsSync(distCandidateA) ? distCandidateA : distCandidateB;
+  const hasBuiltFrontend = fs.existsSync(path.resolve(distPath, 'index.html'));
+
+  const isExplicitDev = process.env.NODE_ENV === 'development';
+  const isProduction = !isExplicitDev && (process.env.NODE_ENV === 'production' || hasBuiltFrontend);
 
   if (!isProduction) {
     // Vite Dev Server middleware with HMR disabled to avoid WebSocket closed errors in AI Studio iframe
@@ -100,17 +107,28 @@ async function startServer() {
     app.use(vite.middlewares);
   } else {
     // Serve static frontend in production
-    const distPath = fs.existsSync(path.resolve(__dirname, 'dist'))
-      ? path.resolve(__dirname, 'dist')
-      : path.resolve(__dirname, '../dist');
+    console.log(`[Server] Serving production static bundle from: ${distPath}`);
     app.use(express.static(distPath));
     app.get('*', (_req, res) => {
       res.sendFile(path.resolve(distPath, 'index.html'));
     });
   }
 
-  app.listen(port, '0.0.0.0', () => {
-    console.log(`[Vendoor Intelligence Server] Running on http://localhost:${port}`);
+  app.listen(port, '0.0.0.0', async () => {
+    const pkgVersion = '1.0.0';
+    const connStatus = await checkSupabaseConnection(false);
+    const dbEngine = isPrimaryPostgres() ? 'SUPABASE_POSTGRES' : 'SQLITE_TEST';
+    const sourceId = getDataSourceIdentifier();
+
+    console.log('================================================================');
+    console.log(`[Vendoor Operations Intelligence] v${pkgVersion}`);
+    console.log(`Mode: ${isProduction ? 'PRODUCTION (Static Assets)' : 'DEVELOPMENT (Vite Middleware)'}`);
+    console.log(`Port: ${port}`);
+    console.log(`Primary Database: ${dbEngine}`);
+    console.log(`Data Source: ${sourceId}`);
+    console.log(`Supabase Connection: ${connStatus.isConnected ? 'CONNECTED' : 'DISCONNECTED'} (Latency: ${connStatus.latencyMs ?? 'N/A'}ms)`);
+    console.log(`SQLite Path: ${DB_PATH} (Local Cache / Test Only)`);
+    console.log('================================================================');
 
     // Start background synchronization (balanced 120s interval for reliable tracking without socket exhaustion)
     const syncInterval = parseInt(process.env.SYNC_INTERVAL_SECONDS || '120', 10);

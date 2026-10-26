@@ -87,8 +87,16 @@ export function processAndDeduplicateTeamEvents(
   events: RawTeamEvent[],
   priorStatusMap?: Map<string, string>
 ): ProcessedTeamEvent[] {
+  // Normalize timestamps in case events were loaded from PostgreSQL (which returns Date objects)
+  const normalized = events.map(ev => ({
+    ...ev,
+    event_timestamp: (ev.event_timestamp as any) instanceof Date
+      ? (ev.event_timestamp as any).toISOString()
+      : String(ev.event_timestamp || '')
+  }));
+
   // 1. Sort stably by timestamp ASC, then by id ASC
-  const sorted = [...events].sort((a, b) => {
+  const sorted = [...normalized].sort((a, b) => {
     if (a.event_timestamp !== b.event_timestamp) {
       return a.event_timestamp.localeCompare(b.event_timestamp);
     }

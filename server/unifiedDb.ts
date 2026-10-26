@@ -193,7 +193,7 @@ export async function getUnifiedDashboardStats(targetDate: string): Promise<any>
     FROM orders o
     WHERE EXISTS (
       SELECT 1 FROM canonical_activity_events c
-      WHERE (c.order_code = o.random_number OR c.order_code = o.order_no OR c.order_id = o.id)
+      WHERE (c.order_code = o.random_number OR c.order_code = o.order_no OR c.order_code = CAST(o.vendoor_id AS TEXT))
         AND c.event_timestamp >= $1 AND c.event_timestamp < $2
         AND (c.to_status = 'Printed' OR c.action_type = 'confirmation')
     )
@@ -618,7 +618,7 @@ export async function getUnifiedRiskOrdersDrilldown(opts: {
     tableSource = 'orders';
     dateFilter = ` AND EXISTS (
       SELECT 1 FROM canonical_activity_events c
-      WHERE (c.order_code = orders.random_number OR c.order_id = orders.id)
+      WHERE (c.order_code = orders.random_number OR c.order_code = orders.order_no OR c.order_code = CAST(orders.vendoor_id AS TEXT))
         AND c.event_timestamp >= $${pIdx++} AND c.event_timestamp < $${pIdx++}
         AND (c.to_status = 'Printed' OR c.action_type = 'confirmation')
     )`;

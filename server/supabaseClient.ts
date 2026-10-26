@@ -1355,3 +1355,221 @@ export async function finalizeOperationalStatusScan(
   }
 }
 
+/**
+ * Reads historical coverage record directly from Supabase PostgreSQL
+ */
+export async function getCoverageRecordFromSupabase(
+  sourceDomain: string,
+  periodDate: string
+): Promise<any | null> {
+  if (!isSupabaseConfigured()) return null;
+  const pool = getSupabasePool();
+  try {
+    const cleanDate = periodDate.trim().slice(0, 10);
+    const res = await pool.query(`
+      SELECT * FROM historical_coverage
+      WHERE source_domain = $1 AND period_date = $2::date
+      LIMIT 1
+    `, [sourceDomain, cleanDate]);
+    return res.rows[0] || null;
+  } catch (err: any) {
+    console.warn('[SupabaseClient] Error fetching coverage record:', err.message);
+    return null;
+  }
+}
+
+/**
+ * Saves/updates historical coverage record directly in Supabase PostgreSQL
+ */
+export async function saveCoverageRecordToSupabase(cov: any): Promise<void> {
+  if (!isSupabaseConfigured() || !cov.periodDate) return;
+  const pool = getSupabasePool();
+  const cleanDate = cov.periodDate.trim().slice(0, 10);
+  const nowIso = new Date().toISOString();
+
+  try {
+    await pool.query(`
+      INSERT INTO historical_coverage (
+        account_id, source_domain, period_date, storage_tier,
+        pages_discovered, pages_read, records_extracted, records_saved,
+        completion_status, error_message, last_attempted_at, completed_at,
+        verified_at, timezone, data_source, canonical_events_count,
+        duplicates_count, review_rows_count, batch_id, local_storage_status,
+        remote_archive_status, last_import_at, last_vendoor_fetch_at,
+        last_supabase_verified_at, source_file_names, notes
+      ) VALUES (
+        $1, $2, $3::date, $4,
+        $5, $6, $7, $8,
+        $9, $10, $11, $12,
+        $13, $14, $15, $16,
+        $17, $18, $19, $20,
+        $21, $22, $23,
+        $24, $25, $26
+      )
+      ON CONFLICT (source_domain, period_date) DO UPDATE SET
+        storage_tier = EXCLUDED.storage_tier,
+        pages_discovered = EXCLUDED.pages_discovered,
+        pages_read = EXCLUDED.pages_read,
+        records_extracted = EXCLUDED.records_extracted,
+        records_saved = EXCLUDED.records_saved,
+        completion_status = EXCLUDED.completion_status,
+        error_message = EXCLUDED.error_message,
+        last_attempted_at = EXCLUDED.last_attempted_at,
+        completed_at = EXCLUDED.completed_at,
+        verified_at = COALESCE(EXCLUDED.verified_at, historical_coverage.verified_at),
+        timezone = COALESCE(EXCLUDED.timezone, historical_coverage.timezone),
+        data_source = COALESCE(EXCLUDED.data_source, historical_coverage.data_source),
+        canonical_events_count = COALESCE(EXCLUDED.canonical_events_count, historical_coverage.canonical_events_count),
+        duplicates_count = COALESCE(EXCLUDED.duplicates_count, historical_coverage.duplicates_count),
+        review_rows_count = COALESCE(EXCLUDED.review_rows_count, historical_coverage.review_rows_count),
+        batch_id = COALESCE(EXCLUDED.batch_id, historical_coverage.batch_id),
+        local_storage_status = COALESCE(EXCLUDED.local_storage_status, historical_coverage.local_storage_status),
+        remote_archive_status = COALESCE(EXCLUDED.remote_archive_status, historical_coverage.remote_archive_status),
+        last_import_at = COALESCE(EXCLUDED.last_import_at, historical_coverage.last_import_at),
+        last_vendoor_fetch_at = COALESCE(EXCLUDED.last_vendoor_fetch_at, historical_coverage.last_vendoor_fetch_at),
+        last_supabase_verified_at = now(),
+        source_file_names = COALESCE(EXCLUDED.source_file_names, historical_coverage.source_file_names),
+        notes = COALESCE(EXCLUDED.notes, historical_coverage.notes)
+    `, [
+      cov.accountId || 'primary',
+      cov.sourceDomain || 'logs',
+      cleanDate,
+      cov.storageTier || 'HOT',
+      cov.pagesDiscovered || 0,
+      cov.pagesRead || 0,
+      cov.recordsExtracted || 0,
+      cov.recordsSaved || 0,
+      cov.completionStatus || 'PARTIAL',
+      cov.errorMessage || null,
+      cov.lastAttemptedAt || nowIso,
+      cov.completedAt || null,
+      cov.verifiedAt || null,
+      cov.timezone || 'Africa/Cairo',
+      cov.dataSource || 'VENDOOR_FETCH',
+      cov.canonicalEventsCount || 0,
+      cov.duplicatesCount || 0,
+      cov.reviewRowsCount || 0,
+      cov.batchId || null,
+      cov.localStorageStatus || 'NONE',
+      cov.remoteArchiveStatus || 'REMOTE_VERIFIED',
+      cov.lastImportAt || null,
+      cov.lastVendoorFetchAt || null,
+      nowIso,
+      cov.sourceFileNames || null,
+      cov.notes || null,
+    ]);
+  } catch (err: any) {
+    console.warn('[SupabaseClient] Error saving coverage record:', err.message);
+  }
+}
+
+/**
+ * Persists a batch of log entries directly into Supabase raw_activity_events and canonical_activity_events
+ */
+export async function persistLogEntriesToSupabase(
+  entries: any[],
+  interval: { startCairo: string; endCairo: string },
+  options?: { dataSource?: string; batchId?: string; strictInterval?: boolean }
+): Promise<{ saved: number; duplicates: number }> {
+  if (!isSupabaseConfigured() || !entries || entries.length === 0) {
+    return { saved: 0, duplicates: 0 };
+  }
+
+  const { parseLogActionDetails } = await import('./logDetailsParser.ts');
+  const crypto = await import('node:crypto');
+  const pool = getSupabasePool();
+  const nowIso = new Date().toISOString();
+  const dataSource = options?.dataSource || 'VENDOOR_FETCH';
+  const importId = options?.batchId || null;
+  const strictInterval = options?.strictInterval !== false;
+
+  let saved = 0;
+  let duplicates = 0;
+  const BATCH_SIZE = 100;
+
+  for (let b = 0; b < entries.length; b += BATCH_SIZE) {
+    const chunk = entries.slice(b, b + BATCH_SIZE);
+
+    for (const entry of chunk) {
+      const eventTime = entry.eventTimestamp || entry.action_date_time || entry.created_at;
+      if (!eventTime) continue;
+      if (strictInterval && (eventTime < interval.startCairo || eventTime >= interval.endCairo)) {
+        continue;
+      }
+
+      const orderCode = (entry.orderCode || entry.order_no || entry.random_number || '').trim();
+      const actorName = (entry.actorName || entry.actor || entry.user_name || 'النظام').trim();
+      const rawActionText = (entry.rawActionText || entry.action || entry.details || '').trim();
+      if (!rawActionText) continue;
+
+      const hashPayload = `${orderCode}_${actorName}_${rawActionText}_${eventTime}`;
+      const sourceHash = crypto.createHash('sha256').update(hashPayload).digest('hex');
+
+      const parsed = parseLogActionDetails(rawActionText, actorName, orderCode);
+      const isSystem = Boolean(
+        actorName === 'النظام' ||
+        actorName.toLowerCase() === 'system' ||
+        actorName.toLowerCase().includes('cron') ||
+        actorName.includes('تلقائي')
+      );
+
+      try {
+        // 1. Insert raw event
+        const rawRes = await pool.query(`
+          INSERT INTO raw_activity_events (
+            source_hash, order_code, actor_name, raw_action_text,
+            event_timestamp, storage_tier, observed_at, page_source,
+            data_source, import_id
+          ) VALUES ($1, $2, $3, $4, $5::timestamptz, 'HOT', $6::timestamptz, 'log/system', $7, $8)
+          ON CONFLICT (source_hash) DO NOTHING
+          RETURNING id
+        `, [sourceHash, orderCode || null, actorName, rawActionText, eventTime, nowIso, dataSource, importId]);
+
+        let rawEventId: number | null = null;
+        if (rawRes.rows.length > 0) {
+          rawEventId = rawRes.rows[0].id;
+        } else {
+          duplicates++;
+          const findRaw = await pool.query(`SELECT id FROM raw_activity_events WHERE source_hash = $1 LIMIT 1`, [sourceHash]);
+          rawEventId = findRaw.rows[0]?.id || null;
+        }
+
+        // 2. Insert canonical event if not exists
+        const checkCanon = await pool.query(`
+          SELECT id FROM canonical_activity_events
+          WHERE (raw_event_id IS NOT NULL AND raw_event_id = $1)
+             OR (order_code = $2 AND actor_name = $3 AND action_type = $4 AND event_timestamp = $5::timestamptz)
+          LIMIT 1
+        `, [rawEventId, orderCode, actorName, parsed.actionType, eventTime]);
+
+        if (checkCanon.rows.length === 0) {
+          await pool.query(`
+            INSERT INTO canonical_activity_events (
+              raw_event_id, order_code, actor_name, action_type, from_status, to_status,
+              event_timestamp, storage_tier, is_system_actor, created_at,
+              data_source, import_id, field_name, old_value, new_value, details_json,
+              is_administrative
+            ) VALUES (
+              $1, $2, $3, $4, $5, $6,
+              $7::timestamptz, 'HOT', $8, $9::timestamptz,
+              $10, $11, $12, $13, $14, $15,
+              $16
+            )
+          `, [
+            rawEventId, orderCode || null, actorName, parsed.actionType, parsed.fromStatus || null, parsed.toStatus || null,
+            eventTime, isSystem, nowIso,
+            dataSource, importId, parsed.fieldName || null, parsed.oldValue || null, parsed.newValue || null,
+            JSON.stringify(parsed), parsed.isAdministrative || false
+          ]);
+          saved++;
+        }
+      } catch (err: any) {
+        console.warn('[SupabaseClient] Error writing log entry to Supabase:', err.message);
+      }
+    }
+  }
+
+  return { saved, duplicates };
+}
+
+

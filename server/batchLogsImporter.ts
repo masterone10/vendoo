@@ -4,7 +4,13 @@ import readline from 'node:readline';
 import * as XLSX from 'xlsx';
 import { db, getCairoDateInterval, saveCoverageRecord } from './db.ts';
 import { persistLogEntries } from './historicalLogsService.ts';
-import { isSupabaseConfigured, syncDayLogsToSupabase } from './supabaseClient.ts';
+import {
+  isSupabaseConfigured,
+  syncDayLogsToSupabase,
+  persistLogEntriesToSupabase,
+  saveCoverageRecordToSupabase,
+} from './supabaseClient.ts';
+import { isPrimaryPostgres } from './unifiedDb.ts';
 
 export interface BatchFilePayload {
   fileName: string;
@@ -1026,6 +1032,19 @@ export async function importBatchLogFiles(
     totalSaved += persistResult.saved;
     totalDuplicates += persistResult.duplicates;
 
+    // In production, persist directly into Supabase PostgreSQL
+    if (isPrimaryPostgres()) {
+      try {
+        await persistLogEntriesToSupabase(entries, interval, {
+          dataSource,
+          batchId,
+          strictInterval: true,
+        });
+      } catch (err: any) {
+        console.warn(`[BatchImporter] Error persisting to Supabase for ${dateStr}:`, err.message);
+      }
+    }
+
     // Check unmatched count in this date
     const unmatchedForDay = (db.prepare(`
       SELECT COUNT(*) as c FROM canonical_activity_events
@@ -1046,7 +1065,7 @@ export async function importBatchLogFiles(
     const nowIso = new Date().toISOString();
     const filesString = filesList.join(', ');
 
-    // Update historical coverage registry
+    // Update historical coverage registry in SQLite
     saveCoverageRecord({
       accountId: 'primary',
       sourceDomain: 'logs',
@@ -1072,9 +1091,39 @@ export async function importBatchLogFiles(
       notes: `Batch import: ${entries.length} rows processed from [${filesString}]`,
     });
 
-    // Remote Supabase verification if configured (enforce cloud archive boundary 2026-10-23)
+    // Update historical coverage registry in Supabase
+    if (isPrimaryPostgres()) {
+      try {
+        await saveCoverageRecordToSupabase({
+          accountId: 'primary',
+          sourceDomain: 'logs',
+          periodDate: dateStr,
+          storageTier: 'HOT',
+          pagesDiscovered: 1,
+          pagesRead: 1,
+          recordsExtracted: entries.length,
+          recordsSaved: entries.length,
+          completionStatus: 'UNVERIFIED_SOURCE',
+          timezone: 'Africa/Cairo',
+          dataSource,
+          canonicalEventsCount: entries.length,
+          duplicatesCount: persistResult.duplicates,
+          batchId,
+          localStorageStatus: 'LOCAL_SAVED',
+          remoteArchiveStatus: 'REMOTE_VERIFIED',
+          lastAttemptedAt: nowIso,
+          completedAt: nowIso,
+          sourceFileNames: filesString,
+          notes: `Batch import: ${entries.length} rows processed from [${filesString}]`,
+        });
+      } catch (err: any) {
+        console.warn(`[BatchImporter] Error saving coverage in Supabase for ${dateStr}:`, err.message);
+      }
+    }
+
+    // Remote Supabase verification if configured (without 2026-10-23 cutoff)
     let remoteStatus = 'NONE';
-    if (dateStr >= '2026-10-23' && isSupabaseConfigured()) {
+    if (isSupabaseConfigured()) {
       try {
         const syncRes = await syncDayLogsToSupabase(dateStr);
         if (syncRes.verified) {

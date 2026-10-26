@@ -4,7 +4,15 @@ import { vendoorClient } from './vendoorClient.ts';
 import { parseLogActionDetails } from './logDetailsParser.ts';
 import { persistLogEntries, repairRawWithoutCanonical } from './historicalLogsService.ts';
 import { importBatchLogFiles } from './batchLogsImporter.ts';
-import { isSupabaseConfigured, fetchDayLogsFromSupabase, syncDayLogsToSupabase } from './supabaseClient.ts';
+import {
+  isSupabaseConfigured,
+  fetchDayLogsFromSupabase,
+  syncDayLogsToSupabase,
+  getCoverageRecordFromSupabase,
+  saveCoverageRecordToSupabase,
+  persistLogEntriesToSupabase,
+} from './supabaseClient.ts';
+import { isPrimaryPostgres, getSupabasePool } from './unifiedDb.ts';
 import { processAndDeduplicateTeamEvents } from './teamDeduplication.ts';
 
 export type FetchStage =
@@ -122,36 +130,44 @@ export async function ensureCoverageForRange(
     }
 
     const interval = getCairoDateInterval(date);
+    let isDayVerifiedComplete = false;
 
-    const cov: any = db.prepare(`
-      SELECT completion_status, data_source, pages_read, pages_discovered FROM historical_coverage
-      WHERE period_date = ? AND source_domain = 'logs'
-    `).get(date);
+    // Check authoritative Supabase PostgreSQL first
+    if (isPrimaryPostgres()) {
+      try {
+        const pool = getSupabasePool();
+        const [supaCov, supaCountRes] = await Promise.all([
+          getCoverageRecordFromSupabase('logs', date),
+          pool.query(
+            `SELECT COUNT(*)::int as c FROM canonical_activity_events WHERE event_timestamp >= $1 AND event_timestamp < $2`,
+            [interval.startCairo, interval.endCairo]
+          ),
+        ]);
+        const canonCount = supaCountRes.rows[0]?.c || 0;
+        if (
+          canonCount > 0 ||
+          (supaCov && (supaCov.completion_status === 'COMPLETE' || supaCov.completion_status === 'EMPTY_VERIFIED'))
+        ) {
+          isDayVerifiedComplete = true;
+        }
+      } catch (supaErr: any) {
+        console.warn(`[ensureCoverageForRange] Supabase check error for ${date}:`, supaErr.message);
+      }
+    }
 
-    const hasLocalRaw = Boolean(
-      (db.prepare(`
-        SELECT 1 FROM raw_activity_events
-        WHERE event_timestamp >= ? AND event_timestamp < ?
-        LIMIT 1
-      `).get(interval.startCairo, interval.endCairo) as any)
-    );
+    if (!isDayVerifiedComplete) {
+      const cov: any = db.prepare(`
+        SELECT completion_status, data_source, pages_read, pages_discovered FROM historical_coverage
+        WHERE period_date = ? AND source_domain = 'logs'
+      `).get(date);
 
-    const hasLocalCanon = Boolean(
-      (db.prepare(`
-        SELECT 1 FROM canonical_activity_events
-        WHERE event_timestamp >= ? AND event_timestamp < ?
-        LIMIT 1
-      `).get(interval.startCairo, interval.endCairo) as any)
-    );
-
-    // Rule: UNVERIFIED_SOURCE does NOT mean verified complete.
-    // Only strictly verified COMPLETE days (with all pages read) or verified EMPTY days are complete.
-    const isDayVerifiedComplete = Boolean(
-      cov && (
-        (cov.completion_status === 'COMPLETE' && !(cov.pages_discovered > 1 && cov.pages_read < cov.pages_discovered)) ||
-        cov.completion_status === 'EMPTY_VERIFIED'
-      )
-    );
+      isDayVerifiedComplete = Boolean(
+        cov && (
+          (cov.completion_status === 'COMPLETE' && !(cov.pages_discovered > 1 && cov.pages_read < cov.pages_discovered)) ||
+          cov.completion_status === 'EMPTY_VERIFIED'
+        )
+      );
+    }
 
     // If day is missing entirely, has PARTIAL coverage, or has unverified raw records without completion:
     if (!isDayVerifiedComplete) {
@@ -455,6 +471,19 @@ export async function ensureCoverageForRange(
         dayStatus === 'COMPLETE' ? new Date().toISOString() : null,
         dayStatus === 'COMPLETE' ? new Date().toISOString() : null
       );
+
+      if (isPrimaryPostgres()) {
+        saveCoverageRecordToSupabase({
+          periodDate: date,
+          sourceDomain: 'logs',
+          pagesDiscovered: dayPagesTotal,
+          pagesRead: dayPagesFetched,
+          recordsSaved: dayEventsSaved,
+          completionStatus: dayStatus,
+          dataSource: 'VENDOOR_FETCH',
+          completedAt: dayStatus === 'COMPLETE' ? new Date().toISOString() : null,
+        }).catch(() => {});
+      }
 
       if (isSupabaseConfigured() && dayStatus === 'COMPLETE') {
         syncDayLogsToSupabase(date).catch(() => {});
@@ -1404,3 +1433,368 @@ export function getDrilldownLogs(params: {
     viewType: effectiveViewType,
   };
 }
+
+/**
+ * Authoritative Supabase PostgreSQL implementation of Intelligence Report
+ * Querying exclusively from canonical_activity_events and raw_activity_events in Supabase.
+ */
+export async function generateUnifiedLogsIntelligenceReport(
+  startDateStr: string,
+  endDateStr: string
+): Promise<LogsIntelligenceReport> {
+  const { getSupabasePool } = await import('./supabaseClient.ts');
+  const pool = getSupabasePool();
+
+  const start = startDateStr.slice(0, 10);
+  const end = endDateStr.slice(0, 10);
+
+  const startInterval = getCairoDateInterval(start);
+  const endInterval = getCairoDateInterval(end);
+  const startTime = startInterval.startCairo;
+  const endTime = endInterval.endCairo;
+
+  const isSingleDay = start === end;
+  const periodType: 'day' | 'week' | 'custom' = isSingleDay ? 'day' : 'week';
+  const periodLabel = isSingleDay ? `يوم ${start}` : `الفترة من ${start} إلى ${end}`;
+
+  // 1. Coverage Information directly from Supabase
+  const covRes = await pool.query(`
+    SELECT period_date::text, completion_status, pages_read, pages_discovered, records_saved, verified_at, completed_at, data_source, local_storage_status, remote_archive_status
+    FROM historical_coverage
+    WHERE period_date >= $1::date AND period_date <= $2::date AND source_domain = 'logs'
+  `, [start, end]);
+
+  const covRows = covRes.rows;
+  const covMap = new Map<string, any>(covRows.map((r: any) => [r.period_date.slice(0, 10), r]));
+
+  // Generate list of days
+  const dayDates: string[] = [];
+  const curr = new Date(`${start}T00:00:00Z`);
+  const stop = new Date(`${end}T00:00:00Z`);
+  while (curr <= stop) {
+    dayDates.push(curr.toISOString().slice(0, 10));
+    curr.setUTCDate(curr.getUTCDate() + 1);
+  }
+
+  let completeDays = 0;
+  let partialDays = 0;
+  let failedDays = 0;
+  let missingDays = 0;
+  let pagesRead = 0;
+  let recordsSaved = 0;
+  let latestVerifiedAt: string | null = null;
+
+  for (const d of dayDates) {
+    const cov = covMap.get(d);
+    if (!cov) {
+      const dInterval = getCairoDateInterval(d);
+      const hasEventsRes = await pool.query(`
+        SELECT 1 FROM canonical_activity_events
+        WHERE event_timestamp >= $1 AND event_timestamp < $2
+        LIMIT 1
+      `, [dInterval.startCairo, dInterval.endCairo]);
+      if (hasEventsRes.rows.length > 0) {
+        partialDays++;
+      } else {
+        missingDays++;
+      }
+    } else {
+      const isCompleteVerified =
+        (cov.completion_status === 'COMPLETE' || cov.completion_status === 'EMPTY_VERIFIED') &&
+        !(cov.pages_discovered > 1 && cov.pages_read < cov.pages_discovered);
+
+      if (isCompleteVerified) {
+        completeDays++;
+      } else if (
+        cov.completion_status === 'PARTIAL' ||
+        cov.completion_status === 'UNVERIFIED_SOURCE' ||
+        (cov.pages_discovered > 1 && cov.pages_read < cov.pages_discovered)
+      ) {
+        partialDays++;
+      } else if (cov.completion_status === 'FAILED') {
+        failedDays++;
+      } else {
+        missingDays++;
+      }
+
+      pagesRead += cov.pages_read || 0;
+      recordsSaved += cov.records_saved || 0;
+      if (cov.verified_at && (!latestVerifiedAt || cov.verified_at > latestVerifiedAt)) {
+        latestVerifiedAt = cov.verified_at;
+      }
+    }
+  }
+
+  const isFullyComplete = dayDates.length > 0 && completeDays === dayDates.length;
+  const coverageStatus: 'COMPLETE' | 'PARTIAL' | 'FAILED' = isFullyComplete
+    ? 'COMPLETE'
+    : (partialDays > 0 || completeDays > 0)
+    ? 'PARTIAL'
+    : 'FAILED';
+
+  // 2. Base Counts from canonical_activity_events in Supabase
+  const [
+    totalLogsRes,
+    uniqueOrdersRes,
+    confirmedRes,
+    canceledRes,
+    cancelingRes,
+    createdRes,
+    extraPhonesRes,
+    statusChangesRes,
+    adminEditsRes,
+    unresolvedRes,
+  ] = await Promise.all([
+    pool.query(`SELECT COUNT(*)::int as c FROM canonical_activity_events WHERE event_timestamp >= $1 AND event_timestamp < $2`, [startTime, endTime]),
+    pool.query(`SELECT COUNT(DISTINCT order_code)::int as c FROM canonical_activity_events WHERE event_timestamp >= $1 AND event_timestamp < $2 AND order_code IS NOT NULL AND TRIM(order_code) != ''`, [startTime, endTime]),
+    pool.query(`SELECT COUNT(DISTINCT order_code)::int as unique_orders, COUNT(*)::int as events_count FROM canonical_activity_events WHERE event_timestamp >= $1 AND event_timestamp < $2 AND (to_status = 'Printed' OR action_type = 'confirmation') AND order_code IS NOT NULL AND TRIM(order_code) != ''`, [startTime, endTime]),
+    pool.query(`SELECT COUNT(DISTINCT order_code)::int as unique_orders, COUNT(*)::int as events_count FROM canonical_activity_events WHERE event_timestamp >= $1 AND event_timestamp < $2 AND (to_status = 'Canceled' OR action_type = 'order_canceled') AND order_code IS NOT NULL AND TRIM(order_code) != ''`, [startTime, endTime]),
+    pool.query(`SELECT COUNT(DISTINCT order_code)::int as unique_orders, COUNT(*)::int as events_count FROM canonical_activity_events WHERE event_timestamp >= $1 AND event_timestamp < $2 AND to_status = 'Canceling' AND order_code IS NOT NULL AND TRIM(order_code) != ''`, [startTime, endTime]),
+    pool.query(`SELECT COUNT(DISTINCT order_code)::int as unique_orders, COUNT(*)::int as events_count FROM canonical_activity_events WHERE event_timestamp >= $1 AND event_timestamp < $2 AND action_type = 'order_created' AND order_code IS NOT NULL AND TRIM(order_code) != ''`, [startTime, endTime]),
+    pool.query(`SELECT COUNT(DISTINCT order_code)::int as unique_orders, COUNT(*)::int as events_count FROM canonical_activity_events WHERE event_timestamp >= $1 AND event_timestamp < $2 AND action_type = 'extra_phone_added'`, [startTime, endTime]),
+    pool.query(`SELECT COUNT(*)::int as c FROM canonical_activity_events WHERE event_timestamp >= $1 AND event_timestamp < $2 AND action_type = 'status_change'`, [startTime, endTime]),
+    pool.query(`SELECT COUNT(*)::int as c FROM canonical_activity_events WHERE event_timestamp >= $1 AND event_timestamp < $2 AND (is_administrative = true OR action_type IN ('address_edit', 'phone_edit', 'extra_phone_edit', 'extra_phone_added', 'customer_edit', 'note_added', 'financial_edit', 'assign_staff'))`, [startTime, endTime]),
+    pool.query(`SELECT COUNT(*)::int as c FROM canonical_activity_events WHERE event_timestamp >= $1 AND event_timestamp < $2 AND (order_match_status = 'UNRESOLVED' OR action_type = 'other')`, [startTime, endTime]),
+  ]);
+
+  const totalLogs = totalLogsRes.rows[0]?.c || 0;
+  const uniqueOrdersTouched = uniqueOrdersRes.rows[0]?.c || 0;
+  const confirmedOrdersCount = confirmedRes.rows[0]?.unique_orders || 0;
+  const printedEventsCount = confirmedRes.rows[0]?.events_count || 0;
+  const canceledOrdersCount = canceledRes.rows[0]?.unique_orders || 0;
+  const canceledEventsCount = canceledRes.rows[0]?.events_count || 0;
+  const cancelingOrdersCount = cancelingRes.rows[0]?.unique_orders || 0;
+  const cancelingEventsCount = cancelingRes.rows[0]?.events_count || 0;
+  const createdOrdersCount = createdRes.rows[0]?.unique_orders || 0;
+  const createdEventsCount = createdRes.rows[0]?.events_count || 0;
+  const extraPhonesAddedUniqueOrders = extraPhonesRes.rows[0]?.unique_orders || 0;
+  const extraPhonesAddedEvents = extraPhonesRes.rows[0]?.events_count || 0;
+  const statusChangeEventsCount = statusChangesRes.rows[0]?.c || 0;
+  const adminEditsCount = adminEditsRes.rows[0]?.c || 0;
+  const unresolvedCount = unresolvedRes.rows[0]?.c || 0;
+
+  // 3. Days Breakdown
+  const daysBreakdown: LogsIntelligenceReport['days'] = [];
+  for (const d of dayDates) {
+    const dayInterval = getCairoDateInterval(d);
+    const dateObj = new Date(`${d}T00:00:00Z`);
+    const dayOfWeek = dateObj.getUTCDay();
+    const dayNameAr = ARABIC_DAYS[dayOfWeek] || '';
+
+    const [dTotalRes, dUniqueRes, dConfirmedRes, dCanceledRes, dCancelingRes, dCreatedRes, dActiveEmpRes] = await Promise.all([
+      pool.query(`SELECT COUNT(*)::int as c FROM canonical_activity_events WHERE event_timestamp >= $1 AND event_timestamp < $2`, [dayInterval.startCairo, dayInterval.endCairo]),
+      pool.query(`SELECT COUNT(DISTINCT order_code)::int as c FROM canonical_activity_events WHERE event_timestamp >= $1 AND event_timestamp < $2 AND order_code IS NOT NULL AND TRIM(order_code) != ''`, [dayInterval.startCairo, dayInterval.endCairo]),
+      pool.query(`SELECT COUNT(DISTINCT order_code)::int as u, COUNT(*)::int as e FROM canonical_activity_events WHERE event_timestamp >= $1 AND event_timestamp < $2 AND (to_status = 'Printed' OR action_type = 'confirmation') AND order_code IS NOT NULL AND TRIM(order_code) != ''`, [dayInterval.startCairo, dayInterval.endCairo]),
+      pool.query(`SELECT COUNT(DISTINCT order_code)::int as u, COUNT(*)::int as e FROM canonical_activity_events WHERE event_timestamp >= $1 AND event_timestamp < $2 AND (to_status = 'Canceled' OR action_type = 'order_canceled') AND order_code IS NOT NULL AND TRIM(order_code) != ''`, [dayInterval.startCairo, dayInterval.endCairo]),
+      pool.query(`SELECT COUNT(DISTINCT order_code)::int as u, COUNT(*)::int as e FROM canonical_activity_events WHERE event_timestamp >= $1 AND event_timestamp < $2 AND to_status = 'Canceling' AND order_code IS NOT NULL AND TRIM(order_code) != ''`, [dayInterval.startCairo, dayInterval.endCairo]),
+      pool.query(`SELECT COUNT(DISTINCT order_code)::int as u, COUNT(*)::int as e FROM canonical_activity_events WHERE event_timestamp >= $1 AND event_timestamp < $2 AND action_type = 'order_created' AND order_code IS NOT NULL AND TRIM(order_code) != ''`, [dayInterval.startCairo, dayInterval.endCairo]),
+      pool.query(`SELECT COUNT(DISTINCT actor_name)::int as c FROM canonical_activity_events WHERE event_timestamp >= $1 AND event_timestamp < $2 AND is_system_actor = false AND actor_name IS NOT NULL AND TRIM(actor_name) != ''`, [dayInterval.startCairo, dayInterval.endCairo]),
+    ]);
+
+    const dTotalLogs = dTotalRes.rows[0]?.c || 0;
+    const cov = covMap.get(d);
+    const dayCovStatus = cov?.completion_status || (dTotalLogs > 0 ? 'COMPLETE' : 'NOT_SYNCED');
+    const dayDataSource = cov?.data_source || (dTotalLogs > 0 ? 'SUPABASE_ARCHIVE' : 'NONE');
+
+    daysBreakdown.push({
+      date: d,
+      dayNameAr,
+      totalLogs: dTotalLogs,
+      uniqueOrdersTouched: dUniqueRes.rows[0]?.c || 0,
+      createdOrdersCount: dCreatedRes.rows[0]?.u || 0,
+      createdEventsCount: dCreatedRes.rows[0]?.e || 0,
+      confirmedOrdersCount: dConfirmedRes.rows[0]?.u || 0,
+      printedEventsCount: dConfirmedRes.rows[0]?.e || 0,
+      canceledOrdersCount: dCanceledRes.rows[0]?.u || 0,
+      canceledEventsCount: dCanceledRes.rows[0]?.e || 0,
+      cancelingOrdersCount: dCancelingRes.rows[0]?.u || 0,
+      cancelingEventsCount: dCancelingRes.rows[0]?.e || 0,
+      extraPhonesAddedCount: 0,
+      activeEmployeesCount: dActiveEmpRes.rows[0]?.c || 0,
+      coverageStatus: dayCovStatus,
+      dataSource: dayDataSource,
+      localStorageStatus: cov?.local_storage_status || (dTotalLogs > 0 ? 'LOCAL_SAVED' : 'NONE'),
+      remoteArchiveStatus: cov?.remote_archive_status || 'REMOTE_VERIFIED',
+    });
+  }
+
+  // 4. Employee Activity Table with conservative deduplication
+  const empEventsRes = await pool.query(`
+    SELECT
+      c.id,
+      c.actor_name,
+      c.action_type,
+      c.from_status,
+      c.to_status,
+      c.order_code,
+      c.event_timestamp,
+      c.is_system_actor,
+      c.raw_event_id,
+      COALESCE(r.source_hash, '') as source_hash,
+      COALESCE(r.raw_action_text, '') as raw_action_text,
+      c.order_id,
+      c.field_name,
+      c.old_value,
+      c.new_value,
+      c.details_json
+    FROM canonical_activity_events c
+    LEFT JOIN raw_activity_events r ON c.raw_event_id = r.id
+    WHERE c.event_timestamp >= $1 AND c.event_timestamp < $2
+    ORDER BY c.event_timestamp ASC, c.id ASC
+  `, [startTime, endTime]);
+
+  const deduplicatedEvents = processAndDeduplicateTeamEvents(empEventsRes.rows);
+  const empStatsMap = new Map<string, any>();
+
+  for (const ev of deduplicatedEvents) {
+    const actor = ev.actor_name || 'غير محدد';
+    let stat = empStatsMap.get(actor);
+    if (!stat) {
+      stat = {
+        actor_name: actor,
+        is_system: ev.is_system_actor === 1 || ev.is_system_actor === true ? 1 : 0,
+        action_count: 0,
+        raw_events_count: 0,
+        duplicate_events_count: 0,
+        unique_orders_set: new Set<string>(),
+        confirmed_orders_set: new Set<string>(),
+        printed_events_count: 0,
+        canceled_orders_set: new Set<string>(),
+        canceled_events_count: 0,
+        extra_phones_added_set: new Set<string>(),
+        status_changes_count: 0,
+        actions_breakdown: {},
+      };
+      empStatsMap.set(actor, stat);
+    }
+
+    stat.raw_events_count++;
+    const orderKey = ev.order_code && ev.order_code.trim() ? `CODE_${ev.order_code.trim().toLowerCase()}` : null;
+    if (orderKey) stat.unique_orders_set.add(orderKey);
+
+    if (!ev.is_counted) {
+      stat.duplicate_events_count++;
+      continue;
+    }
+
+    stat.action_count++;
+    stat.actions_breakdown[ev.action_type] = (stat.actions_breakdown[ev.action_type] || 0) + 1;
+
+    if (ev.to_status === 'Printed' || ev.action_type === 'confirmation') {
+      stat.printed_events_count++;
+      if (orderKey) stat.confirmed_orders_set.add(orderKey);
+    } else if (ev.to_status === 'Canceled' || ev.action_type === 'order_canceled') {
+      stat.canceled_events_count++;
+      if (orderKey) stat.canceled_orders_set.add(orderKey);
+    }
+
+    if (ev.action_type === 'status_change') {
+      stat.status_changes_count++;
+    }
+  }
+
+  const employees: LogsIntelligenceReport['employees'] = Array.from(empStatsMap.values())
+    .map((st: any) => {
+      const isSys = st.is_system === 1;
+      let actorType: 'STAFF' | 'SYSTEM' | 'UNKNOWN' = isSys ? 'SYSTEM' : 'STAFF';
+      if (!st.actor_name || st.actor_name === 'غير محدد' || st.actor_name === 'Unknown') {
+        actorType = 'UNKNOWN';
+      }
+      return {
+        actor_name: st.actor_name,
+        is_system: st.is_system,
+        actor_type: actorType,
+        action_count: st.action_count,
+        raw_events_count: st.raw_events_count,
+        duplicate_events_count: st.duplicate_events_count,
+        unique_orders: st.unique_orders_set.size,
+        confirmed_orders_count: st.confirmed_orders_set.size,
+        printed_events_count: st.printed_events_count,
+        canceled_orders_count: st.canceled_orders_set.size,
+        canceled_events_count: st.canceled_events_count,
+        extra_phones_added_count: st.extra_phones_added_set.size,
+        status_changes_count: st.status_changes_count,
+        actions_breakdown: st.actions_breakdown,
+      };
+    })
+    .sort((a, b) => b.action_count - a.action_count);
+
+  // 5. Transitions Matrix
+  const transRes = await pool.query(`
+    SELECT
+      COALESCE(from_status, 'غير محدد') as from_status,
+      to_status,
+      COUNT(*)::int as events_count,
+      COUNT(DISTINCT order_code)::int as unique_orders
+    FROM canonical_activity_events
+    WHERE event_timestamp >= $1 AND event_timestamp < $2
+      AND action_type = 'status_change'
+      AND to_status IS NOT NULL
+    GROUP BY from_status, to_status
+    ORDER BY events_count DESC
+  `, [startTime, endTime]);
+
+  // 6. Recent Events Preview
+  const recentRes = await pool.query(`
+    SELECT
+      c.id, c.order_code, c.actor_name, c.action_type, c.from_status, c.to_status,
+      COALESCE(r.raw_action_text, '') as raw_action_text,
+      c.event_timestamp, c.field_name, c.old_value, c.new_value, c.is_system_actor
+    FROM canonical_activity_events c
+    LEFT JOIN raw_activity_events r ON c.raw_event_id = r.id
+    WHERE c.event_timestamp >= $1 AND c.event_timestamp < $2
+    ORDER BY c.event_timestamp DESC, c.id DESC
+    LIMIT 50
+  `, [startTime, endTime]);
+
+  return {
+    startDate: start,
+    endDate: end,
+    periodType,
+    periodLabel,
+    cairoInterval: {
+      startCairo: startTime,
+      endExclusiveCairo: endTime,
+    },
+    status: coverageStatus,
+    loadedFromCache: false,
+    lastVerifiedAt: latestVerifiedAt,
+    coverage: {
+      totalDays: dayDates.length,
+      completeDays,
+      partialDays,
+      failedDays,
+      missingDays,
+      pagesRead,
+      recordsSaved,
+      isFullyComplete,
+      dataSource: dayDates.length === 1 && covMap.get(dayDates[0])?.data_source ? covMap.get(dayDates[0])?.data_source : undefined,
+    },
+    metrics: {
+      totalLogs,
+      uniqueOrdersTouched,
+      confirmedOrdersCount,
+      printedEventsCount,
+      canceledOrdersCount,
+      canceledEventsCount,
+      cancelingOrdersCount,
+      cancelingEventsCount,
+      createdOrdersCount,
+      createdEventsCount,
+      extraPhonesAddedUniqueOrders,
+      extraPhonesAddedEvents,
+      extraPhonesReplacedCount: 0,
+      extraPhonesDeletedCount: 0,
+      statusChangeEventsCount,
+      adminEditsCount,
+      unresolvedCount,
+    },
+    days: daysBreakdown,
+    employees,
+    transitions: transRes.rows,
+    administrativeEdits: [],
+    unresolvedActions: [],
+    recentEvents: recentRes.rows,
+  };
+}
+
